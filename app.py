@@ -13,7 +13,7 @@ Segredos (Settings -> Variables and secrets, no Space):
   GEMINI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
   (opcionais) GEMINI_MODEL, FAT_NOME, FAT_CNPJ
 """
-import os, re, json, shutil, subprocess, tempfile, datetime, zipfile, unicodedata, urllib.parse, urllib.request
+import os, re, json, shutil, subprocess, tempfile, datetime, zipfile, unicodedata, urllib.parse, urllib.request, urllib.error
 import google.generativeai as genai
 import dropbox_rateio
 
@@ -25,6 +25,8 @@ CAD = json.load(open(os.path.join(ASSETS, "cadastro_lojas.json"), encoding="utf-
 
 GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 FAT_NOME = os.environ.get("FAT_NOME", "FROTA MACEDO ENGENHARIA LTDA")
@@ -100,18 +102,48 @@ Extraia SOMENTE o que estiver na nota e responda em JSON puro (sem texto fora do
 }
 Regras: NÃO aplique nenhum acréscimo/desconto — use o valor unitário BRUTO. Inclua item de ENTREGA/FRETE se houver (desc contendo 'ENTREGA' ou 'FRETE'). quant e unit são números (ponto decimal)."""
 
+def _parse_json(txt):
+    txt = (txt or "").strip()
+    try:
+        return json.loads(txt)
+    except Exception:
+        m = re.search(r"\{.*\}", txt, re.S)
+        return json.loads(m.group(0)) if m else {"ticket": None, "itens": []}
+
 def gemini_le(png_path):
     from PIL import Image
     img = Image.open(png_path)
     model = genai.GenerativeModel(GEMINI_MODEL)
     r = model.generate_content([PROMPT, img],
         generation_config={"temperature": 0, "response_mime_type": "application/json"})
-    txt = (r.text or "").strip()
+    return _parse_json(r.text)
+
+def groq_le(png_path):
+    import base64
+    b64 = base64.b64encode(open(png_path, "rb").read()).decode()
+    payload = {
+        "model": GROQ_MODEL, "temperature": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+        ]}],
+    }
+    req = urllib.request.Request("https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"})
     try:
-        return json.loads(txt)
-    except Exception:
-        m = re.search(r"\{.*\}", txt, re.S)
-        return json.loads(m.group(0)) if m else {"ticket": None, "itens": []}
+        raw = urllib.request.urlopen(req, timeout=90).read().decode()
+    except urllib.error.HTTPError as e:
+        body = ""
+        try: body = e.read().decode("utf-8", "ignore")
+        except Exception: pass
+        raise RuntimeError(f"Groq {e.code}: {body[:300]}") from None
+    r = json.loads(raw)
+    return _parse_json(r["choices"][0]["message"]["content"])
+
+def ler_nota(png_path):
+    """Usa o Groq (visão) se a chave estiver setada; senão o Gemini."""
+    return groq_le(png_path) if GROQ_KEY else gemini_le(png_path)
 
 # ---------- ticket -> loja (Supabase chamados) ----------
 def busca_chamado(ticket):
@@ -190,8 +222,8 @@ def _pagina_pdf(src, page, is_img, workdir, tag):
         return None
 
 def processar(arquivos, planilha_controle=None):
-    if not GEMINI_KEY:
-        return None, "⚠️ Falta configurar o segredo GEMINI_API_KEY."
+    if not (GEMINI_KEY or GROQ_KEY):
+        return None, "⚠️ Configure o segredo GROQ_API_KEY (ou GEMINI_API_KEY)."
     if not (SB_URL and SB_KEY):
         return None, "⚠️ Faltam os segredos SUPABASE_URL / SUPABASE_SERVICE_KEY."
     if not dropbox_rateio.ativo():
@@ -244,11 +276,11 @@ def processar(arquivos, planilha_controle=None):
             continue
         for idx, png in pgs:
             try:
-                nota = gemini_le(png)
+                nota = ler_nota(png)
             except Exception as e:
                 nota = {"ticket": None, "itens": [], "fornecedor": None, "_erro": str(e)}
             try:
-                print("GEMINI:", json.dumps({k: nota.get(k) for k in ("ticket","num_documento","fornecedor","obs","_erro")}, ensure_ascii=False)[:500], flush=True)
+                print("LEITURA:", json.dumps({k: nota.get(k) for k in ("ticket","num_documento","fornecedor","obs","_erro")}, ensure_ascii=False)[:500], flush=True)
             except Exception:
                 pass
             ticket = re.sub(r"\D", "", str(nota.get("ticket") or ""))
