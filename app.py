@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 36
+#  CONTADOR DE REVISÕES DESTE app.py: 38
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -40,7 +40,8 @@ LOGO = os.path.join(ASSETS, "logo_frota.jpg")
 CAD = json.load(open(os.path.join(ASSETS, "cadastro_lojas.json"), encoding="utf-8"))
 
 GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")   # 2.0-flash perdeu o free tier; 2.5-flash é grátis
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")   # ajustável; o motor ainda tem fallback abaixo
+_GEMINI_OK = None   # modelo que funcionou (cache entre chamadas)
 GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
 SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
@@ -127,12 +128,31 @@ def _parse_json(txt):
         return json.loads(m.group(0)) if m else {"ticket": None, "itens": []}
 
 def gemini_le(png_path):
+    """Tenta uma lista de modelos e usa o 1º que funcionar (memoriza no _GEMINI_OK)."""
+    global _GEMINI_OK
     from PIL import Image
     img = Image.open(png_path)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    r = model.generate_content([PROMPT, img],
-        generation_config={"temperature": 0, "response_mime_type": "application/json"})
-    return _parse_json(r.text)
+    candidatos = [_GEMINI_OK] if _GEMINI_OK else list(dict.fromkeys([
+        GEMINI_MODEL, "gemini-2.5-flash-lite", "gemini-flash-latest",
+        "gemini-2.0-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash",
+    ]))
+    ultimo = None
+    for nome in candidatos:
+        if not nome: continue
+        try:
+            model = genai.GenerativeModel(nome)
+            r = model.generate_content([PROMPT, img],
+                generation_config={"temperature": 0, "response_mime_type": "application/json"})
+            _GEMINI_OK = nome
+            return _parse_json(r.text)
+        except Exception as e:
+            ultimo = e
+            m = str(e).lower()
+            if any(s in m for s in ("not available", "not found", "404", "no longer",
+                                    "unsupported", "permission", "does not exist")):
+                continue                 # modelo indisponível p/ essa conta -> tenta o próximo
+            raise                        # erro real (ex.: cota) -> propaga
+    raise ultimo or RuntimeError("nenhum modelo Gemini disponível")
 
 def groq_le(png_path):
     import base64, io
@@ -320,7 +340,8 @@ def processar(arquivos, planilha_controle=None):
             reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "", "ticket": ticket, "loja": ""}
             pg = {"src": path, "page": idx, "is_img": is_img, "ticket": ticket, "num": numdoc}
             if not ticket:
-                diag.append({"forn": nota.get("fornecedor") or "?", "obs": str(nota.get("obs") or "")[:140], "err": nota.get("_erro")})
+                diag.append({"forn": nota.get("fornecedor") or "?", "obs": str(nota.get("obs") or "")[:140],
+                             "nitens": len(itens), "err": nota.get("_erro")})
                 sem_ticket.append({**reg, "status": "SEM TICKET"}); pg["cat"] = "SEM TICKET"; paginas.append(pg); continue
             ch = busca_chamado(ticket)
             if not ch:
@@ -394,9 +415,11 @@ def processar(arquivos, planilha_controle=None):
     msg.append(f"📁 {ok_r} nota(s) roteada(s) no Dropbox.")
     if duplicadas: msg.append(f"↩️ {duplicadas} nota(s) já processada(s) neste mês (ignoradas pelo número da nota).")
     if sem_ticket: msg.append(f"⚠️ {len(sem_ticket)} SEM TICKET (planilha de correção atualizada).")
+    if diag:
+        msg.append(f"🔎 Leitor: {'GROQ ' + GROQ_MODEL if GROQ_KEY else 'GEMINI ' + (_GEMINI_OK or GEMINI_MODEL)}")
     for x in diag[:5]:
-        det = x.get("err") and f" | ERRO leitura: {x['err']}" or ""
-        msg.append(f"   🔎 obs lida: «{x['obs']}»{det}")
+        det = x.get("err") and f" | ERRO: {x['err']}" or ""
+        msg.append(f"   🔎 forn='{x['forn']}' | itens={x.get('nitens')} | obs=«{x['obs']}»{det}")
     if nao_assoc:  msg.append(f"⚠️ {len(nao_assoc)} TICKET NÃO ASSOCIADO (planilha de correção atualizada).")
     if ctrl_ok:    msg.append("🧾 Planilha de controle do mês atualizada no Dropbox — baixe abaixo p/ enviar ao cliente.")
     errs = erros_dbx + erros_r
