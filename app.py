@@ -267,13 +267,41 @@ with gr.Blocks(title="Motor de Orçamentos — Frota Macedo") as demo:
     status = gr.Textbox(label="Resultado", lines=10)
     btn.click(processar, inputs=[notas, controle], outputs=[saida, status])
 
+def _basic_auth(app, user, pw):
+    """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI —
+    não interfere no streaming do Gradio."""
+    import base64, secrets
+    async def wrapped(scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            hdrs = dict(scope.get("headers") or [])
+            auth = hdrs.get(b"authorization", b"").decode()
+            ok = False
+            if auth.startswith("Basic "):
+                try:
+                    usr, _, pwd = base64.b64decode(auth[6:]).decode("utf-8", "ignore").partition(":")
+                    ok = secrets.compare_digest(usr, user) and secrets.compare_digest(pwd, pw)
+                except Exception:
+                    ok = False
+            if not ok:
+                if scope["type"] == "http":
+                    await send({"type": "http.response.start", "status": 401,
+                                "headers": [(b"www-authenticate", b'Basic realm="Motor"'),
+                                            (b"content-type", b"text/plain; charset=utf-8")]})
+                    await send({"type": "http.response.body", "body": "Autenticação necessária".encode()})
+                else:
+                    await send({"type": "websocket.close", "code": 1008})
+                return
+        await app(scope, receive, send)
+    return wrapped
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "7860"))    # Render/Cloud injeta PORT
     u, p = os.environ.get("APP_USER", ""), os.environ.get("APP_PASS", "")
-    auth = (u, p) if (u and p) else None           # senha simples (opcional)
     # Sobe via uvicorn (evita o autocheck de localhost do Gradio atrás de proxy)
     import uvicorn
     from fastapi import FastAPI
     demo.queue()
-    app = gr.mount_gradio_app(FastAPI(), demo, path="/", auth=auth)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    asgi = gr.mount_gradio_app(FastAPI(), demo, path="/")
+    if u and p:
+        asgi = _basic_auth(asgi, u, p)
+    uvicorn.run(asgi, host="0.0.0.0", port=port)
