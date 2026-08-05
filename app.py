@@ -14,8 +14,6 @@ Segredos (Settings -> Variables and secrets, no Space):
   (opcionais) GEMINI_MODEL, FAT_NOME, FAT_CNPJ
 """
 import os, re, json, shutil, subprocess, tempfile, datetime, zipfile, unicodedata, urllib.parse, urllib.request
-os.environ.setdefault("GRADIO_SSR_MODE", "False")   # sem SSR -> não precisa de Node
-import gradio as gr
 import google.generativeai as genai
 import dropbox_rateio
 
@@ -135,45 +133,54 @@ def gera_orcamento(ticket, chamado, itens_brutos, workdir, outdir, data_str, for
              "total_geral": prep["total_geral"], "extenso": prep["extenso"]}
     dj = os.path.join(workdir, f"dados_{ticket}.json")
     json.dump(dados, open(dj, "w"), ensure_ascii=False)
-    # pasta Mês/Loja
-    hoje = datetime.date.today()
-    pasta_mes = os.path.join(outdir, "ORCAMENTOS MONTADOS", f"{MESES[hoje.month-1]} {hoje.year}")
-    pasta_loja = os.path.join(pasta_mes, f"{num}_{slug(nome_loja)}")
-    os.makedirs(pasta_loja, exist_ok=True)
-    base = f"{num}_{nome_loja}_{ticket}"
-    pdf = os.path.join(pasta_loja, base + ".pdf")
+    base = f"{num}_{slug(nome_loja)}_{ticket}"
+    pdf = os.path.join(workdir, base + ".pdf")
     subprocess.run(["python3", os.path.join(SCRIPTS, "gerar_pdf.py"), dj, pdf, LOGO],
                    capture_output=True)
-    # planilha mensal
-    xlsx = os.path.join(pasta_mes, f"ORÇAMENTOS MONTADOS - {MESES[hoje.month-1]} {hoje.year}.xlsx")
-    if os.path.exists(pdf):
-        subprocess.run(["python3", os.path.join(SCRIPTS, "atualizar_planilha_mensal.py"),
-                        "--xlsx", xlsx, "--ticket", str(ticket), "--loja", nome_loja,
-                        "--pdf", pdf, "--data", data_str], capture_output=True)
-    return dict(ticket=ticket, loja=f"{num} - {nome_loja}", total=prep["total_geral"],
-                pdf_ok=os.path.exists(pdf))
+    return dict(ticket=ticket, num=num, nome_loja=nome_loja, loja=f"{num} - {nome_loja}",
+                total=prep["total_geral"], pdf=pdf, base=base, pdf_ok=os.path.exists(pdf))
 
 # ---------- orquestração ----------
-def processar(arquivos, planilha_controle):
+def _nota_nome(path, info):
+    """Nome da nota roteada no Dropbox: 'TICKET <n> - NOTA <doc>.pdf'."""
+    ext = (os.path.splitext(path)[1] or ".pdf")
+    num = re.sub(r'[\\/:*?"<>|]', "", str(info.get("num") or "")).strip()
+    tk = info.get("ticket") or ""
+    if info["cat"] == "SEM TICKET":
+        base = f"TICKET SEMTICKET - NOTA {num}" if num else os.path.splitext(os.path.basename(path))[0]
+    elif tk:
+        base = f"TICKET {tk} - NOTA {num}" if num else f"TICKET {tk}"
+    else:
+        base = os.path.splitext(os.path.basename(path))[0]
+    return base + ext
+
+def processar(arquivos, planilha_controle=None):
     if not GEMINI_KEY:
-        return None, "⚠️ Falta configurar o segredo GEMINI_API_KEY no Space."
+        return None, "⚠️ Falta configurar o segredo GEMINI_API_KEY."
     if not (SB_URL and SB_KEY):
         return None, "⚠️ Faltam os segredos SUPABASE_URL / SUPABASE_SERVICE_KEY."
+    if not dropbox_rateio.ativo():
+        return None, "⚠️ Configure os segredos do Dropbox (DROPBOX_APP_KEY/SECRET/REFRESH_TOKEN/BASE)."
+    try:
+        access = dropbox_rateio.obter_token()
+        if not access: raise RuntimeError("token vazio")
+    except Exception as e:
+        return None, f"⚠️ Falha ao autenticar no Dropbox: {e}"
+
     work = tempfile.mkdtemp(prefix="orc_")
-    out = os.path.join(work, "SAIDA"); os.makedirs(out, exist_ok=True)
-    data_str = datetime.date.today().strftime("%d/%m/%Y")
-
-    # se enviaram a planilha de controle, ela entra na pasta do mês para ser atualizada
     hoje = datetime.date.today()
-    pasta_mes = os.path.join(out, "ORCAMENTOS MONTADOS", f"{MESES[hoje.month-1]} {hoje.year}")
-    os.makedirs(pasta_mes, exist_ok=True)
-    if planilha_controle:
-        shutil.copy(planilha_controle, os.path.join(pasta_mes, f"ORÇAMENTOS MONTADOS - {MESES[hoje.month-1]} {hoje.year}.xlsx"))
+    mes = f"{MESES[hoje.month-1]} {hoje.year}"
+    data_str = hoje.strftime("%d/%m/%Y")
+    B = dropbox_rateio.BASE
+    dbx_mes = f"{B}/{dropbox_rateio.ORCAMENTOS}/{mes}"
+    ATUALIZAR = os.path.join(SCRIPTS, "atualizar_planilha_mensal.py")
+    PENDENTES = os.path.join(SCRIPTS, "pendentes.py")
+    erros_dbx = []
 
-    # 1) lê todas as notas (páginas) com o Gemini e agrupa por ticket
-    por_ticket = {}   # ticket -> {"chamado":..., "itens":[...], "forma":...}
+    # 1) lê todas as notas com o Gemini e agrupa por ticket
+    por_ticket = {}
     sem_ticket, nao_assoc = [], []
-    rateio = {}       # caminho do arquivo -> {"cat","ticket","num"} (p/ o Dropbox)
+    rateio = {}       # caminho -> {"cat","ticket","num"}
     PRIO = {"RESIDUAL": 0, "SEM TICKET": 1, "NAO ASSOCIADO": 2, "CIVIL": 3, "INSTALACOES": 3}
     def marca(path, cat, ticket="", num=""):
         cur = rateio.setdefault(path, {"cat": "RESIDUAL", "ticket": "", "num": ""})
@@ -187,13 +194,12 @@ def processar(arquivos, planilha_controle):
         for idx, png in paginas_imagens(path, work):
             try:
                 nota = gemini_le(png)
-            except Exception as e:
+            except Exception:
                 nota = {"ticket": None, "itens": [], "fornecedor": None}
             ticket = re.sub(r"\D", "", str(nota.get("ticket") or ""))
             itens = nota.get("itens") or []
             numdoc = str(nota.get("num_documento") or "")
-            reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "",
-                   "ticket": ticket, "loja": ""}
+            reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "", "ticket": ticket, "loja": ""}
             if not ticket:
                 sem_ticket.append({**reg, "status": "SEM TICKET"}); marca(path, "SEM TICKET", num=numdoc); continue
             ch = busca_chamado(ticket)
@@ -204,73 +210,159 @@ def processar(arquivos, planilha_controle):
             g["itens"].extend(itens)
             if nota.get("forma_pagamento") and not g["forma"]: g["forma"] = nota.get("forma_pagamento")
 
-    # 2) gera 1 orçamento por ticket
+    # 2) baixa a planilha de controle do mês (se já existir no Dropbox) p/ atualizar
+    ctrl = os.path.join(work, f"ORÇAMENTOS MONTADOS - {mes}.xlsx")
+    ctrl_dbx = f"{dbx_mes}/ORÇAMENTOS MONTADOS - {mes}.xlsx"
+    try:
+        atual = dropbox_rateio.baixar(access, ctrl_dbx)
+        if atual: open(ctrl, "wb").write(atual)
+    except Exception as e:
+        erros_dbx.append(f"baixar controle: {e}")
+
+    # 3) gera 1 orçamento por ticket -> sobe PDF (mês/loja + não lançados) + atualiza controle
     feitos = []
     for ticket, g in por_ticket.items():
         if not g["itens"]: continue
         try:
-            feitos.append(gera_orcamento(ticket, g["chamado"], g["itens"], work, out, data_str, g["forma"]))
+            d = gera_orcamento(ticket, g["chamado"], g["itens"], work, work, data_str, g["forma"])
         except Exception as e:
-            nao_assoc.append({"nota": "", "fornecedor": "", "status": f"ERRO: {e}", "ticket": ticket, "loja": ""})
+            nao_assoc.append({"nota": "", "fornecedor": "", "status": f"ERRO: {e}", "ticket": ticket, "loja": ""}); continue
+        feitos.append(d)
+        if d["pdf_ok"]:
+            subprocess.run(["python3", ATUALIZAR, "--xlsx", ctrl, "--ticket", str(ticket),
+                            "--loja", d["nome_loja"], "--pdf", d["pdf"], "--data", data_str], capture_output=True)
+            nome_pdf = d["base"] + ".pdf"
+            try: dropbox_rateio.subir(access, d["pdf"], f"{dbx_mes}/{d['num']}_{slug(d['nome_loja'])}/{nome_pdf}")
+            except Exception as e: erros_dbx.append(f"PDF {ticket}: {e}")
+            try: dropbox_rateio.subir(access, d["pdf"], f"{B}/{dropbox_rateio.NAO_LANCADOS}/{nome_pdf}")
+            except Exception as e: erros_dbx.append(f"não lançados {ticket}: {e}")
 
-    # 3) planilha de correção (SEM TICKET + TICKET NÃO ASSOCIADO)
-    pend = sem_ticket + nao_assoc
-    if pend:
-        corr = os.path.join(out, "NOTAS PARA CORREÇÃO.xlsx")
-        inp = os.path.join(work, "pend.json"); json.dump(pend, open(inp, "w"), ensure_ascii=False)
-        subprocess.run(["python3", os.path.join(SCRIPTS, "pendentes.py"), "add",
-                        "--xlsx", corr, "--input", inp], capture_output=True)
+    # 4) sobe a planilha de controle atualizada (sobrescreve)
+    ctrl_ok = os.path.exists(ctrl)
+    if ctrl_ok:
+        try: dropbox_rateio.subir(access, ctrl, ctrl_dbx, overwrite=True)
+        except Exception as e: erros_dbx.append(f"subir controle: {e}")
 
-    # 4) zip
-    zip_path = os.path.join(work, f"orcamentos_{hoje.strftime('%Y-%m-%d')}.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(out):
-            for fn in files:
-                fp = os.path.join(root, fn)
-                z.write(fp, os.path.relpath(fp, out))
+    # 5) planilhas de correção por categoria (baixa -> adiciona -> sobe)
+    def atualiza_correcao(lista, subpasta, arq):
+        if not lista: return
+        dbxp = f"{B}/{subpasta}/{arq}"
+        local = os.path.join(work, arq)
+        try:
+            atual = dropbox_rateio.baixar(access, dbxp)
+            if atual: open(local, "wb").write(atual)
+        except Exception as e:
+            erros_dbx.append(f"baixar {arq}: {e}")
+        inp = os.path.join(work, "p_" + re.sub(r"\W+", "_", subpasta) + ".json")
+        json.dump(lista, open(inp, "w"), ensure_ascii=False)
+        subprocess.run(["python3", PENDENTES, "add", "--xlsx", local, "--input", inp], capture_output=True)
+        if os.path.exists(local):
+            try: dropbox_rateio.subir(access, local, dbxp, overwrite=True)
+            except Exception as e: erros_dbx.append(f"subir {arq}: {e}")
+    atualiza_correcao(sem_ticket, "SEM TICKET", "NOTAS - SEM TICKET.xlsx")
+    atualiza_correcao(nao_assoc, "TICKET NAO ASSOCIADO", "NOTAS - TICKET NAO ASSOCIADO.xlsx")
 
-    # 5) rateio direto no Dropbox online (se configurado)
-    dbx_msg = ""
-    if dropbox_rateio.ativo():
-        def nome_dest(path, info):
-            ext = (os.path.splitext(path)[1] or ".pdf")
-            num = re.sub(r'[\\/:*?"<>|]', "", str(info.get("num") or "")).strip()
-            tk = info.get("ticket") or ""
-            if info["cat"] == "SEM TICKET":
-                base = f"TICKET SEMTICKET - NOTA {num}" if num else os.path.splitext(os.path.basename(path))[0]
-            elif tk:
-                base = f"TICKET {tk} - NOTA {num}" if num else f"TICKET {tk}"
-            else:
-                base = os.path.splitext(os.path.basename(path))[0]
-            return base + ext
-        itens_dbx = [{"local": p, "categoria": info["cat"], "nome_destino": nome_dest(p, info)}
-                     for p, info in rateio.items()]
-        ok, erros = dropbox_rateio.ratear(itens_dbx)
-        dbx_msg = f"📁 Dropbox: {ok} arquivo(s) rateado(s)."
-        if erros: dbx_msg += f"  ({len(erros)} falha(s): " + "; ".join(erros[:3]) + ")"
+    # 6) roteia as notas para as pastas certas
+    itens_dbx = [{"local": p, "categoria": info["cat"], "nome_destino": _nota_nome(p, info)}
+                 for p, info in rateio.items()]
+    ok_r, erros_r = dropbox_rateio.ratear(access, itens_dbx)
 
-    msg = [f"✅ {len(feitos)} orçamento(s) gerado(s)."]
+    # mensagem
+    msg = [f"✅ {len(feitos)} orçamento(s) gerado(s) e enviado(s) ao Dropbox."]
     for d in feitos: msg.append(f"• Ticket {d['ticket']} — {d['loja']} — {d['total']}" + ("" if d['pdf_ok'] else "  (⚠️ PDF falhou)"))
-    if sem_ticket: msg.append(f"⚠️ {len(sem_ticket)} nota(s) SEM TICKET (na planilha de correção).")
-    if nao_assoc: msg.append(f"⚠️ {len(nao_assoc)} nota(s) com TICKET NÃO ASSOCIADO (na planilha de correção).")
-    if dbx_msg: msg.append(dbx_msg)
-    return zip_path, "\n".join(msg)
+    msg.append(f"📁 {ok_r} nota(s) roteada(s) no Dropbox.")
+    if sem_ticket: msg.append(f"⚠️ {len(sem_ticket)} SEM TICKET (planilha de correção atualizada).")
+    if nao_assoc:  msg.append(f"⚠️ {len(nao_assoc)} TICKET NÃO ASSOCIADO (planilha de correção atualizada).")
+    if ctrl_ok:    msg.append("🧾 Planilha de controle do mês atualizada no Dropbox — baixe abaixo p/ enviar ao cliente.")
+    errs = erros_dbx + erros_r
+    if errs: msg.append("⚠️ Erros no Dropbox: " + "; ".join(errs[:4]))
+    return (ctrl if ctrl_ok else None), "\n".join(msg)
 
-# ---------- interface ----------
-with gr.Blocks(title="Motor de Orçamentos — Frota Macedo") as demo:
-    gr.Markdown("## Motor de Orçamentos — Frota Macedo\nSuba as **notas/DAVs** (PDF ou imagem) e, se quiser, a **planilha de controle** do mês. Clique em **Gerar** e baixe o ZIP.")
-    with gr.Row():
-        notas = gr.File(label="Notas / DAVs", file_count="multiple",
-                        file_types=[".pdf", ".jpg", ".jpeg", ".png"])
-        controle = gr.File(label="Planilha de controle do mês (opcional)", file_types=[".xlsx"])
-    btn = gr.Button("Gerar orçamentos", variant="primary")
-    saida = gr.File(label="ZIP com os orçamentos")
-    status = gr.Textbox(label="Resultado", lines=10)
-    btn.click(processar, inputs=[notas, controle], outputs=[saida, status])
+# ---------- interface (FastAPI puro — sem Gradio) ----------
+from fastapi import FastAPI, UploadFile, File, Request
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
+
+app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
+RESULTS = {}   # token -> caminho do zip
+
+PAGINA = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Motor de Orçamentos — Frota Macedo</title>
+<style>
+ body{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:640px;margin:28px auto;padding:0 18px;color:#1e2733}
+ h1{font-size:21px;color:#1F3864} .card{border:1px solid #C9CFDA;border-radius:12px;padding:20px;background:#fff}
+ label{font-weight:bold;display:block;margin:14px 0 6px} input[type=file]{width:100%}
+ button{margin-top:18px;background:#1F3864;color:#fff;border:0;border-radius:8px;padding:12px 20px;font-size:16px;cursor:pointer}
+ button:disabled{background:#9aa4b4} small{color:#5A6472} #msg{white-space:pre-wrap;margin-top:16px}
+ .ok{color:#1a7f37} .err{color:#b3261e} a.dl{display:inline-block;margin-top:14px;background:#1a7f37;color:#fff;padding:11px 18px;border-radius:8px;text-decoration:none}
+</style></head><body>
+<h1>Motor de Orçamentos — Frota Macedo</h1>
+<div class="card">
+ <p><small>Suba as notas/DAVs. O motor gera os orçamentos, envia tudo para o seu Dropbox
+ (orçamentos, notas roteadas, planilhas) e deixa a <b>planilha de controle do mês</b> pronta para baixar e enviar ao cliente.</small></p>
+ <form id="f">
+  <label>Notas / DAVs (PDF ou imagem — pode selecionar várias)</label>
+  <input type="file" name="notas" multiple accept=".pdf,.jpg,.jpeg,.png" required>
+  <button id="b" type="submit">Gerar e enviar ao Dropbox</button>
+ </form>
+ <div id="msg"></div>
+</div>
+<script>
+const f=document.getElementById('f'), b=document.getElementById('b'), msg=document.getElementById('msg');
+f.addEventListener('submit', async (e)=>{
+ e.preventDefault(); b.disabled=true; b.textContent='Processando… (pode levar 1–2 min)'; msg.textContent='';
+ try{
+  const r=await fetch('processar',{method:'POST',body:new FormData(f)});
+  const j=await r.json();
+  if(j.erro){ msg.innerHTML='<span class="err">'+j.erro+'</span>'; }
+  else{
+   const warn=(j.status||'').trim().indexOf('⚠️')===0;
+   let h='<span class="'+(warn?'err':'ok')+'">'+(j.status||'').replace(/</g,'&lt;')+'</span>';
+   if(j.token){ h+='<br><a class="dl" href="baixar?t='+j.token+'">⬇ Baixar planilha de controle</a>'; }
+   msg.innerHTML=h;
+  }
+ }catch(err){ msg.innerHTML='<span class="err">Falhou: '+err+'</span>'; }
+ b.disabled=false; b.textContent='Gerar e enviar ao Dropbox';
+});
+</script></body></html>"""
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return PAGINA
+
+@app.post("/processar")
+async def processar_endpoint(request: Request):
+    form = await request.form()
+    tmp = tempfile.mkdtemp(prefix="up_")
+    caminhos = []
+    for uf in form.getlist("notas"):
+        if not getattr(uf, "filename", ""): continue
+        dest = os.path.join(tmp, os.path.basename(uf.filename))
+        with open(dest, "wb") as w: w.write(await uf.read())
+        caminhos.append(dest)
+    if not caminhos:
+        return {"erro": "Selecione ao menos uma nota."}
+    try:
+        path, status = processar(caminhos)
+    except Exception as e:
+        return {"erro": f"Erro ao processar: {e}"}
+    token = None
+    if path and os.path.exists(path):
+        import secrets as _s
+        token = _s.token_urlsafe(10)
+        RESULTS[token] = path
+    return {"status": status, "token": token}
+
+@app.get("/baixar")
+def baixar(t: str):
+    path = RESULTS.get(t)
+    if not path or not os.path.exists(path):
+        return PlainTextResponse("Arquivo expirado — gere novamente.", status_code=404)
+    return FileResponse(path, filename=os.path.basename(path),
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 def _basic_auth(app, user, pw):
-    """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI —
-    não interfere no streaming do Gradio."""
+    """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
     import base64, secrets
     async def wrapped(scope, receive, send):
         if scope["type"] in ("http", "websocket"):
@@ -298,11 +390,6 @@ def _basic_auth(app, user, pw):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "7860"))    # Render/Cloud injeta PORT
     u, p = os.environ.get("APP_USER", ""), os.environ.get("APP_PASS", "")
-    # Sobe via uvicorn (evita o autocheck de localhost do Gradio atrás de proxy)
     import uvicorn
-    from fastapi import FastAPI
-    demo.queue()
-    asgi = gr.mount_gradio_app(FastAPI(), demo, path="/")
-    if u and p:
-        asgi = _basic_auth(asgi, u, p)
+    asgi = _basic_auth(app, u, p) if (u and p) else app
     uvicorn.run(asgi, host="0.0.0.0", port=port)
