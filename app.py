@@ -1,19 +1,35 @@
 # -*- coding: utf-8 -*-
+# =====================================================================
+#  CONTADOR DE REVISÕES DESTE app.py: 36
+#  (some +1 sempre que uma versão nova for gerada)
+# =====================================================================
 """
-MOTOR DE ORÇAMENTOS — Frota Macedo (100% online, Hugging Face Spaces)
-Operador sobe notas/DAVs (+ opcional planilha de controle) -> OK -> baixa um ZIP com:
-  - orçamentos (Word + PDF) por Mês/Loja
-  - planilha de controle mensal atualizada
-  - planilha de correção (notas SEM TICKET / TICKET NÃO ASSOCIADO)
+MOTOR DE ORÇAMENTOS — Frota Macedo  (100% online: FastAPI no Render)
 
-Leitura das notas: Google Gemini (visão).  Ticket->loja: tabela `chamados` no Supabase.
-Regras (reaproveitadas dos scripts): +20% no unitário, rateio de entrega, 1 orçamento por ticket.
+O operador abre a página, sobe as NOTAS/DAVs (PDF ou imagem) e clica em
+"Gerar e enviar ao Dropbox". O motor faz TUDO no Dropbox online (não devolve ZIP):
+  - gera 1 orçamento (PDF) por ticket em ORCAMENTOS MONTADOS/<mês>/<loja>/
+    e uma cópia em "1 - ORÇAMENTOS NÃO LANÇADOS" (p/ o robô do Trílogo);
+  - roteia cada nota (página a página) em NOTAS INCLUIDAS ORCAMENTO/<aba>,
+    SEM TICKET ou TICKET NAO ASSOCIADO;
+  - mantém a planilha de controle do mês atualizada (e oferece p/ baixar no app);
+  - atualiza as planilhas de correção (SEM TICKET / TICKET NAO ASSOCIADO).
 
-Segredos (Settings -> Variables and secrets, no Space):
-  GEMINI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
-  (opcionais) GEMINI_MODEL, FAT_NOME, FAT_CNPJ
+Leitura das notas (visão): Groq (Llama/Qwen) se GROQ_API_KEY existir; senão Gemini.
+Ticket -> loja/aba: tabela `chamados` no Supabase (alimentada pelo robô do Trílogo).
+Regras (dos scripts): +20% no unitário (sem mencionar), rateio de entrega,
+1 orçamento por ticket, dedup pelo NÚMERO DA NOTA (permite +1 orçamento por ticket).
+
+Interface: FastAPI + uvicorn (sem Gradio). Login por HTTP Basic (APP_USER/APP_PASS).
+
+Segredos no Render (Environment):
+  Leitura:  GROQ_API_KEY   (recomendado)  ou  GEMINI_API_KEY
+  Supabase: SUPABASE_URL, SUPABASE_SERVICE_KEY
+  Login:    APP_USER, APP_PASS
+  Dropbox:  DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN, DROPBOX_BASE
+  Opcionais: GROQ_MODEL, GEMINI_MODEL, FAT_NOME, FAT_CNPJ
 """
-import os, re, json, shutil, subprocess, tempfile, datetime, zipfile, unicodedata, urllib.parse, urllib.request, urllib.error
+import os, re, json, subprocess, tempfile, datetime, unicodedata, urllib.parse, urllib.request, urllib.error
 import google.generativeai as genai
 import dropbox_rateio
 
@@ -24,7 +40,7 @@ LOGO = os.path.join(ASSETS, "logo_frota.jpg")
 CAD = json.load(open(os.path.join(ASSETS, "cadastro_lojas.json"), encoding="utf-8"))
 
 GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")   # 2.0-flash perdeu o free tier; 2.5-flash é grátis
 GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
 SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
@@ -392,7 +408,7 @@ from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
 
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
-RESULTS = {}   # token -> caminho do zip
+RESULTS = {}   # token -> caminho da planilha de controle p/ download
 
 PAGINA = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
