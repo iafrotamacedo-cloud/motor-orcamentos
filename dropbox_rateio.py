@@ -24,14 +24,14 @@ APP_KEY   = os.environ.get("DROPBOX_APP_KEY", "")
 APP_SECRET= os.environ.get("DROPBOX_APP_SECRET", "")
 REFRESH   = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
 TOKEN     = os.environ.get("DROPBOX_TOKEN", "")
-BASE      = os.environ.get("DROPBOX_BASE", "/AUTOMACAO ADMINISTRATIVO/3 - ORCAMENTOS/RATEIO").rstrip("/")
+BASE      = os.environ.get("DROPBOX_BASE", "/AUTOMACAO MANUTENCAO").rstrip("/")
 
 PASTAS = {
     "INSTALACOES":     "NOTAS INCLUIDAS ORCAMENTO/INSTALACOES",
     "CIVIL":           "NOTAS INCLUIDAS ORCAMENTO/CIVIL",
     "SEM TICKET":      "SEM TICKET",
     "NAO ASSOCIADO":   "TICKET NAO ASSOCIADO",
-    "RESIDUAL":        "ARQUIVOS RESIDUAIS",
+    "RESIDUAL":        "ARQUIVOS RESIDUAIS (NÃO MEXER)",
 }
 
 def ativo():
