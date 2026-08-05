@@ -234,6 +234,7 @@ def processar(arquivos, planilha_controle=None):
     paginas = []          # cada página vira 1 arquivo roteado no Dropbox
     novas_notas = set()
     duplicadas = 0
+    diag = []             # diagnóstico do que o Gemini leu (p/ notas SEM TICKET)
     for f in (arquivos or []):
         path = f.name if hasattr(f, "name") else f
         is_img = path.lower().rsplit(".", 1)[-1] in ("jpg", "jpeg", "png")
@@ -244,8 +245,12 @@ def processar(arquivos, planilha_controle=None):
         for idx, png in pgs:
             try:
                 nota = gemini_le(png)
+            except Exception as e:
+                nota = {"ticket": None, "itens": [], "fornecedor": None, "_erro": str(e)}
+            try:
+                print("GEMINI:", json.dumps({k: nota.get(k) for k in ("ticket","num_documento","fornecedor","obs","_erro")}, ensure_ascii=False)[:500], flush=True)
             except Exception:
-                nota = {"ticket": None, "itens": [], "fornecedor": None}
+                pass
             ticket = re.sub(r"\D", "", str(nota.get("ticket") or ""))
             if not ticket:                                   # rede de segurança: extrai do texto da observação
                 ticket = ticket_do_texto(nota.get("obs"))
@@ -258,6 +263,7 @@ def processar(arquivos, planilha_controle=None):
             reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "", "ticket": ticket, "loja": ""}
             pg = {"src": path, "page": idx, "is_img": is_img, "ticket": ticket, "num": numdoc}
             if not ticket:
+                diag.append({"forn": nota.get("fornecedor") or "?", "obs": str(nota.get("obs") or "")[:140], "err": nota.get("_erro")})
                 sem_ticket.append({**reg, "status": "SEM TICKET"}); pg["cat"] = "SEM TICKET"; paginas.append(pg); continue
             ch = busca_chamado(ticket)
             if not ch:
@@ -331,6 +337,9 @@ def processar(arquivos, planilha_controle=None):
     msg.append(f"📁 {ok_r} nota(s) roteada(s) no Dropbox.")
     if duplicadas: msg.append(f"↩️ {duplicadas} nota(s) já processada(s) neste mês (ignoradas pelo número da nota).")
     if sem_ticket: msg.append(f"⚠️ {len(sem_ticket)} SEM TICKET (planilha de correção atualizada).")
+    for x in diag[:5]:
+        det = x.get("err") and f" | ERRO leitura: {x['err']}" or ""
+        msg.append(f"   🔎 obs lida: «{x['obs']}»{det}")
     if nao_assoc:  msg.append(f"⚠️ {len(nao_assoc)} TICKET NÃO ASSOCIADO (planilha de correção atualizada).")
     if ctrl_ok:    msg.append("🧾 Planilha de controle do mês atualizada no Dropbox — baixe abaixo p/ enviar ao cliente.")
     errs = erros_dbx + erros_r
