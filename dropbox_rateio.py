@@ -36,6 +36,13 @@ PASTAS = {
 def ativo():
     return bool(TOKEN or (APP_KEY and APP_SECRET and REFRESH))
 
+def _erro(e):
+    """Extrai a mensagem real do Dropbox de um HTTPError."""
+    body = ""
+    try: body = e.read().decode("utf-8", "ignore")
+    except Exception: pass
+    return f"HTTP {e.code}: {body[:300]}"
+
 def obter_token():
     """Token de acesso (renova pelo refresh token) ou DROPBOX_TOKEN direto."""
     if APP_KEY and APP_SECRET and REFRESH:
@@ -44,7 +51,12 @@ def obter_token():
             "client_id": APP_KEY, "client_secret": APP_SECRET,
         }).encode()
         req = urllib.request.Request("https://api.dropbox.com/oauth2/token", data=data)
-        r = json.loads(urllib.request.urlopen(req, timeout=20).read().decode())
+        try:
+            r = json.loads(urllib.request.urlopen(req, timeout=20).read().decode())
+        except urllib.error.HTTPError as e:
+            raise RuntimeError("token: " + _erro(e)) from None
+        if not r.get("access_token"):
+            raise RuntimeError(f"token sem access_token: {r}")
         return r.get("access_token")
     return TOKEN
 
@@ -52,22 +64,25 @@ def baixar(access, dropbox_path):
     """Baixa um arquivo do Dropbox. Retorna bytes, ou None se não existir."""
     req = urllib.request.Request("https://content.dropboxapi.com/2/files/download",
         data=b"", headers={"Authorization": f"Bearer {access}",
-                           "Dropbox-API-Arg": json.dumps({"path": dropbox_path})})
+                           "Dropbox-API-Arg": json.dumps({"path": dropbox_path}, ensure_ascii=True)})
     try:
         return urllib.request.urlopen(req, timeout=120).read()
     except urllib.error.HTTPError as e:
-        if e.code in (404, 409):   # not_found
+        if e.code == 409:   # path/not_found
             return None
-        raise
+        raise RuntimeError(_erro(e)) from None
 
 def subir_bytes(access, data, dropbox_path, overwrite=False):
     arg = {"path": dropbox_path, "mode": ("overwrite" if overwrite else "add"),
            "autorename": (not overwrite), "mute": True}
     req = urllib.request.Request("https://content.dropboxapi.com/2/files/upload",
         data=data, headers={"Authorization": f"Bearer {access}",
-                            "Dropbox-API-Arg": json.dumps(arg),
+                            "Dropbox-API-Arg": json.dumps(arg, ensure_ascii=True),
                             "Content-Type": "application/octet-stream"})
-    urllib.request.urlopen(req, timeout=180).read()
+    try:
+        urllib.request.urlopen(req, timeout=180).read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(_erro(e)) from None
 
 def subir(access, local_path, dropbox_path, overwrite=False):
     with open(local_path, "rb") as fh:
