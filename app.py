@@ -172,14 +172,17 @@ def processar(arquivos, planilha_controle):
     # 1) lê todas as notas (páginas) com o Gemini e agrupa por ticket
     por_ticket = {}   # ticket -> {"chamado":..., "itens":[...], "forma":...}
     sem_ticket, nao_assoc = [], []
-    rateio = {}       # caminho do arquivo -> categoria (p/ o Dropbox); guarda a melhor
+    rateio = {}       # caminho do arquivo -> {"cat","ticket","num"} (p/ o Dropbox)
     PRIO = {"RESIDUAL": 0, "SEM TICKET": 1, "NAO ASSOCIADO": 2, "CIVIL": 3, "INSTALACOES": 3}
-    def marca(path, cat):
-        if PRIO.get(cat, 0) >= PRIO.get(rateio.get(path, "RESIDUAL"), 0):
-            rateio[path] = cat
+    def marca(path, cat, ticket="", num=""):
+        cur = rateio.setdefault(path, {"cat": "RESIDUAL", "ticket": "", "num": ""})
+        if PRIO.get(cat, 0) >= PRIO.get(cur["cat"], 0):
+            cur["cat"] = cat
+        if ticket and not cur["ticket"]: cur["ticket"] = ticket
+        if num and not cur["num"]: cur["num"] = num
     for f in (arquivos or []):
         path = f.name if hasattr(f, "name") else f
-        rateio.setdefault(path, "RESIDUAL")
+        rateio.setdefault(path, {"cat": "RESIDUAL", "ticket": "", "num": ""})
         for idx, png in paginas_imagens(path, work):
             try:
                 nota = gemini_le(png)
@@ -187,14 +190,15 @@ def processar(arquivos, planilha_controle):
                 nota = {"ticket": None, "itens": [], "fornecedor": None}
             ticket = re.sub(r"\D", "", str(nota.get("ticket") or ""))
             itens = nota.get("itens") or []
-            reg = {"nota": nota.get("num_documento") or "", "fornecedor": nota.get("fornecedor") or "",
+            numdoc = str(nota.get("num_documento") or "")
+            reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "",
                    "ticket": ticket, "loja": ""}
             if not ticket:
-                sem_ticket.append({**reg, "status": "SEM TICKET"}); marca(path, "SEM TICKET"); continue
+                sem_ticket.append({**reg, "status": "SEM TICKET"}); marca(path, "SEM TICKET", num=numdoc); continue
             ch = busca_chamado(ticket)
             if not ch:
-                nao_assoc.append({**reg, "status": "TICKET NÃO ASSOCIADO"}); marca(path, "NAO ASSOCIADO"); continue
-            marca(path, (ch.get("aba") or "CIVIL").upper())
+                nao_assoc.append({**reg, "status": "TICKET NÃO ASSOCIADO"}); marca(path, "NAO ASSOCIADO", ticket=ticket, num=numdoc); continue
+            marca(path, (ch.get("aba") or "CIVIL").upper(), ticket=ticket, num=numdoc)
             g = por_ticket.setdefault(ticket, {"chamado": ch, "itens": [], "forma": nota.get("forma_pagamento")})
             g["itens"].extend(itens)
             if nota.get("forma_pagamento") and not g["forma"]: g["forma"] = nota.get("forma_pagamento")
@@ -227,7 +231,19 @@ def processar(arquivos, planilha_controle):
     # 5) rateio direto no Dropbox online (se configurado)
     dbx_msg = ""
     if dropbox_rateio.ativo():
-        itens_dbx = [{"local": p, "categoria": cat} for p, cat in rateio.items()]
+        def nome_dest(path, info):
+            ext = (os.path.splitext(path)[1] or ".pdf")
+            num = re.sub(r'[\\/:*?"<>|]', "", str(info.get("num") or "")).strip()
+            tk = info.get("ticket") or ""
+            if info["cat"] == "SEM TICKET":
+                base = f"TICKET SEMTICKET - NOTA {num}" if num else os.path.splitext(os.path.basename(path))[0]
+            elif tk:
+                base = f"TICKET {tk} - NOTA {num}" if num else f"TICKET {tk}"
+            else:
+                base = os.path.splitext(os.path.basename(path))[0]
+            return base + ext
+        itens_dbx = [{"local": p, "categoria": info["cat"], "nome_destino": nome_dest(p, info)}
+                     for p, info in rateio.items()]
         ok, erros = dropbox_rateio.ratear(itens_dbx)
         dbx_msg = f"📁 Dropbox: {ok} arquivo(s) rateado(s)."
         if erros: dbx_msg += f"  ({len(erros)} falha(s): " + "; ".join(erros[:3]) + ")"
@@ -252,7 +268,12 @@ with gr.Blocks(title="Motor de Orçamentos — Frota Macedo") as demo:
     btn.click(processar, inputs=[notas, controle], outputs=[saida, status])
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "7860"))   # Cloud Run injeta PORT (8080)
+    port = int(os.environ.get("PORT", "7860"))    # Render/Cloud injeta PORT
     u, p = os.environ.get("APP_USER", ""), os.environ.get("APP_PASS", "")
-    auth = (u, p) if (u and p) else None          # senha simples (opcional)
-    demo.launch(server_name="0.0.0.0", server_port=port, auth=auth)
+    auth = (u, p) if (u and p) else None           # senha simples (opcional)
+    # Sobe via uvicorn (evita o autocheck de localhost do Gradio atrás de proxy)
+    import uvicorn
+    from fastapi import FastAPI
+    demo.queue()
+    app = gr.mount_gradio_app(FastAPI(), demo, path="/", auth=auth)
+    uvicorn.run(app, host="0.0.0.0", port=port)
