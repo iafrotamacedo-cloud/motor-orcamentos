@@ -42,6 +42,17 @@ def norm(s):
     s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii","ignore").decode().upper()
     return re.sub(r"[^A-Z0-9 ]", " ", s).strip()
 
+def fmt_cnpj(s):
+    d = re.sub(r"\D", "", str(s or ""))
+    if len(d) == 14:
+        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+    return str(s).strip() if s else "—"
+
+def cidade_de(endereco):
+    """Extrai 'Cidade - UF' de um endereço do cadastro (ex.: '..., Fortaleza - CE, 60175-395')."""
+    m = re.search(r",\s*([^,]+?\s*-\s*[A-Z]{2})\b", str(endereco or ""))
+    return m.group(1).strip() if m else ""
+
 # ---------- leitura das notas (render por página) ----------
 def paginas_imagens(path, workdir):
     """Retorna lista de (indice, caminho_png). PDF: render por página; imagem: usa direto."""
@@ -66,14 +77,15 @@ def paginas_imagens(path, workdir):
     return out
 
 PROMPT = """Você lê UMA nota fiscal / DAV / orçamento de fornecedor (imagem).
+O EMITENTE (Razão Social de quem emitiu) é o "fornecedor". Ignore o destinatário.
 Extraia SOMENTE o que estiver na nota e responda em JSON puro (sem texto fora do JSON):
 {
- "ticket": "<número do ticket/chamado, 5-6 dígitos, aparece como #NNNNNN, TICKET NNNNNN, TICKTE/ NNNNNN, ORÇAMENTO NNNNNN, em Observação/Dados adicionais; se não houver, null>",
- "num_documento": "<Nº do documento/nota; se não houver, null>",
- "fornecedor": "<razão social do emitente>",
- "forma_pagamento": "<ex.: Boleto 30 dias, se aparecer; senão null>",
+ "ticket": "<número do ticket/chamado, 5-6 dígitos. Quase sempre aparece no campo Observação / Dados Complementares / Dados adicionais, precedido por um rótulo que PODE estar com erro de digitação ou abreviado: TICKET, TICKER, TICKTE, TIKET, TCKET, TK, CHAMADO, OS, ORÇAMENTO, ou apenas #. Retorne SÓ os dígitos. Exemplos: 'TICKER:126486 AMAURI COCO' -> 126486 ; 'Obs: tk 125411' -> 125411 ; '#126486' -> 126486. Só use null se não houver mesmo nenhum número de 5-6 dígitos com esse sentido>",
+ "num_documento": "<Nº do Documento/Nota, só os dígitos e SEM zeros à esquerda (ex.: '0000018747' -> '18747'); se não houver, null>",
+ "fornecedor": "<razão social do EMITENTE>",
+ "forma_pagamento": "<ex.: Boleto 30 dias / Plano de Pagamento, se aparecer; senão null>",
  "itens": [
-   {"desc":"<descrição do item>", "quant":<número>, "unid":"<UN/PC/SV/…>", "unit":<valor UNITÁRIO BRUTO, sem imposto/desconto>}
+   {"desc":"<descrição do item, LIMPA: remova o código/SKU do início (ex.: '00000000001633 - CIMENTO TODAS AS OBRAS' -> 'CIMENTO TODAS AS OBRAS') e não inclua NCM/CFOP>", "quant":<número>, "unid":"<UN/PC/SV/KG/…>", "unit":<valor UNITÁRIO BRUTO, sem imposto/desconto/acréscimo>}
  ]
 }
 Regras: NÃO aplique nenhum acréscimo/desconto — use o valor unitário BRUTO. Inclua item de ENTREGA/FRETE se houver (desc contendo 'ENTREGA' ou 'FRETE'). quant e unit são números (ponto decimal)."""
@@ -124,7 +136,8 @@ def gera_orcamento(ticket, chamado, itens_brutos, workdir, outdir, data_str, for
     num = e.get("numero") or "00"
     nome_loja = e.get("nome") or re.sub(r"^LOJA\s*\d+\s*-\s*", "", chamado.get("loja") or "").strip() or "LOJA"
     cliente = {"nome": f"Mercadinhos São Luiz — {nome_loja.title()}",
-               "cnpj": (e.get("cnpj") or "—"), "endereco": e.get("endereco") or "—", "cidade": ""}
+               "cnpj": fmt_cnpj(e.get("cnpj")), "endereco": e.get("endereco") or "—",
+               "cidade": cidade_de(e.get("endereco"))}
     obra = f"{norm(chamado.get('descricao'))}  #{ticket}"
     dados = {"numero_ticket": str(ticket), "revisao": 1, "data": data_str, "obra": obra,
              "faturamento": {"nome": FAT_NOME, "cnpj": FAT_CNPJ,
@@ -141,18 +154,30 @@ def gera_orcamento(ticket, chamado, itens_brutos, workdir, outdir, data_str, for
                 total=prep["total_geral"], pdf=pdf, base=base, pdf_ok=os.path.exists(pdf))
 
 # ---------- orquestração ----------
-def _nota_nome(path, info):
-    """Nome da nota roteada no Dropbox: 'TICKET <n> - NOTA <doc>.pdf'."""
-    ext = (os.path.splitext(path)[1] or ".pdf")
+def _nota_nome_pdf(info):
+    """Nome da nota roteada no Dropbox: 'TICKET <n> - NOTA <doc>.pdf' (sempre .pdf)."""
     num = re.sub(r'[\\/:*?"<>|]', "", str(info.get("num") or "")).strip()
     tk = info.get("ticket") or ""
     if info["cat"] == "SEM TICKET":
-        base = f"TICKET SEMTICKET - NOTA {num}" if num else os.path.splitext(os.path.basename(path))[0]
+        base = f"TICKET SEMTICKET - NOTA {num}" if num else f"NOTA p{info.get('page', 1)}"
     elif tk:
-        base = f"TICKET {tk} - NOTA {num}" if num else f"TICKET {tk}"
+        base = f"TICKET {tk} - NOTA {num}" if num else f"TICKET {tk} - p{info.get('page', 1)}"
     else:
-        base = os.path.splitext(os.path.basename(path))[0]
-    return base + ext
+        base = f"NOTA p{info.get('page', 1)}"
+    return base + ".pdf"
+
+def _pagina_pdf(src, page, is_img, workdir, tag):
+    """Produz um PDF de 1 página a partir de uma página do arquivo (imagem -> PDF; PDF -> só a página)."""
+    out = os.path.join(workdir, f"nota_{tag}.pdf")
+    try:
+        if is_img:
+            from PIL import Image
+            Image.open(src).convert("RGB").save(out, "PDF")
+        else:
+            subprocess.run(["pdfseparate", "-f", str(page), "-l", str(page), src, out], capture_output=True)
+        return out if os.path.exists(out) else None
+    except Exception:
+        return None
 
 def processar(arquivos, planilha_controle=None):
     if not GEMINI_KEY:
@@ -177,40 +202,7 @@ def processar(arquivos, planilha_controle=None):
     PENDENTES = os.path.join(SCRIPTS, "pendentes.py")
     erros_dbx = []
 
-    # 1) lê todas as notas com o Gemini e agrupa por ticket
-    por_ticket = {}
-    sem_ticket, nao_assoc = [], []
-    rateio = {}       # caminho -> {"cat","ticket","num"}
-    PRIO = {"RESIDUAL": 0, "SEM TICKET": 1, "NAO ASSOCIADO": 2, "CIVIL": 3, "INSTALACOES": 3}
-    def marca(path, cat, ticket="", num=""):
-        cur = rateio.setdefault(path, {"cat": "RESIDUAL", "ticket": "", "num": ""})
-        if PRIO.get(cat, 0) >= PRIO.get(cur["cat"], 0):
-            cur["cat"] = cat
-        if ticket and not cur["ticket"]: cur["ticket"] = ticket
-        if num and not cur["num"]: cur["num"] = num
-    for f in (arquivos or []):
-        path = f.name if hasattr(f, "name") else f
-        rateio.setdefault(path, {"cat": "RESIDUAL", "ticket": "", "num": ""})
-        for idx, png in paginas_imagens(path, work):
-            try:
-                nota = gemini_le(png)
-            except Exception:
-                nota = {"ticket": None, "itens": [], "fornecedor": None}
-            ticket = re.sub(r"\D", "", str(nota.get("ticket") or ""))
-            itens = nota.get("itens") or []
-            numdoc = str(nota.get("num_documento") or "")
-            reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "", "ticket": ticket, "loja": ""}
-            if not ticket:
-                sem_ticket.append({**reg, "status": "SEM TICKET"}); marca(path, "SEM TICKET", num=numdoc); continue
-            ch = busca_chamado(ticket)
-            if not ch:
-                nao_assoc.append({**reg, "status": "TICKET NÃO ASSOCIADO"}); marca(path, "NAO ASSOCIADO", ticket=ticket, num=numdoc); continue
-            marca(path, (ch.get("aba") or "CIVIL").upper(), ticket=ticket, num=numdoc)
-            g = por_ticket.setdefault(ticket, {"chamado": ch, "itens": [], "forma": nota.get("forma_pagamento")})
-            g["itens"].extend(itens)
-            if nota.get("forma_pagamento") and not g["forma"]: g["forma"] = nota.get("forma_pagamento")
-
-    # 2) baixa a planilha de controle do mês (se já existir no Dropbox) p/ atualizar
+    # 1) baixa a planilha de controle e o registro de notas já feitas neste mês
     ctrl = os.path.join(work, f"ORÇAMENTOS MONTADOS - {mes}.xlsx")
     ctrl_dbx = f"{dbx_mes}/ORÇAMENTOS MONTADOS - {mes}.xlsx"
     try:
@@ -218,8 +210,52 @@ def processar(arquivos, planilha_controle=None):
         if atual: open(ctrl, "wb").write(atual)
     except Exception as e:
         erros_dbx.append(f"baixar controle: {e}")
+    reg_dbx = f"{dbx_mes}/.notas_processadas.json"
+    notas_feitas = set()
+    try:
+        rb = dropbox_rateio.baixar(access, reg_dbx)
+        if rb: notas_feitas = set(str(x) for x in json.loads(rb.decode("utf-8")))
+    except Exception:
+        pass
 
-    # 3) gera 1 orçamento por ticket -> sobe PDF (mês/loja + não lançados) + atualiza controle
+    # 2) lê as notas (por página); dedup pelo NÚMERO DA NOTA; agrupa por ticket
+    por_ticket = {}
+    sem_ticket, nao_assoc = [], []
+    paginas = []          # cada página vira 1 arquivo roteado no Dropbox
+    novas_notas = set()
+    duplicadas = 0
+    for f in (arquivos or []):
+        path = f.name if hasattr(f, "name") else f
+        is_img = path.lower().rsplit(".", 1)[-1] in ("jpg", "jpeg", "png")
+        pgs = paginas_imagens(path, work)
+        if not pgs:
+            paginas.append({"src": path, "page": 1, "is_img": is_img, "cat": "RESIDUAL", "ticket": "", "num": ""})
+            continue
+        for idx, png in pgs:
+            try:
+                nota = gemini_le(png)
+            except Exception:
+                nota = {"ticket": None, "itens": [], "fornecedor": None}
+            ticket = re.sub(r"\D", "", str(nota.get("ticket") or ""))
+            itens = nota.get("itens") or []
+            numdoc = str(nota.get("num_documento") or "").strip()
+            # dedup por número da nota: mesma nota já feita no mês (ou repetida no lote) -> ignora
+            if numdoc and (numdoc in notas_feitas or numdoc in novas_notas):
+                duplicadas += 1; continue
+            if numdoc: novas_notas.add(numdoc)
+            reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "", "ticket": ticket, "loja": ""}
+            pg = {"src": path, "page": idx, "is_img": is_img, "ticket": ticket, "num": numdoc}
+            if not ticket:
+                sem_ticket.append({**reg, "status": "SEM TICKET"}); pg["cat"] = "SEM TICKET"; paginas.append(pg); continue
+            ch = busca_chamado(ticket)
+            if not ch:
+                nao_assoc.append({**reg, "status": "TICKET NÃO ASSOCIADO"}); pg["cat"] = "NAO ASSOCIADO"; paginas.append(pg); continue
+            pg["cat"] = (ch.get("aba") or "CIVIL").upper(); paginas.append(pg)
+            g = por_ticket.setdefault(ticket, {"chamado": ch, "itens": [], "forma": nota.get("forma_pagamento")})
+            g["itens"].extend(itens)
+            if nota.get("forma_pagamento") and not g["forma"]: g["forma"] = nota.get("forma_pagamento")
+
+    # 3) gera 1 orçamento por ticket -> sobe PDF (mês/loja + não lançados) + acrescenta no controle
     feitos = []
     for ticket, g in por_ticket.items():
         if not g["itens"]: continue
@@ -230,18 +266,24 @@ def processar(arquivos, planilha_controle=None):
         feitos.append(d)
         if d["pdf_ok"]:
             subprocess.run(["python3", ATUALIZAR, "--xlsx", ctrl, "--ticket", str(ticket),
-                            "--loja", d["nome_loja"], "--pdf", d["pdf"], "--data", data_str], capture_output=True)
+                            "--loja", d["nome_loja"], "--pdf", d["pdf"], "--data", data_str, "--append"], capture_output=True)
             nome_pdf = d["base"] + ".pdf"
             try: dropbox_rateio.subir(access, d["pdf"], f"{dbx_mes}/{d['num']}_{slug(d['nome_loja'])}/{nome_pdf}")
             except Exception as e: erros_dbx.append(f"PDF {ticket}: {e}")
             try: dropbox_rateio.subir(access, d["pdf"], f"{B}/{dropbox_rateio.NAO_LANCADOS}/{nome_pdf}")
             except Exception as e: erros_dbx.append(f"não lançados {ticket}: {e}")
 
-    # 4) sobe a planilha de controle atualizada (sobrescreve)
+    # 4) sobe controle atualizado + registro de notas processadas
     ctrl_ok = os.path.exists(ctrl)
     if ctrl_ok:
         try: dropbox_rateio.subir(access, ctrl, ctrl_dbx, overwrite=True)
         except Exception as e: erros_dbx.append(f"subir controle: {e}")
+    if novas_notas:
+        try:
+            dropbox_rateio.subir_bytes(access, json.dumps(sorted(notas_feitas | novas_notas)).encode("utf-8"),
+                                       reg_dbx, overwrite=True)
+        except Exception as e:
+            erros_dbx.append(f"registro notas: {e}")
 
     # 5) planilhas de correção por categoria (baixa -> adiciona -> sobe)
     def atualiza_correcao(lista, subpasta, arq):
@@ -262,15 +304,20 @@ def processar(arquivos, planilha_controle=None):
     atualiza_correcao(sem_ticket, "SEM TICKET", "NOTAS - SEM TICKET.xlsx")
     atualiza_correcao(nao_assoc, "TICKET NAO ASSOCIADO", "NOTAS - TICKET NAO ASSOCIADO.xlsx")
 
-    # 6) roteia as notas para as pastas certas
-    itens_dbx = [{"local": p, "categoria": info["cat"], "nome_destino": _nota_nome(p, info)}
-                 for p, info in rateio.items()]
+    # 6) roteia as notas página a página (multipágina: cada página vai pro seu destino)
+    itens_dbx = []
+    for i, pg in enumerate(paginas):
+        local = _pagina_pdf(pg["src"], pg["page"], pg["is_img"], work, str(i))
+        if not local:
+            erros_dbx.append(f"extrair pág {pg['page']} de {os.path.basename(pg['src'])}"); continue
+        itens_dbx.append({"local": local, "categoria": pg["cat"], "nome_destino": _nota_nome_pdf(pg)})
     ok_r, erros_r = dropbox_rateio.ratear(access, itens_dbx)
 
     # mensagem
     msg = [f"✅ {len(feitos)} orçamento(s) gerado(s) e enviado(s) ao Dropbox."]
     for d in feitos: msg.append(f"• Ticket {d['ticket']} — {d['loja']} — {d['total']}" + ("" if d['pdf_ok'] else "  (⚠️ PDF falhou)"))
     msg.append(f"📁 {ok_r} nota(s) roteada(s) no Dropbox.")
+    if duplicadas: msg.append(f"↩️ {duplicadas} nota(s) já processada(s) neste mês (ignoradas pelo número da nota).")
     if sem_ticket: msg.append(f"⚠️ {len(sem_ticket)} SEM TICKET (planilha de correção atualizada).")
     if nao_assoc:  msg.append(f"⚠️ {len(nao_assoc)} TICKET NÃO ASSOCIADO (planilha de correção atualizada).")
     if ctrl_ok:    msg.append("🧾 Planilha de controle do mês atualizada no Dropbox — baixe abaixo p/ enviar ao cliente.")
