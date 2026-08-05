@@ -14,6 +14,7 @@ Segredos (Settings -> Variables and secrets, no Space):
   (opcionais) GEMINI_MODEL, FAT_NOME, FAT_CNPJ
 """
 import os, re, json, shutil, subprocess, tempfile, datetime, zipfile, unicodedata, urllib.parse, urllib.request
+os.environ.setdefault("GRADIO_SSR_MODE", "False")   # sem SSR -> não precisa de Node
 import gradio as gr
 import google.generativeai as genai
 import dropbox_rateio
