@@ -53,6 +53,15 @@ def cidade_de(endereco):
     m = re.search(r",\s*([^,]+?\s*-\s*[A-Z]{2})\b", str(endereco or ""))
     return m.group(1).strip() if m else ""
 
+RE_TICKET = re.compile(r"(?:ticket|ticker|tickte|tikett|tiket|tcket|tck|tk|chamado|cham|\bos\b|or[çc]amento|#)\s*[:/#\.\-]?\s*(\d{5,6})\b", re.I)
+def ticket_do_texto(t):
+    """Extrai o ticket (5-6 dígitos) de um texto de observação, tolerando rótulos errados."""
+    t = str(t or "")
+    m = RE_TICKET.search(t)
+    if m: return m.group(1)
+    m = re.search(r"(?<!\d)(\d{5,6})(?!\d)", t)   # fallback: número isolado de 5-6 dígitos
+    return m.group(1) if m else ""
+
 # ---------- leitura das notas (render por página) ----------
 def paginas_imagens(path, workdir):
     """Retorna lista de (indice, caminho_png). PDF: render por página; imagem: usa direto."""
@@ -84,6 +93,7 @@ Extraia SOMENTE o que estiver na nota e responda em JSON puro (sem texto fora do
  "num_documento": "<Nº do Documento/Nota, só os dígitos e SEM zeros à esquerda (ex.: '0000018747' -> '18747'); se não houver, null>",
  "fornecedor": "<razão social do EMITENTE>",
  "forma_pagamento": "<ex.: Boleto 30 dias / Plano de Pagamento, se aparecer; senão null>",
+ "obs": "<TRANSCREVA VERBATIM, exatamente como está na nota, todo o conteúdo dos campos Observação / Dados Complementares / Dados Adicionais / Informações Complementares (é onde costuma estar o ticket). Se não houver, ''>",
  "itens": [
    {"desc":"<descrição do item, LIMPA: remova o código/SKU do início (ex.: '00000000001633 - CIMENTO TODAS AS OBRAS' -> 'CIMENTO TODAS AS OBRAS') e não inclua NCM/CFOP>", "quant":<número>, "unid":"<UN/PC/SV/KG/…>", "unit":<valor UNITÁRIO BRUTO, sem imposto/desconto/acréscimo>}
  ]
@@ -237,6 +247,8 @@ def processar(arquivos, planilha_controle=None):
             except Exception:
                 nota = {"ticket": None, "itens": [], "fornecedor": None}
             ticket = re.sub(r"\D", "", str(nota.get("ticket") or ""))
+            if not ticket:                                   # rede de segurança: extrai do texto da observação
+                ticket = ticket_do_texto(nota.get("obs"))
             itens = nota.get("itens") or []
             numdoc = str(nota.get("num_documento") or "").strip()
             # dedup por número da nota: mesma nota já feita no mês (ou repetida no lote) -> ignora
