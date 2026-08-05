@@ -1,0 +1,348 @@
+{
+ "01": {
+  "numero": "01",
+  "nome": "DUNAS",
+  "nome_endereco_lista": "DUNAS",
+  "cnpj": "03720882000239",
+  "endereco": "Av. Engenheiro Alberto Sá, 1111 - Papicu, Fortaleza - CE, 60175-395",
+  "apelidos": [
+   "DUNAS"
+  ]
+ },
+ "02": {
+  "numero": "02",
+  "nome": "OLIVEIRA PAIVA",
+  "nome_endereco_lista": "OLIVEIRA",
+  "cnpj": "03720882000310",
+  "endereco": "Av. Oliveira Paiva, 170 - Cidade dos Funcionários, Fortaleza - CE, 60822-310",
+  "apelidos": [
+   "OLIVEIRA",
+   "OLIVEIRA PAIVA"
+  ]
+ },
+ "03": {
+  "numero": "03",
+  "nome": "BENFICA",
+  "nome_endereco_lista": "BENFICA",
+  "cnpj": "03720882000409",
+  "endereco": "Av. Carapinima, 2200 - T1 - Benfica, Fortaleza - CE, 60015-299",
+  "apelidos": [
+   "BENFICA"
+  ]
+ },
+ "04": {
+  "numero": "04",
+  "nome": "PONTES VIEIRA",
+  "nome_endereco_lista": "PONTES",
+  "cnpj": "03720882000581",
+  "endereco": "Av. Pontes Vieira, 1486 - Dionísio Torres, Fortaleza - CE, 60130-241",
+  "apelidos": [
+   "PONTES",
+   "PONTES VIEIRA"
+  ]
+ },
+ "05": {
+  "numero": "05",
+  "nome": "COCÓ",
+  "nome_endereco_lista": "COCÓ",
+  "cnpj": "03720882001120",
+  "endereco": "Av. Eng. Santana Jr., 2977 - Cocó, Fortaleza - CE, 60192-205",
+  "apelidos": [
+   "COCÓ"
+  ]
+ },
+ "06": {
+  "numero": "06",
+  "nome": "VIRGÍLIO",
+  "nome_endereco_lista": "VIRGÍLIO",
+  "cnpj": "03.720.882/0006-62",
+  "endereco": "Av. Senador Virgílio Távora, 570 - Aldeota, Fortaleza - CE, 60160-140",
+  "apelidos": [
+   "VIRGÍLIO"
+  ]
+ },
+ "08": {
+  "numero": "08",
+  "nome": "BARÃO DE STUDART",
+  "nome_endereco_lista": "BARÃO",
+  "cnpj": "03720882001391",
+  "endereco": "Av. Barão de Studart, 2675 - Dionísio Torres, Fortaleza - CE, 60120-375",
+  "apelidos": [
+   "BARÃO",
+   "BARÃO DE STUDART"
+  ]
+ },
+ "09": {
+  "numero": "09",
+  "nome": "CAMBEBA",
+  "nome_endereco_lista": "CAMBEBA",
+  "cnpj": "03720882000743",
+  "endereco": "Av. Washington Soares, 6180 - Cambeba, Fortaleza - CE, 60822-142",
+  "apelidos": [
+   "CAMBEBA"
+  ]
+ },
+ "10": {
+  "numero": "10",
+  "nome": "PRAIA",
+  "nome_endereco_lista": "P. IRACEMA",
+  "cnpj": "03720882000824",
+  "endereco": "R. dos Tabajaras, 693 - Praia de Iracema, Fortaleza - CE, 60060-510",
+  "apelidos": [
+   "P. IRACEMA",
+   "PRAIA"
+  ]
+ },
+ "11": {
+  "numero": "11",
+  "nome": "WS",
+  "nome_endereco_lista": "W.S.",
+  "cnpj": "03720882001553",
+  "endereco": "Av. Washington Soares, 4352 - Lj 01 - Parque Manibura, Fortaleza - CE, 60821-750",
+  "apelidos": [
+   "W.S.",
+   "WS"
+  ]
+ },
+ "13": {
+  "numero": "13",
+  "nome": "SANTOS DUMONT",
+  "nome_endereco_lista": "S. DUMONT",
+  "cnpj": "03720882001634",
+  "endereco": "Av. Santos Dumont, 5625 - Papicu, Fortaleza - CE, 60175-047",
+  "apelidos": [
+   "S. DUMONT",
+   "SANTOS DUMONT"
+  ]
+ },
+ "14": {
+  "numero": "14",
+  "nome": "RIOMAR PAPICU",
+  "nome_endereco_lista": "R.M. PAPICU",
+  "cnpj": "03720882001987",
+  "endereco": "R. Des. Lauro Nogueira, 1500 - Papicu, Fortaleza - CE, 60175-055",
+  "apelidos": [
+   "R.M. PAPICU",
+   "RIOMAR PAPICU"
+  ]
+ },
+ "15": {
+  "numero": "15",
+  "nome": "ALPHAVILLE",
+  "nome_endereco_lista": "ALPHAVILLE",
+  "cnpj": "03720882001804",
+  "endereco": "Av. Litorânea, 2010 - Cararu, Eusébio - CE, 61760-000",
+  "apelidos": [
+   "ALPHAVILLE"
+  ]
+ },
+ "16": {
+  "numero": "16",
+  "nome": "RIOMAR PRESIDENTE KENNEDY",
+  "nome_endereco_lista": "R.M. PK",
+  "cnpj": "03720882002010",
+  "endereco": "Av. Srg. Hermínio Sampaio, 3100 - Presidente Kennedy, Fortaleza - CE, 60355-512",
+  "apelidos": [
+   "R.M. PK",
+   "RIOMAR PRESIDENTE KENNEDY"
+  ]
+ },
+ "17": {
+  "numero": "17",
+  "nome": "EDILSON BRASIL",
+  "nome_endereco_lista": "EDILSON",
+  "cnpj": "03720882002100",
+  "endereco": "Av. Edilson Brasil Soares, 920 - Sapiranga-Coité, Fortaleza - CE, 60833-020",
+  "apelidos": [
+   "EDILSON",
+   "EDILSON BRASIL"
+  ]
+ },
+ "18": {
+  "numero": "18",
+  "nome": "CASTELÃO",
+  "nome_endereco_lista": "CASTELÃO",
+  "cnpj": "03.720.882/0022-82",
+  "endereco": "Av. Alberto Craveiro, 2000 - Dias Macêdo, Fortaleza - CE, 60861-212",
+  "apelidos": [
+   "CASTELÃO"
+  ]
+ },
+ "19": {
+  "numero": "19",
+  "nome": "DEL PASSEO",
+  "nome_endereco_lista": "DEL PASSEO",
+  "cnpj": "03.720.882/0023-63",
+  "endereco": "Av. Santos Dumont, 3131 - Aldeota, Fortaleza - CE, 60150-162",
+  "apelidos": [
+   "DEL PASSEO"
+  ]
+ },
+ "20": {
+  "numero": "20",
+  "nome": "RUI B.",
+  "nome_endereco_lista": "RUI B.",
+  "cnpj": "03.720.882/0024-44",
+  "endereco": "Av. Santos Dumont, 1749 - Aldeota, Fortaleza - CE, 60150-161",
+  "apelidos": [
+   "RUI B."
+  ]
+ },
+ "22": {
+  "numero": "22",
+  "nome": "MIGUEL DIAS",
+  "nome_endereco_lista": "MIGUEL",
+  "cnpj": "03720882002797",
+  "endereco": "Av. Coronel Miguel Dias, 1300 - Engenheiro Luciano Cavalcante, Fortaleza - CE, 60810-160",
+  "apelidos": [
+   "MIGUEL",
+   "MIGUEL DIAS"
+  ]
+ },
+ "23": {
+  "numero": "23",
+  "nome": "JÚLIO V.",
+  "nome_endereco_lista": "JÚLIO V.",
+  "cnpj": "03.720.882/0026-06",
+  "endereco": "Av Barão de Studart, 1685 - Aldeota, Fortaleza - CE, 60120-001",
+  "apelidos": [
+   "JÚLIO V."
+  ]
+ },
+ "24": {
+  "numero": "24",
+  "nome": "EUSÉBIO",
+  "nome_endereco_lista": "EUSÉBIO",
+  "cnpj": "03720882002878",
+  "endereco": "Av Farias Brito, S/N - Loja 1 - Amador, Eusébio - CE, 61760-000",
+  "apelidos": [
+   "EUSÉBIO"
+  ]
+ },
+ "27": {
+  "numero": "27",
+  "nome": "MARACANAU",
+  "nome_endereco_lista": "MARACANAÚ",
+  "cnpj": "03720882003254",
+  "endereco": "R. João de Alencar, 113 - Centro, Maracanaú - CE, 61900-150",
+  "apelidos": [
+   "MARACANAÚ",
+   "MARACANAU"
+  ]
+ },
+ "28": {
+  "numero": "28",
+  "nome": "ABOLIÇÃO",
+  "nome_endereco_lista": "ABOLIÇÃO",
+  "cnpj": "03.720.882/0031-73",
+  "endereco": "Av. da Abolição, 2377 - Meireles, Fortaleza - CE, 60165-075",
+  "apelidos": [
+   "ABOLIÇÃO"
+  ]
+ },
+ "29": {
+  "numero": "29",
+  "nome": "MONDUBIM",
+  "nome_endereco_lista": "MONDUBIM",
+  "cnpj": "03.720.882/0033-35",
+  "endereco": "Av. Maria Gomes de Sá, 1000 - Mondubim, Fortaleza - CE, 60765-173",
+  "apelidos": [
+   "MONDUBIM"
+  ]
+ },
+ "30": {
+  "numero": "30",
+  "nome": "MERCADÃO RUI",
+  "nome_endereco_lista": "MERC. RUI",
+  "cnpj": "03720882003416",
+  "endereco": "Av. Rui Barbosa, 1999 - Aldeota, Fortaleza - CE, 60115-221",
+  "apelidos": [
+   "MERC. RUI",
+   "MERCADÃO RUI"
+  ]
+ },
+ "35": {
+  "numero": "35",
+  "nome": "MERCADÃO CAUCAIA",
+  "nome_endereco_lista": "CAUCAIA",
+  "cnpj": "03720882003688",
+  "endereco": "Via Estruturante, 1100 - Curicaca, Caucaia - CE, 61601-605",
+  "apelidos": [
+   "CAUCAIA",
+   "MERCADÃO CAUCAIA"
+  ]
+ },
+ "36": {
+  "numero": "36",
+  "nome": "ANTÔNIO SALES",
+  "nome_endereco_lista": "ANT. SALES",
+  "cnpj": "03720882003769",
+  "endereco": "Av. Senador Virgílio Távora, 2270 - Dionísio Torres, Fortaleza - CE, 60170-192",
+  "apelidos": [
+   "ANT. SALES",
+   "ANTÔNIO SALES"
+  ]
+ },
+ "37": {
+  "numero": "37",
+  "nome": "BORGES DE MELO",
+  "nome_endereco_lista": "BORGES",
+  "cnpj": "03720882003840",
+  "endereco": "Av. Borges de Melo, 1287 - Parreão, Fortaleza - CE, 60410-335",
+  "apelidos": [
+   "BORGES",
+   "BORGES DE MELO"
+  ]
+ },
+ "38": {
+  "numero": "38",
+  "nome": "PORTO DAS DUNAS",
+  "nome_endereco_lista": "P. DUNAS",
+  "cnpj": "03720882004064",
+  "endereco": "Av. Caminho do Sol, 3487 - Porto das Dunas, Aquiraz - CE, 61700-000",
+  "apelidos": [
+   "P. DUNAS",
+   "PORTO DAS DUNAS"
+  ]
+ },
+ "39": {
+  "numero": "39",
+  "nome": "VILLAS",
+  "nome_endereco_lista": "VILLAS",
+  "cnpj": "03.720.882/0040-64",
+  "endereco": "CE-040, 19972 - Jacundá, Aquiraz - CE, 61700-000",
+  "apelidos": [
+   "VILLAS"
+  ]
+ },
+ "101": {
+  "numero": "101",
+  "nome": "CD",
+  "nome_endereco_lista": "CD",
+  "cnpj": "03720882000158",
+  "endereco": "R. Adelaíde Paulino, 96 - Paupina, Fortaleza - CE, 60873-830",
+  "apelidos": [
+   "CD"
+  ]
+ },
+ "102": {
+  "numero": "102",
+  "nome": "EMPÓRIO",
+  "nome_endereco_lista": "EMPÓRIO",
+  "cnpj": "03.720.882/0025-25",
+  "endereco": "Rua Tenente Nicolau, 489 - Cidade dos Funcionários, Fortaleza - CE, 60822-590",
+  "apelidos": [
+   "EMPÓRIO"
+  ]
+ },
+ "26": {
+  "numero": "26",
+  "nome": "SOBRAL",
+  "nome_endereco_lista": "",
+  "cnpj": "03720882003092",
+  "endereco": "",
+  "apelidos": [
+   "SOBRAL"
+  ]
+ }
+}
