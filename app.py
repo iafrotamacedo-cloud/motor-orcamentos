@@ -119,8 +119,14 @@ def gemini_le(png_path):
     return _parse_json(r.text)
 
 def groq_le(png_path):
-    import base64
-    b64 = base64.b64encode(open(png_path, "rb").read()).decode()
+    import base64, io
+    from PIL import Image
+    # converte SEMPRE p/ PNG de verdade (evita descasar bytes JPEG com rótulo image/png)
+    im = Image.open(png_path).convert("RGB")
+    if im.width > 1600:                      # reduz p/ caber no limite da API
+        im = im.resize((1600, int(im.height * 1600 / im.width)))
+    buf = io.BytesIO(); im.save(buf, "PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
     payload = {
         "model": GROQ_MODEL, "temperature": 0,
         "messages": [{"role": "user", "content": [
