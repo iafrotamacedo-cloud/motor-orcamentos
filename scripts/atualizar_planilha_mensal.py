@@ -108,6 +108,7 @@ def main():
     ap.add_argument("--valor"); ap.add_argument("--pdf")
     ap.add_argument("--data",default=None)
     ap.add_argument("--inteiro",action="store_true",help="permite valor redondo sem centavos")
+    ap.add_argument("--append",action="store_true",help="não faz dedup por ticket (permite mais de um orçamento por ticket)")
     args=ap.parse_args();openpyxl=op()
     from openpyxl.styles import Font,PatternFill,Alignment
     from openpyxl.utils import get_column_letter
@@ -153,9 +154,10 @@ def main():
         for i,w in enumerate([8,14,28,16,14],1): ws.column_dimensions[get_column_letter(i)].width=w
 
     tk=str(args.ticket).strip()
-    for row in ws.iter_rows(min_row=2,values_only=True):
-        if row[1] is not None and str(row[1]).strip()==tk:
-            print("JA EXISTE ticket",tk,"- nada a fazer");return
+    if not args.append:
+        for row in ws.iter_rows(min_row=2,values_only=True):
+            if row[1] is not None and str(row[1]).strip()==tk:
+                print("JA EXISTE ticket",tk,"- nada a fazer");return
     seq=ws.max_row
     ws.append([seq,tk,args.loja,round(float(valor),2),data])
     # NUNCA reprocessa valores antigos: só garante o FORMATO das colunas 4 e 5.
