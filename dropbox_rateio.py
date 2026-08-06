@@ -88,6 +88,52 @@ def subir(access, local_path, dropbox_path, overwrite=False):
     with open(local_path, "rb") as fh:
         subir_bytes(access, fh.read(), dropbox_path, overwrite)
 
+def listar(access, pasta):
+    """Lista os NOMES dos arquivos (não pastas) de uma pasta do Dropbox."""
+    nomes, url = [], "https://api.dropboxapi.com/2/files/list_folder"
+    arg = {"path": pasta, "recursive": False, "limit": 2000}
+    while True:
+        req = urllib.request.Request(url, data=json.dumps(arg).encode(),
+            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+        try:
+            r = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 409:   # pasta não existe
+                return nomes
+            raise RuntimeError(_erro(e)) from None
+        for ent in r.get("entries", []):
+            if ent.get(".tag") == "file":
+                nomes.append(ent["name"])
+        if not r.get("has_more"): break
+        url = "https://api.dropboxapi.com/2/files/list_folder/continue"
+        arg = {"cursor": r["cursor"]}
+    return nomes
+
+def criar_pasta(access, pasta):
+    """Cria uma pasta (ignora se já existir)."""
+    req = urllib.request.Request("https://api.dropboxapi.com/2/files/create_folder_v2",
+        data=json.dumps({"path": pasta, "autorename": False}, ensure_ascii=True).encode(),
+        headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=30).read()
+    except urllib.error.HTTPError as e:
+        if e.code == 409:   # já existe
+            return
+        # não é fatal — segue mesmo assim
+        return
+
+def mover(access, de_path, para_path, autorename=True):
+    """MOVE (relocaliza) um arquivo no Dropbox — não apaga dados, só troca de pasta."""
+    arg = {"from_path": de_path, "to_path": para_path,
+           "autorename": autorename, "allow_ownership_transfer": False}
+    req = urllib.request.Request("https://api.dropboxapi.com/2/files/move_v2",
+        data=json.dumps(arg, ensure_ascii=True).encode(),
+        headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=60).read(); return True
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(_erro(e)) from None
+
 def _dest(categoria):
     return f"{BASE}/{PASTAS.get(categoria, PASTAS['RESIDUAL'])}"
 
