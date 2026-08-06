@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 39
+#  CONTADOR DE REVISÕES DESTE app.py: 40
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -429,6 +429,155 @@ def processar(arquivos, planilha_controle=None):
     if errs: msg.append("⚠️ Erros no Dropbox: " + "; ".join(errs[:4]))
     return (ctrl if ctrl_ok else None), "\n".join(msg)
 
+# ---------- 2ª passagem: ORÇAMENTOS CORRIGIDOS (lê a planilha de pendentes no Dropbox) ----------
+def _pendentes_list(xlsx_local):
+    out = subprocess.run(["python3", os.path.join(SCRIPTS, "pendentes.py"), "list", "--xlsx", xlsx_local],
+                         capture_output=True, text=True)
+    try: return json.loads(out.stdout.strip() or "[]")
+    except Exception: return []
+
+def _acha_nota_pdf(arqs, numero):
+    """Casa o nº da nota com um arquivo da pasta (ex.: 9107 -> 'TICKET 126486 - NOTA 9107.pdf')."""
+    n = re.sub(r"\D", "", str(numero or ""))
+    if not n: return None
+    cands = [a for a in arqs if n in re.sub(r"\D", "", a)]
+    # prefere o que casa o número exato entre separadores
+    exatos = [a for a in cands if re.search(rf"(?<!\d){n}(?!\d)", a)]
+    return (exatos or cands or [None])[0]
+
+def processar_corrigidos(subpasta="TICKET NAO ASSOCIADO", arq_xlsx="NOTAS - TICKET NAO ASSOCIADO.xlsx"):
+    """Gera os orçamentos das linhas RODAR=SIM da planilha de pendentes, roteia as
+    notas p/ NOTAS INCLUIDAS ORCAMENTO/<classe> e remove as linhas processadas."""
+    if not (GEMINI_KEY or GROQ_KEY):
+        return None, "⚠️ Configure GEMINI_API_KEY (ou GROQ_API_KEY) no Render."
+    if not (SB_URL and SB_KEY):
+        return None, "⚠️ Faltam SUPABASE_URL / SUPABASE_SERVICE_KEY."
+    if not dropbox_rateio.ativo():
+        return None, "⚠️ Faltam os segredos do Dropbox."
+    access = dropbox_rateio.obter_token()
+    B = dropbox_rateio.BASE
+    work = tempfile.mkdtemp(prefix="corr_")
+    hoje = datetime.date.today()
+    mes = f"{MESES[hoje.month-1]} {hoje.year}"
+    data_str = hoje.strftime("%d/%m/%Y")
+    dbx_mes = f"{B}/{dropbox_rateio.ORCAMENTOS}/{mes}"
+    ATUALIZAR = os.path.join(SCRIPTS, "atualizar_planilha_mensal.py")
+    PENDENTES = os.path.join(SCRIPTS, "pendentes.py")
+    erros = []
+
+    pasta_notas = f"{B}/{subpasta}"
+    xlsx_dbx = f"{pasta_notas}/{arq_xlsx}"
+    xlsx_local = os.path.join(work, arq_xlsx)
+    raw = dropbox_rateio.baixar(access, xlsx_dbx)
+    if not raw:
+        return None, f"⚠️ Planilha não encontrada: {xlsx_dbx}"
+    open(xlsx_local, "wb").write(raw)
+    linhas = _pendentes_list(xlsx_local)
+    if not linhas:
+        return None, "Nenhuma linha com RODAR = SIM na planilha de pendentes."
+    arqs = dropbox_rateio.listar(access, pasta_notas)
+
+    # planilha de controle do mês (append com dedup por ticket)
+    ctrl = os.path.join(work, f"ORÇAMENTOS MONTADOS - {mes}.xlsx")
+    ctrl_dbx = f"{dbx_mes}/ORÇAMENTOS MONTADOS - {mes}.xlsx"
+    try:
+        a = dropbox_rateio.baixar(access, ctrl_dbx)
+        if a: open(ctrl, "wb").write(a)
+    except Exception as e: erros.append(f"baixar controle: {e}")
+
+    # 1) agrupa por ticket (várias notas do mesmo ticket -> 1 orçamento)
+    por_ticket, notas_por_ticket, achadas = {}, {}, []
+    faltando = []
+    for row in linhas:
+        ticket = re.sub(r"\D", "", str(row.get("ticket") or ""))
+        if not ticket:
+            faltando.append(f"nota {row.get('nota')}: sem ticket na planilha"); continue
+        nome_arq = _acha_nota_pdf(arqs, row.get("nota"))
+        if not nome_arq:
+            faltando.append(f"nota {row.get('nota')}: PDF não encontrado na pasta"); continue
+        pdf_bytes = dropbox_rateio.baixar(access, f"{pasta_notas}/{nome_arq}")
+        if not pdf_bytes:
+            faltando.append(f"nota {row.get('nota')}: falha ao baixar"); continue
+        local_pdf = os.path.join(work, nome_arq)
+        open(local_pdf, "wb").write(pdf_bytes)
+        # lê os itens da nota (todas as páginas)
+        itens, forma = [], None
+        for idx, png in paginas_imagens(local_pdf, work):
+            try:
+                nota = ler_nota(png)
+            except Exception as e:
+                nota = {"itens": [], "_erro": str(e)}
+            itens.extend(nota.get("itens") or [])
+            if nota.get("forma_pagamento") and not forma: forma = nota.get("forma_pagamento")
+        if not itens:
+            faltando.append(f"nota {row.get('nota')} (ticket {ticket}): não consegui ler itens"); continue
+        # chamado: Supabase; senão usa a Loja preenchida na planilha
+        ch = busca_chamado(ticket) or {"loja": row.get("loja") or "", "aba": None, "descricao": ""}
+        g = por_ticket.setdefault(ticket, {"chamado": ch, "itens": [], "forma": forma})
+        g["itens"].extend(itens)
+        if forma and not g["forma"]: g["forma"] = forma
+        notas_por_ticket.setdefault(ticket, []).append({"nota": row.get("nota"), "arq": nome_arq, "aba": ch.get("aba")})
+        achadas.append(row.get("nota"))
+
+    # 2) gera 1 orçamento por ticket + sobe PDFs + atualiza controle
+    feitos = []
+    for ticket, g in por_ticket.items():
+        try:
+            d = gera_orcamento(ticket, g["chamado"], g["itens"], work, work, data_str, g["forma"])
+        except Exception as e:
+            erros.append(f"orçamento ticket {ticket}: {e}"); continue
+        feitos.append(d)
+        if d["pdf_ok"]:
+            subprocess.run(["python3", ATUALIZAR, "--xlsx", ctrl, "--ticket", str(ticket),
+                            "--loja", d["nome_loja"], "--pdf", d["pdf"], "--data", data_str, "--append"],
+                           capture_output=True)
+            nome_pdf = d["base"] + ".pdf"
+            try: dropbox_rateio.subir(access, d["pdf"], f"{dbx_mes}/{d['num']}_{slug(d['nome_loja'])}/{nome_pdf}")
+            except Exception as e: erros.append(f"PDF {ticket}: {e}")
+            try: dropbox_rateio.subir(access, d["pdf"], f"{B}/{dropbox_rateio.NAO_LANCADOS}/{nome_pdf}")
+            except Exception as e: erros.append(f"não lançados {ticket}: {e}")
+
+    # 3) sobe controle atualizado
+    if os.path.exists(ctrl):
+        try: dropbox_rateio.subir(access, ctrl, ctrl_dbx, overwrite=True)
+        except Exception as e: erros.append(f"subir controle: {e}")
+
+    # 4) MOVE cada nota p/ NOTAS INCLUIDAS ORCAMENTO/<classe> (só dos tickets que viraram orçamento)
+    tickets_ok = {d["ticket"] for d in feitos}
+    movidas = 0
+    incl = "NOTAS INCLUIDAS ORCAMENTO"
+    for ticket, itens_n in notas_por_ticket.items():
+        if ticket not in tickets_ok: continue
+        for it in itens_n:
+            classe = (it.get("aba") or "SEM CLASSIFICACAO").upper()
+            destino_pasta = f"{B}/{incl}/{classe}"
+            dropbox_rateio.criar_pasta(access, destino_pasta)
+            try:
+                dropbox_rateio.mover(access, f"{pasta_notas}/{it['arq']}", f"{destino_pasta}/{it['arq']}")
+                movidas += 1
+            except Exception as e:
+                erros.append(f"mover nota {it['nota']}: {e}")
+
+    # 5) remove da planilha de pendentes só as notas que viraram orçamento; sobe a planilha
+    notas_feitas = [it["nota"] for t in tickets_ok for it in notas_por_ticket.get(t, [])]
+    for n in notas_feitas:
+        subprocess.run(["python3", PENDENTES, "remove", "--xlsx", xlsx_local, "--nota", str(n)],
+                       capture_output=True)
+    if notas_feitas and os.path.exists(xlsx_local):
+        try: dropbox_rateio.subir(access, xlsx_local, xlsx_dbx, overwrite=True)
+        except Exception as e: erros.append(f"subir pendentes: {e}")
+
+    # mensagem
+    msg = [f"✅ {len(feitos)} orçamento(s) corrigido(s) gerado(s) e enviado(s) ao Dropbox."]
+    for d in feitos: msg.append(f"• Ticket {d['ticket']} — {d['loja']} — {d['total']}" + ("" if d['pdf_ok'] else "  (⚠️ PDF falhou)"))
+    msg.append(f"📁 {movidas} nota(s) movida(s) p/ NOTAS INCLUIDAS ORCAMENTO.")
+    msg.append(f"🧾 {len(notas_feitas)} linha(s) removida(s) da planilha de pendentes.")
+    if faltando:
+        msg.append("⚠️ Ficaram de fora: " + "; ".join(faltando[:8]))
+    if erros:
+        msg.append("⚠️ Erros: " + "; ".join(erros[:6]))
+    return (ctrl if os.path.exists(ctrl) else None), "\n".join(msg)
+
 # ---------- interface (FastAPI puro — sem Gradio) ----------
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
@@ -456,10 +605,31 @@ PAGINA = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
   <input type="file" name="notas" multiple accept=".pdf,.jpg,.jpeg,.png" required>
   <button id="b" type="submit">Gerar e enviar ao Dropbox</button>
  </form>
+ <hr style="margin:22px 0;border:0;border-top:1px solid #E1E5EC">
+ <p><small><b>Orçamentos corrigidos</b> — depois de corrigir o Ticket/Loja e marcar
+  <b>RODAR = SIM</b> na planilha <i>NOTAS - TICKET NAO ASSOCIADO</i> (no Dropbox),
+  clique abaixo. O motor gera os orçamentos dessas notas, roteia e remove as linhas.</small></p>
+ <button id="bc" type="button" style="background:#1a7f37">Rodar corrigidos (TICKET NÃO ASSOCIADO)</button>
  <div id="msg"></div>
 </div>
 <script>
 const f=document.getElementById('f'), b=document.getElementById('b'), msg=document.getElementById('msg');
+const bc=document.getElementById('bc');
+bc.addEventListener('click', async ()=>{
+ bc.disabled=true; bc.textContent='Processando… (pode levar 1–2 min)'; msg.textContent='';
+ try{
+  const r=await fetch('corrigidos',{method:'POST'});
+  const j=await r.json();
+  if(j.erro){ msg.innerHTML='<span class="err">'+j.erro+'</span>'; }
+  else{
+   const warn=(j.status||'').trim().indexOf('⚠️')===0;
+   let h='<span class="'+(warn?'err':'ok')+'">'+(j.status||'').replace(/</g,'&lt;')+'</span>';
+   if(j.token){ h+='<br><a class="dl" href="baixar?t='+j.token+'">⬇ Baixar planilha de controle</a>'; }
+   msg.innerHTML=h;
+  }
+ }catch(err){ msg.innerHTML='<span class="err">Falhou: '+err+'</span>'; }
+ bc.disabled=false; bc.textContent='Rodar corrigidos (TICKET NÃO ASSOCIADO)';
+});
 f.addEventListener('submit', async (e)=>{
  e.preventDefault(); b.disabled=true; b.textContent='Processando… (pode levar 1–2 min)'; msg.textContent='';
  try{
@@ -497,6 +667,19 @@ async def processar_endpoint(request: Request):
         path, status = processar(caminhos)
     except Exception as e:
         return {"erro": f"Erro ao processar: {e}"}
+    token = None
+    if path and os.path.exists(path):
+        import secrets as _s
+        token = _s.token_urlsafe(10)
+        RESULTS[token] = path
+    return {"status": status, "token": token}
+
+@app.post("/corrigidos")
+def corrigidos_endpoint():
+    try:
+        path, status = processar_corrigidos()
+    except Exception as e:
+        return {"erro": f"Erro ao processar corrigidos: {e}"}
     token = None
     if path and os.path.exists(path):
         import secrets as _s
