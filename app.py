@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 38
+#  CONTADOR DE REVISÕES DESTE app.py: 39
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -309,7 +309,8 @@ def processar(arquivos, planilha_controle=None):
     por_ticket = {}
     sem_ticket, nao_assoc = [], []
     paginas = []          # cada página vira 1 arquivo roteado no Dropbox
-    novas_notas = set()
+    novas_notas = set()   # notas que VIRARAM orçamento (vão pro registro do mês)
+    vistos = set()        # guarda contra repetir a MESMA nota dentro deste lote
     duplicadas = 0
     diag = []             # diagnóstico do que o Gemini leu (p/ notas SEM TICKET)
     for f in (arquivos or []):
@@ -333,10 +334,10 @@ def processar(arquivos, planilha_controle=None):
                 ticket = ticket_do_texto(nota.get("obs"))
             itens = nota.get("itens") or []
             numdoc = str(nota.get("num_documento") or "").strip()
-            # dedup por número da nota: mesma nota já feita no mês (ou repetida no lote) -> ignora
-            if numdoc and (numdoc in notas_feitas or numdoc in novas_notas):
+            # dedup por número da nota: nota já ORÇADA no mês, ou repetida neste mesmo lote -> ignora
+            if numdoc and (numdoc in notas_feitas or numdoc in vistos):
                 duplicadas += 1; continue
-            if numdoc: novas_notas.add(numdoc)
+            if numdoc: vistos.add(numdoc)
             reg = {"nota": numdoc, "fornecedor": nota.get("fornecedor") or "", "ticket": ticket, "loja": ""}
             pg = {"src": path, "page": idx, "is_img": is_img, "ticket": ticket, "num": numdoc}
             if not ticket:
@@ -347,8 +348,9 @@ def processar(arquivos, planilha_controle=None):
             if not ch:
                 nao_assoc.append({**reg, "status": "TICKET NÃO ASSOCIADO"}); pg["cat"] = "NAO ASSOCIADO"; paginas.append(pg); continue
             pg["cat"] = (ch.get("aba") or "CIVIL").upper(); paginas.append(pg)
-            g = por_ticket.setdefault(ticket, {"chamado": ch, "itens": [], "forma": nota.get("forma_pagamento")})
+            g = por_ticket.setdefault(ticket, {"chamado": ch, "itens": [], "forma": nota.get("forma_pagamento"), "notas": set()})
             g["itens"].extend(itens)
+            if numdoc: g["notas"].add(numdoc)
             if nota.get("forma_pagamento") and not g["forma"]: g["forma"] = nota.get("forma_pagamento")
 
     # 3) gera 1 orçamento por ticket -> sobe PDF (mês/loja + não lançados) + acrescenta no controle
@@ -360,6 +362,7 @@ def processar(arquivos, planilha_controle=None):
         except Exception as e:
             nao_assoc.append({"nota": "", "fornecedor": "", "status": f"ERRO: {e}", "ticket": ticket, "loja": ""}); continue
         feitos.append(d)
+        novas_notas |= g.get("notas", set())      # só REGISTRA as notas que viraram orçamento
         if d["pdf_ok"]:
             subprocess.run(["python3", ATUALIZAR, "--xlsx", ctrl, "--ticket", str(ticket),
                             "--loja", d["nome_loja"], "--pdf", d["pdf"], "--data", data_str, "--append"], capture_output=True)
