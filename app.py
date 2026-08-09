@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 40
+#  CONTADOR DE REVISÕES DESTE app.py: 41
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -46,6 +46,11 @@ GROQ_KEY   = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
 SB_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+# anon key (pública) — usada para validar o token do usuário do FrotaHub
+SB_ANON = os.environ.get("SUPABASE_ANON_KEY",
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWxnZmJ1Z3Zla2J1aGh0YXR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU4NzA0OTIsImV4cCI6MjEwMTQ0NjQ5Mn0.Vwba3hsm43bwOXMXf2iQMkCWXqrGZaHKojHvV6mhFSI")
+# base do PCO no Dropbox (novo layout FROTAHUB)
+PCO_BASE = os.environ.get("PCO_BASE", "/FROTAHUB/1 - ADMINISTRATIVO/1 - PCO")
 FAT_NOME = os.environ.get("FAT_NOME", "FROTA MACEDO ENGENHARIA LTDA")
 FAT_CNPJ = os.environ.get("FAT_CNPJ", "27.363.223/0001-70")
 if GEMINI_KEY:
@@ -578,11 +583,105 @@ def processar_corrigidos(subpasta="TICKET NAO ASSOCIADO", arq_xlsx="NOTAS - TICK
         msg.append("⚠️ Erros: " + "; ".join(erros[:6]))
     return (ctrl if os.path.exists(ctrl) else None), "\n".join(msg)
 
+# ---------- FrotaHub: auth por token do Supabase + permissão por rotina ----------
+def _oc_pdf_texto(pdf_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_bytes); p = f.name
+    try:
+        out = subprocess.run(["pdftotext", "-layout", p, "-"], capture_output=True, text=True, timeout=60)
+        return out.stdout or ""
+    except Exception:
+        return ""
+    finally:
+        try: os.unlink(p)
+        except Exception: pass
+
+def _valor_br(s):
+    t = re.sub(r"[^\d,.\-]", "", str(s or ""))
+    if not t: return None
+    if "," in t: t = t.replace(".", "").replace(",", ".")
+    try: return round(float(t), 2)
+    except Exception: return None
+
+FART_BASE = "03720882"
+def extrai_oc(txt):
+    """Extrai os campos de uma O.C. do Obra Prima a partir do texto do PDF."""
+    d = {"numero":None,"data_oc":None,"centro_custo":None,"cnpj_centro_custo":None,
+         "fornecedor":None,"cnpj_fornecedor":None,"valor":None}
+    m = re.search(r"(?:ordem de compra|o\.?c\.?|n[ºo°]?\s*da\s*ordem)\D{0,12}(\d{4,7})", txt, re.I)
+    if m: d["numero"] = m.group(1).zfill(6)
+    m = re.search(r"(\d{2}/\d{2}/\d{4})", txt)
+    if m:
+        p=m.group(1).split("/"); d["data_oc"]=f"{p[2]}-{p[1]}-{p[0]}"
+    m = re.search(r"(?:obra|centro de custo)\s*[:\-]?\s*(.+)", txt, re.I)
+    if m: d["centro_custo"] = m.group(1).strip()[:120]
+    cnpjs = re.findall(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", txt)
+    fat = next((c for c in cnpjs if re.sub(r"\D","",c).startswith(FART_BASE)), None)
+    forn= next((c for c in cnpjs if not re.sub(r"\D","",c).startswith(FART_BASE)), None)
+    d["cnpj_centro_custo"]=fat; d["cnpj_fornecedor"]=forn
+    m = re.search(r"(?:total geral|valor total|total)\s*[:\-]?\s*R?\$?\s*([\d\.\,]+)", txt, re.I)
+    if m: d["valor"]=_valor_br(m.group(1))
+    # validação PCO: fornecedor com CNPJ + faturamento começa em 03720882
+    d["valido"] = bool(forn) and bool(fat)
+    d["motivo"] = "" if d["valido"] else ("sem CNPJ do fornecedor" if not forn else "faturamento não é Fartura")
+    return d
+
+def _bearer(request):
+    h = request.headers.get("authorization","") or request.headers.get("Authorization","")
+    return h[7:].strip() if h.lower().startswith("bearer ") else ""
+
+def _sb_json(url, key, tok=None, data=None, method="GET"):
+    hdrs = {"apikey": key, "authorization": f"Bearer {tok or key}"}
+    if data is not None: hdrs["content-type"]="application/json"
+    req = urllib.request.Request(url, data=(json.dumps(data).encode() if data is not None else None),
+                                 headers=hdrs, method=method)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        b=r.read().decode()
+        return json.loads(b) if b else None
+
+def auth_user(tok):
+    if not tok: return None
+    try: return _sb_json(f"{SB_URL}/auth/v1/user", SB_ANON, tok)
+    except Exception: return None
+
+def perfil_de(uid):
+    q=urllib.parse.urlencode({"id":f"eq.{uid}","select":"papel,nome,ativo","limit":"1"})
+    try:
+        d=_sb_json(f"{SB_URL}/rest/v1/perfis?{q}", SB_KEY)
+        return d[0] if d else None
+    except Exception: return None
+
+def pode_rotina(papel, rotina):
+    if papel=="builder": return True
+    q=urllib.parse.urlencode({"papel":f"eq.{papel}","rotina":f"eq.{rotina}","pode":"is.true","select":"rotina","limit":"1"})
+    try:
+        return bool(_sb_json(f"{SB_URL}/rest/v1/permissoes?{q}", SB_KEY))
+    except Exception: return False
+
+def exige(request, rotina):
+    """Valida o token do FrotaHub e a permissão. Devolve (user, perfil) ou levanta HTTPException."""
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request))
+    if not u or not u.get("id"): raise HTTPException(401, "não autenticado")
+    p=perfil_de(u["id"])
+    if not p or p.get("ativo") is False: raise HTTPException(403, "usuário sem perfil ativo")
+    if not pode_rotina(p["papel"], rotina): raise HTTPException(403, f"sem permissão para {rotina}")
+    return u, p
+
+def log_frotahub(uid, papel, rotina, acao, alvo="", detalhe=None):
+    try:
+        _sb_json(f"{SB_URL}/rest/v1/log_atividades", SB_KEY, data={
+            "user_id":uid,"papel":papel,"rotina":rotina,"acao":acao,"alvo":alvo,
+            "detalhe":detalhe or {}}, method="POST")
+    except Exception: pass
+
 # ---------- interface (FastAPI puro — sem Gradio) ----------
 from fastapi import FastAPI, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, FileResponse, PlainTextResponse, JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 RESULTS = {}   # token -> caminho da planilha de controle p/ download
 
 PAGINA = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
@@ -695,10 +794,83 @@ def baixar(t: str):
     return FileResponse(path, filename=os.path.basename(path),
                         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+# ============ API do FrotaHub (protegida por token do Supabase) ============
+@app.get("/api/ping")
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 41}
+
+@app.get("/api/me")
+def api_me(request: Request):
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request))
+    if not u: raise HTTPException(401,"não autenticado")
+    p=perfil_de(u["id"]) or {}
+    return {"email":u.get("email"),"nome":p.get("nome"),"papel":p.get("papel")}
+
+PCO_ENVIAR = PCO_BASE + "/0 - ENVIAR (ADICIONAR AQUI)"
+PCO_RESIDUAL = PCO_BASE + "/100 - ARQUIVOS RESIDUAIS (NÃO MEXER)"
+
+@app.post("/pco/listar")
+def pco_listar(request: Request):
+    """CONFERIR_LISTA_PCO — lê a pasta 0-ENVIAR, extrai os dados de cada O.C. e
+    devolve a lista (filtra as que já têm PCO enviado no banco)."""
+    from fastapi import HTTPException
+    u,p = exige(request, "CONFERIR_LISTA_PCO")
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    access = dropbox_rateio.obter_token()
+    arqs = [a for a in dropbox_rateio.listar(access, PCO_ENVIAR) if a.lower().endswith(".pdf")]
+    # números de O.C. já enviadas (não mostrar de novo)
+    try:
+        env = _sb_json(f"{SB_URL}/rest/v1/ocs?pco_status=eq.enviado&select=numero", SB_KEY) or []
+        ja = {str(r["numero"]) for r in env}
+    except Exception: ja=set()
+    itens=[]
+    for nome in sorted(arqs):
+        try:
+            pdf = dropbox_rateio.baixar(access, f"{PCO_ENVIAR}/{nome}")
+            d = extrai_oc(_oc_pdf_texto(pdf)) if pdf else {}
+        except Exception as e:
+            d = {"_erro": str(e)[:120]}
+        if d.get("numero") and d["numero"] in ja:   # já enviada
+            continue
+        d["arquivo"]=nome
+        itens.append(d)
+    return {"pasta": PCO_ENVIAR, "total": len(itens), "itens": itens}
+
+@app.get("/pco/visualizar")
+def pco_visualizar(request: Request, arquivo: str):
+    from fastapi import HTTPException
+    exige(request, "CONFERIR_LISTA_PCO")
+    access = dropbox_rateio.obter_token()
+    pdf = dropbox_rateio.baixar(access, f"{PCO_ENVIAR}/{os.path.basename(arquivo)}")
+    if not pdf: raise HTTPException(404,"arquivo não encontrado")
+    return Response(content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{os.path.basename(arquivo)}"'})
+
+@app.post("/pco/excluir")
+async def pco_excluir(request: Request):
+    from fastapi import HTTPException
+    u,p = exige(request, "CONFERIR_LISTA_PCO")
+    body = await request.json()
+    arq = os.path.basename(body.get("arquivo",""))
+    if not arq: raise HTTPException(400,"arquivo?")
+    access = dropbox_rateio.obter_token()
+    dropbox_rateio.criar_pasta(access, PCO_RESIDUAL)
+    try:
+        dropbox_rateio.mover(access, f"{PCO_ENVIAR}/{arq}", f"{PCO_RESIDUAL}/{arq}")
+    except Exception as e:
+        raise HTTPException(500, f"falha ao mover: {e}")
+    log_frotahub(u["id"], p["papel"], "CONFERIR_LISTA_PCO", "EXCLUIU_OC", arq)
+    return {"ok": True}
+
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
     import base64, secrets
     async def wrapped(scope, receive, send):
+        # rotas do FrotaHub têm autenticação própria (token Supabase) — não pedir Basic
+        _path = scope.get("path", "") or ""
+        if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
+                                        or scope.get("method") == "OPTIONS"):
+            await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
             hdrs = dict(scope.get("headers") or [])
             auth = hdrs.get(b"authorization", b"").decode()
