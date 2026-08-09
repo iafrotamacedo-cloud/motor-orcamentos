@@ -20,7 +20,7 @@ APP_KEY   = os.environ.get("DROPBOX_APP_KEY", "")
 APP_SECRET= os.environ.get("DROPBOX_APP_SECRET", "")
 REFRESH   = os.environ.get("DROPBOX_REFRESH_TOKEN", "")
 TOKEN     = os.environ.get("DROPBOX_TOKEN", "")
-BASE      = os.environ.get("DROPBOX_BASE", "/AUTOMACAO MANUTENCAO").rstrip("/")
+BASE      = os.environ.get("DROPBOX_BASE", "/FROTAHUB/2 - MANUTENCAO").rstrip("/")
 
 ORCAMENTOS   = os.environ.get("DROPBOX_ORCAMENTOS", "ORCAMENTOS MONTADOS")
 NAO_LANCADOS = os.environ.get("DROPBOX_NAO_LANCADOS", "1 - ORÇAMENTOS NÃO LANÇADOS")
@@ -121,6 +121,16 @@ def criar_pasta(access, pasta):
             return
         # não é fatal — segue mesmo assim
         return
+
+def apagar(access, dropbox_path):
+    """Apaga um arquivo (vai para a LIXEIRA do Dropbox — recuperável ~30 dias)."""
+    req = urllib.request.Request("https://api.dropboxapi.com/2/files/delete_v2",
+        data=json.dumps({"path": dropbox_path}, ensure_ascii=True).encode(),
+        headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=30).read(); return True
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(_erro(e)) from None
 
 def mover(access, de_path, para_path, autorename=True):
     """MOVE (relocaliza) um arquivo no Dropbox — não apaga dados, só troca de pasta."""
