@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 44
+#  CONTADOR DE REVISÕES DESTE app.py: 45
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -56,7 +56,9 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "mail.frotamacedo.com.br")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
-PCO_FROM  = os.environ.get("PCO_FROM", SMTP_USER)
+# Render bloqueia portas de SMTP -> preferimos a API HTTP do Brevo quando houver chave
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+PCO_FROM  = os.environ.get("PCO_FROM", SMTP_USER or "pco@frotamacedo.com.br")
 def _lista_env(k, padrao):
     return [x.strip() for x in os.environ.get(k, padrao).split(",") if x.strip()]
 PCO_TO      = _lista_env("PCO_TO", "igor@frotamacedo.com.br")
@@ -842,7 +844,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 44}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 45}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -972,7 +974,25 @@ def _bloq_email_html(bloqueadas, data_str):
 <ul>{itens}</ul>
 <p style="margin-top:20px">Atenciosamente,</p><p>{ASSINATURA}</p></div>"""
 
+def _enviar_brevo(assunto, html, para, cc, anexos):
+    import base64
+    payload = {"sender": {"email": PCO_FROM, "name": "Frota Macedo Engenharia"},
+               "to": [{"email": e} for e in para], "subject": assunto, "htmlContent": html}
+    if cc: payload["cc"] = [{"email": e} for e in cc]
+    if anexos:
+        payload["attachment"] = [{"name": n, "content": base64.b64encode(c).decode()} for n, c, _ in anexos]
+    req = urllib.request.Request("https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode(),
+        headers={"api-key": BREVO_API_KEY, "content-type": "application/json", "accept": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=60).read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Brevo {e.code}: {e.read().decode()[:300]}") from None
+
 def enviar_email(assunto, html, para, cc=None, anexos=None):
+    # Preferir API HTTP (Brevo) — o Render bloqueia SMTP.
+    if BREVO_API_KEY:
+        return _enviar_brevo(assunto, html, para, cc, anexos)
     import smtplib, ssl
     from email.message import EmailMessage
     msg = EmailMessage()
@@ -1038,15 +1058,15 @@ def pco_enviar_previa(request: Request):
     limpo = lambda d: {k: d.get(k) for k in ("arquivo","numero","data_oc","centro_custo","fornecedor","cnpj_fornecedor","valor","motivo")}
     return {"aprovadas": [limpo(d) for d in aprov], "bloqueadas": [limpo(d) for d in bloq],
             "destinatarios": {"to": PCO_TO, "cc": PCO_CC, "bloqueadas": PCO_BLOQ_TO},
-            "smtp_ok": bool(SMTP_USER and SMTP_PASS)}
+            "smtp_ok": bool(BREVO_API_KEY or (SMTP_USER and SMTP_PASS))}
 
 @app.post("/pco/enviar")
 def pco_enviar(request: Request):
     import io, zipfile
     from fastapi import HTTPException
     u, p = exige(request, "ENVIAR_PCO")
-    if not (SMTP_USER and SMTP_PASS):
-        raise HTTPException(500, "SMTP não configurado — defina SMTP_USER e SMTP_PASS no Render.")
+    if not (BREVO_API_KEY or (SMTP_USER and SMTP_PASS)):
+        raise HTTPException(500, "Envio não configurado — defina BREVO_API_KEY (recomendado) no Render.")
     access = dropbox_rateio.obter_token()
     hoje = datetime.date.today().strftime("%d/%m/%Y")
     aprov, bloq = _pco_coleta(access)
