@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 41
+#  CONTADOR DE REVISÕES DESTE app.py: 43
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -604,26 +604,59 @@ def _valor_br(s):
     except Exception: return None
 
 FART_BASE = "03720882"
+# rótulos que aparecem no bloco de dados (usados p/ não colar o endereço no nome)
+_OC_LABELS = ("Nome:", "CNPJ:", "Telefone:", "Vendedor:", "E-mail:", "Endereço:", "Endereco:", "I.E.:")
+
 def extrai_oc(txt):
-    """Extrai os campos de uma O.C. do Obra Prima a partir do texto do PDF."""
+    """Extrai os campos de uma O.C. do Obra Prima (mesma lógica do PCO manual):
+    lê os BLOCOS 'DADOS DO FATURAMENTO' (tomador Fartura) e 'DADOS DO FORNECEDOR'
+    (o fornecedor de verdade — Nome + CNPJ), não um CNPJ solto qualquer."""
     d = {"numero":None,"data_oc":None,"centro_custo":None,"cnpj_centro_custo":None,
          "fornecedor":None,"cnpj_fornecedor":None,"valor":None}
-    m = re.search(r"(?:ordem de compra|o\.?c\.?|n[ºo°]?\s*da\s*ordem)\D{0,12}(\d{4,7})", txt, re.I)
+    # número da O.C.
+    m = re.search(r"ORDEM DE COMPRA\s+(\d+)", txt, re.I)
+    if not m: m = re.search(r"(?:ordem de compra|o\.?c\.?)\D{0,12}(\d{4,7})", txt, re.I)
     if m: d["numero"] = m.group(1).zfill(6)
-    m = re.search(r"(\d{2}/\d{2}/\d{4})", txt)
+    # data (preferir Criação/Data; senão a 1ª data do documento)
+    m = re.search(r"(?:cria[çc][ãa]o|data)\D{0,12}(\d{2}/\d{2}/\d{4})", txt, re.I) or re.search(r"(\d{2}/\d{2}/\d{4})", txt)
     if m:
         p=m.group(1).split("/"); d["data_oc"]=f"{p[2]}-{p[1]}-{p[0]}"
-    m = re.search(r"(?:obra|centro de custo)\s*[:\-]?\s*(.+)", txt, re.I)
-    if m: d["centro_custo"] = m.group(1).strip()[:120]
-    cnpjs = re.findall(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", txt)
-    fat = next((c for c in cnpjs if re.sub(r"\D","",c).startswith(FART_BASE)), None)
-    forn= next((c for c in cnpjs if not re.sub(r"\D","",c).startswith(FART_BASE)), None)
-    d["cnpj_centro_custo"]=fat; d["cnpj_fornecedor"]=forn
-    m = re.search(r"(?:total geral|valor total|total)\s*[:\-]?\s*R?\$?\s*([\d\.\,]+)", txt, re.I)
-    if m: d["valor"]=_valor_br(m.group(1))
-    # validação PCO: fornecedor com CNPJ + faturamento começa em 03720882
-    d["valido"] = bool(forn) and bool(fat)
-    d["motivo"] = "" if d["valido"] else ("sem CNPJ do fornecedor" if not forn else "faturamento não é Fartura")
+    # centro de custo (delimitado por CNO:)
+    m = re.search(r"OBRA\s*/?\s*CENTRO DE CUSTO\s*:?\s*(.+?)\s{2,}CNO:", txt, re.I)
+    if not m: m = re.search(r"OBRA\s*/?\s*CENTRO DE CUSTO\s*:?\s*(.+)", txt, re.I)
+    if m: d["centro_custo"] = re.sub(r"\s+"," ",m.group(1)).strip()[:120]
+    # bloco FATURAMENTO (tomador Fartura) -> CNPJ do centro de custo
+    ftb = re.search(r"DADOS DO FATURAMENTO(.*?)DADOS DO FORNECEDOR", txt, re.DOTALL|re.I)
+    if ftb:
+        mfc = re.search(r"CNPJ:\s*([\d./\-]+)", ftb.group(1))
+        if mfc and mfc.group(1).strip(): d["cnpj_centro_custo"] = fmt_cnpj(mfc.group(1))
+    # bloco FORNECEDOR -> Nome + CNPJ do fornecedor de verdade
+    fb = re.search(r"DADOS DO FORNECEDOR(.*?)(?:OBRA\s*/?\s*CENTRO DE CUSTO|DADOS DO|ITENS|PRODUTOS)", txt, re.DOTALL|re.I) \
+         or re.search(r"DADOS DO FORNECEDOR(.*)", txt, re.DOTALL|re.I)
+    if fb:
+        block = fb.group(1); lines = block.splitlines()
+        for i, line in enumerate(lines):
+            mn = re.search(r"Nome:\s+(.+?)(?:\s{2,}Endere[çc]o:.*)?$", line)
+            if mn:
+                nome = mn.group(1).strip()
+                if i+1 < len(lines):
+                    nxt = lines[i+1].strip()
+                    if nxt and not any(lbl in lines[i+1] for lbl in _OC_LABELS):
+                        nome = (nome + " " + re.sub(r"\s{2,}.*$","",nxt)).strip()
+                d["fornecedor"] = re.sub(r"\s+"," ",nome).strip()[:160]
+                break
+        mc = re.search(r"CNPJ:\s*([\d./\-]*)", block)
+        if mc and mc.group(1).strip(): d["cnpj_fornecedor"] = fmt_cnpj(mc.group(1))
+    # total
+    totais = re.findall(r"(?mi)^\s*Total\s+([\d.,]+)\s*$", txt)
+    if totais: d["valor"] = _valor_br(totais[-1])
+    else:
+        m = re.search(r"(?:total geral|valor total|total)\s*[:\-]?\s*R?\$?\s*([\d\.\,]+)", txt, re.I)
+        if m: d["valor"] = _valor_br(m.group(1))
+    # validação PCO
+    fat_ok = bool(d["cnpj_centro_custo"]) and re.sub(r"\D","",d["cnpj_centro_custo"] or "").startswith(FART_BASE)
+    d["valido"] = bool(d["cnpj_fornecedor"]) and fat_ok
+    d["motivo"] = "" if d["valido"] else ("sem CNPJ do fornecedor" if not d["cnpj_fornecedor"] else "faturamento não é Fartura")
     return d
 
 def _bearer(request):
@@ -796,7 +829,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 41}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 43}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -836,6 +869,34 @@ def pco_listar(request: Request):
         itens.append(d)
     return {"pasta": PCO_ENVIAR, "total": len(itens), "itens": itens}
 
+@app.post("/pco/arquivos")
+def pco_arquivos(request: Request):
+    """Lista rápida só com os NOMES dos PDFs da pasta 0-ENVIAR (p/ barra de progresso)."""
+    from fastapi import HTTPException
+    exige(request, "CONFERIR_LISTA_PCO")
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    access = dropbox_rateio.obter_token()
+    arqs = [a for a in dropbox_rateio.listar(access, PCO_ENVIAR) if a.lower().endswith(".pdf")]
+    return {"arquivos": sorted(arqs)}
+
+@app.get("/pco/oc")
+def pco_oc(request: Request, arquivo: str):
+    """Lê UMA O.C. (extrai os campos) — usado no carregamento com progresso."""
+    from fastapi import HTTPException
+    exige(request, "CONFERIR_LISTA_PCO")
+    access = dropbox_rateio.obter_token()
+    nome = os.path.basename(arquivo)
+    pdf = dropbox_rateio.baixar(access, f"{PCO_ENVIAR}/{nome}")
+    d = extrai_oc(_oc_pdf_texto(pdf)) if pdf else {}
+    d["arquivo"] = nome
+    d["ja_enviada"] = False
+    if d.get("numero"):
+        try:
+            q = urllib.parse.urlencode({"numero": f"eq.{d['numero']}", "pco_status":"eq.enviado","select":"numero","limit":"1"})
+            d["ja_enviada"] = bool(_sb_json(f"{SB_URL}/rest/v1/ocs?{q}", SB_KEY))
+        except Exception: pass
+    return d
+
 @app.get("/pco/visualizar")
 def pco_visualizar(request: Request, arquivo: str):
     from fastapi import HTTPException
@@ -854,11 +915,10 @@ async def pco_excluir(request: Request):
     arq = os.path.basename(body.get("arquivo",""))
     if not arq: raise HTTPException(400,"arquivo?")
     access = dropbox_rateio.obter_token()
-    dropbox_rateio.criar_pasta(access, PCO_RESIDUAL)
     try:
-        dropbox_rateio.mover(access, f"{PCO_ENVIAR}/{arq}", f"{PCO_RESIDUAL}/{arq}")
+        dropbox_rateio.apagar(access, f"{PCO_ENVIAR}/{arq}")   # vai p/ lixeira do Dropbox (recuperável)
     except Exception as e:
-        raise HTTPException(500, f"falha ao mover: {e}")
+        raise HTTPException(500, f"falha ao excluir: {e}")
     log_frotahub(u["id"], p["papel"], "CONFERIR_LISTA_PCO", "EXCLUIU_OC", arq)
     return {"ok": True}
 
