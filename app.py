@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 43
+#  CONTADOR DE REVISÕES DESTE app.py: 44
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -51,6 +51,19 @@ SB_ANON = os.environ.get("SUPABASE_ANON_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWxnZmJ1Z3Zla2J1aGh0YXR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU4NzA0OTIsImV4cCI6MjEwMTQ0NjQ5Mn0.Vwba3hsm43bwOXMXf2iQMkCWXqrGZaHKojHvV6mhFSI")
 # base do PCO no Dropbox (novo layout FROTAHUB)
 PCO_BASE = os.environ.get("PCO_BASE", "/FROTAHUB/1 - ADMINISTRATIVO/1 - PCO")
+# --- ENVIAR_PCO: SMTP + destinatários (padrão = TESTE p/ igor@; trocar por env p/ ir ao ar) ---
+SMTP_HOST = os.environ.get("SMTP_HOST", "mail.frotamacedo.com.br")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
+PCO_FROM  = os.environ.get("PCO_FROM", SMTP_USER)
+def _lista_env(k, padrao):
+    return [x.strip() for x in os.environ.get(k, padrao).split(",") if x.strip()]
+PCO_TO      = _lista_env("PCO_TO", "igor@frotamacedo.com.br")
+PCO_CC      = _lista_env("PCO_CC", "")
+PCO_BLOQ_TO = _lista_env("PCO_BLOQ_TO", "igor@frotamacedo.com.br")
+ASSINATURA = ("<b>Isabele Melissa</b><br><b>Administrativo</b><br>"
+              "<b>(85) 98795-5735</b><br><b>Frota Macedo Engenharia LTDA</b>")
 FAT_NOME = os.environ.get("FAT_NOME", "FROTA MACEDO ENGENHARIA LTDA")
 FAT_CNPJ = os.environ.get("FAT_CNPJ", "27.363.223/0001-70")
 if GEMINI_KEY:
@@ -829,7 +842,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 43}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 44}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -921,6 +934,164 @@ async def pco_excluir(request: Request):
         raise HTTPException(500, f"falha ao excluir: {e}")
     log_frotahub(u["id"], p["papel"], "CONFERIR_LISTA_PCO", "EXCLUIU_OC", arq)
     return {"ok": True}
+
+# ---------------- ENVIAR_PCO ----------------
+def _fmt_reais(v):
+    try: return "R$ " + f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception: return "—"
+
+def _pco_email_html(aprovadas, data_str):
+    th = "style='background:#000;color:#fff;padding:7px 9px;text-align:left;font-size:13px'"
+    td = "style='padding:7px 9px;border-bottom:1px solid #ddd;font-size:13px'"
+    linhas = ""; total = 0.0
+    for o in aprovadas:
+        try: total += float(o.get("valor") or 0)
+        except Exception: pass
+        linhas += (f"<tr><td {td}>{o.get('centro_custo') or '—'}</td>"
+                   f"<td {td}>{o.get('numero') or '—'}</td>"
+                   f"<td {td}>{o.get('fornecedor') or '—'}</td>"
+                   f"<td {td}>{o.get('cnpj_fornecedor') or '—'}</td>"
+                   f"<td {td} align='right'>{_fmt_reais(o.get('valor'))}</td></tr>")
+    total_row = (f"<tr><td {td} colspan='4'><b>Total ({len(aprovadas)} ordens)</b></td>"
+                 f"<td {td} align='right'><b>{_fmt_reais(total)}</b></td></tr>")
+    return f"""<div style="font-family:Arial,sans-serif;color:#1e2733;font-size:14px">
+<p>Prezados, equipe Distribuidora de Alimentos Fartura S/A,</p>
+<p style="margin-bottom:18px">Seguem as Ordens de Compra (PCO) para solicitação. Os PDFs correspondentes
+seguem no arquivo em anexo.</p>
+<table style="border-collapse:collapse;width:100%;max-width:720px">
+<thead><tr><th {th}>CENTRO DE CUSTO</th><th {th}>OC</th><th {th}>FORNECEDOR</th><th {th}>CNPJ</th><th {th}>VALOR (R$)</th></tr></thead>
+<tbody>{linhas}{total_row}</tbody></table>
+<p style="margin-top:16px">Arquivo em anexo: <b>Pedidos_PCO_{data_str.replace('/','-')}.zip</b></p>
+<p style="margin-top:24px">Atenciosamente,</p>
+<p>{ASSINATURA}</p></div>"""
+
+def _bloq_email_html(bloqueadas, data_str):
+    itens = "".join(f"<li>O.C. <b>{o.get('numero') or o.get('arquivo')}</b> — {o.get('motivo') or 'bloqueada'}</li>" for o in bloqueadas)
+    return f"""<div style="font-family:Arial,sans-serif;color:#1e2733;font-size:14px">
+<p>As seguintes Ordens de Compra <b>NÃO</b> foram enviadas no PCO de {data_str} (precisam de correção):</p>
+<ul>{itens}</ul>
+<p style="margin-top:20px">Atenciosamente,</p><p>{ASSINATURA}</p></div>"""
+
+def enviar_email(assunto, html, para, cc=None, anexos=None):
+    import smtplib, ssl
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"] = assunto; msg["From"] = PCO_FROM
+    msg["To"] = ", ".join(para)
+    if cc: msg["Cc"] = ", ".join(cc)
+    msg.set_content("Seu cliente de e-mail não suporta HTML.")
+    msg.add_alternative(html, subtype="html")
+    for nome, conteudo, mime in (anexos or []):
+        mt, st = mime.split("/", 1)
+        msg.add_attachment(conteudo, maintype=mt, subtype=st, filename=nome)
+    destinos = list(para) + list(cc or [])
+    ctx = ssl.create_default_context()
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx, timeout=60) as s:
+            s.login(SMTP_USER, SMTP_PASS); s.send_message(msg, to_addrs=destinos)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=60) as s:
+            s.ehlo(); s.starttls(context=ctx); s.login(SMTP_USER, SMTP_PASS); s.send_message(msg, to_addrs=destinos)
+
+def _oc_row(d, status, path, motivo=None):
+    row = {"numero": d.get("numero"), "data_oc": d.get("data_oc"),
+           "centro_custo": d.get("centro_custo"), "cnpj_centro_custo": d.get("cnpj_centro_custo"),
+           "fornecedor": d.get("fornecedor"), "cnpj_fornecedor": d.get("cnpj_fornecedor"),
+           "valor": d.get("valor"), "pco_status": status, "arquivo_oc_path": path}
+    if status == "enviado": row["pco_enviado_em"] = datetime.datetime.now().isoformat()
+    if motivo: row["bloqueio_motivo"] = motivo
+    return row
+
+def sb_upsert_ocs(rows):
+    rows = [r for r in rows if r.get("numero")]
+    if not rows: return
+    req = urllib.request.Request(f"{SB_URL}/rest/v1/ocs?on_conflict=numero",
+        data=json.dumps(rows, ensure_ascii=False).encode(), method="POST",
+        headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "content-type": "application/json",
+                 "prefer": "resolution=merge-duplicates,return=minimal"})
+    try: urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e: print("ocs upsert erro:", e.read().decode()[:300], flush=True)
+
+def _pco_coleta(access):
+    """Baixa os PDFs de 0-ENVIAR, extrai e separa aprovadas/bloqueadas (ignora já enviadas)."""
+    arqs = [a for a in dropbox_rateio.listar(access, PCO_ENVIAR) if a.lower().endswith(".pdf")]
+    try:
+        env = _sb_json(f"{SB_URL}/rest/v1/ocs?pco_status=eq.enviado&select=numero", SB_KEY) or []
+        ja = {str(r["numero"]) for r in env}
+    except Exception: ja = set()
+    aprov, bloq = [], []
+    for nome in sorted(arqs):
+        pdf = dropbox_rateio.baixar(access, f"{PCO_ENVIAR}/{nome}")
+        if not pdf: continue
+        d = extrai_oc(_oc_pdf_texto(pdf)); d["arquivo"] = nome; d["_pdf"] = pdf
+        if d.get("numero") and d["numero"] in ja: continue
+        (aprov if d.get("valido") else bloq).append(d)
+    return aprov, bloq
+
+@app.post("/pco/enviar_previa")
+def pco_enviar_previa(request: Request):
+    from fastapi import HTTPException
+    exige(request, "ENVIAR_PCO")
+    if not dropbox_rateio.ativo(): raise HTTPException(500, "Dropbox não configurado")
+    access = dropbox_rateio.obter_token()
+    aprov, bloq = _pco_coleta(access)
+    limpo = lambda d: {k: d.get(k) for k in ("arquivo","numero","data_oc","centro_custo","fornecedor","cnpj_fornecedor","valor","motivo")}
+    return {"aprovadas": [limpo(d) for d in aprov], "bloqueadas": [limpo(d) for d in bloq],
+            "destinatarios": {"to": PCO_TO, "cc": PCO_CC, "bloqueadas": PCO_BLOQ_TO},
+            "smtp_ok": bool(SMTP_USER and SMTP_PASS)}
+
+@app.post("/pco/enviar")
+def pco_enviar(request: Request):
+    import io, zipfile
+    from fastapi import HTTPException
+    u, p = exige(request, "ENVIAR_PCO")
+    if not (SMTP_USER and SMTP_PASS):
+        raise HTTPException(500, "SMTP não configurado — defina SMTP_USER e SMTP_PASS no Render.")
+    access = dropbox_rateio.obter_token()
+    hoje = datetime.date.today().strftime("%d/%m/%Y")
+    aprov, bloq = _pco_coleta(access)
+    if not aprov and not bloq:
+        return {"ok": True, "enviados": 0, "bloqueados": 0, "msg": "Nada novo para enviar."}
+    erros = []
+    # ---- APROVADAS: e-mail com zip + move + banco ----
+    if aprov:
+        buf = io.BytesIO(); z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
+        for d in aprov: z.writestr(d["arquivo"], d["_pdf"])
+        z.close(); zipbytes = buf.getvalue()
+        zipnome = f"Pedidos_PCO_{hoje.replace('/','-')}.zip"
+        try:
+            enviar_email(f"Ordens de Compra (PCO) - {hoje} - Frota Macedo Engenharia",
+                         _pco_email_html(aprov, hoje), PCO_TO, PCO_CC,
+                         [(zipnome, zipbytes, "application/zip")])
+        except Exception as e:
+            raise HTTPException(500, f"falha ao enviar e-mail: {e}")
+        feitos = f"{PCO_BASE}/1 - PEDIDOS FEITOS"
+        dropbox_rateio.criar_pasta(access, feitos); dropbox_rateio.criar_pasta(access, f"{feitos}/APAGAR")
+        try: dropbox_rateio.subir_bytes(access, zipbytes, f"{feitos}/{zipnome}", overwrite=True)
+        except Exception as e: erros.append(f"zip: {e}")
+        rows = []
+        for d in aprov:
+            dest = f"{feitos}/APAGAR/{d['arquivo']}"
+            try: dropbox_rateio.mover(access, f"{PCO_ENVIAR}/{d['arquivo']}", dest)
+            except Exception as e: erros.append(f"mover {d['arquivo']}: {e}")
+            rows.append(_oc_row(d, "enviado", f"1 - PEDIDOS FEITOS/APAGAR/{d['arquivo']}"))
+        sb_upsert_ocs(rows)
+    # ---- BLOQUEADAS: move + banco + aviso ----
+    if bloq:
+        pasta_bloq = f"{PCO_BASE}/2 - OCS BLOQUEADAS"; dropbox_rateio.criar_pasta(access, pasta_bloq)
+        rows = []
+        for d in bloq:
+            novo = f"OC_BLOC_{d.get('numero') or os.path.splitext(d['arquivo'])[0]}.pdf"
+            try: dropbox_rateio.mover(access, f"{PCO_ENVIAR}/{d['arquivo']}", f"{pasta_bloq}/{novo}")
+            except Exception as e: erros.append(f"mover bloq {d['arquivo']}: {e}")
+            rows.append(_oc_row(d, "bloqueado", f"2 - OCS BLOQUEADAS/{novo}", motivo=d.get("motivo")))
+        sb_upsert_ocs(rows)
+        try: enviar_email(f"O.C. bloqueadas no PCO - {hoje}", _bloq_email_html(bloq, hoje), PCO_BLOQ_TO)
+        except Exception as e: erros.append(f"e-mail bloqueadas: {e}")
+    log_frotahub(u["id"], p["papel"], "ENVIAR_PCO", "ENVIOU_PCO",
+                 f"{len(aprov)} enviadas / {len(bloq)} bloqueadas", {"to": PCO_TO})
+    return {"ok": True, "enviados": len(aprov), "bloqueados": len(bloq),
+            "to": PCO_TO, "cc": PCO_CC, "erros": erros}
 
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
