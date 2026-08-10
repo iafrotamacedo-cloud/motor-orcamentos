@@ -122,6 +122,35 @@ def criar_pasta(access, pasta):
         # não é fatal — segue mesmo assim
         return
 
+def listar_entradas(access, pasta):
+    """Lista entradas do 1º nível (arquivos E pastas): [{'name':.., 'dir':bool}]."""
+    out, url = [], "https://api.dropboxapi.com/2/files/list_folder"
+    arg = {"path": pasta, "recursive": False, "limit": 2000}
+    while True:
+        req = urllib.request.Request(url, data=json.dumps(arg).encode(),
+            headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+        try:
+            r = json.loads(urllib.request.urlopen(req, timeout=60).read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 409: return out   # pasta não existe
+            raise RuntimeError(_erro(e)) from None
+        for ent in r.get("entries", []):
+            out.append({"name": ent["name"], "dir": ent.get(".tag") == "folder"})
+        if not r.get("has_more"): break
+        url = "https://api.dropboxapi.com/2/files/list_folder/continue"; arg = {"cursor": r["cursor"]}
+    return out
+
+def copiar(access, de_path, para_path):
+    """Copia arquivo OU pasta (recursivo, server-side) via copy_v2."""
+    arg = {"from_path": de_path, "to_path": para_path, "autorename": False}
+    req = urllib.request.Request("https://api.dropboxapi.com/2/files/copy_v2",
+        data=json.dumps(arg, ensure_ascii=True).encode(),
+        headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=600).read(); return True
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(_erro(e)) from None
+
 def apagar(access, dropbox_path):
     """Apaga um arquivo (vai para a LIXEIRA do Dropbox — recuperável ~30 dias)."""
     req = urllib.request.Request("https://api.dropboxapi.com/2/files/delete_v2",
