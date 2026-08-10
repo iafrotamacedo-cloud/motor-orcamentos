@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 61
+#  CONTADOR DE REVISÕES DESTE app.py: 62
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 61}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 62}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2048,11 +2048,21 @@ def _ler_notas_gemini(file_bytes, mime="application/pdf"):
     try: return (json.loads(r.text) or {}).get("notas") or []
     except Exception: return []
 
-def _pasta_manut(access, n):
+FROTAHUB_ROOT = os.environ.get("FROTAHUB_ROOT", "/FROTAHUB")
+def _manut_base(access):
+    """Acha a pasta do depto Manutenção pelo número '2 -' (robusto a acento/grafia)."""
     try:
-        for e in dropbox_rateio.listar_entradas(access, MANUT_BASE):
+        for e in dropbox_rateio.listar_entradas(access, FROTAHUB_ROOT):
+            if e["dir"] and re.match(r"^\s*2\s*-", e["name"]):
+                return f"{FROTAHUB_ROOT}/{e['name']}"
+    except Exception: pass
+    return MANUT_BASE
+def _pasta_manut(access, n, base=None):
+    base = base or _manut_base(access)
+    try:
+        for e in dropbox_rateio.listar_entradas(access, base):
             if e["dir"] and re.match(rf"^\s*{n}\s*-", e["name"]):
-                return f"{MANUT_BASE}/{e['name']}"
+                return f"{base}/{e['name']}"
     except Exception: pass
     return None
 
@@ -2099,27 +2109,72 @@ def orc_listar(request: Request):
     exige(request,"CONFERIR_LISTA_ORCAMENTOS")
     if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
     access=dropbox_rateio.obter_token()
-    ORC_NOTAS=_pasta_manut(access,0) or (MANUT_BASE + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
+    _mb=_manut_base(access)
+    ORC_NOTAS=_pasta_manut(access,0,_mb) or (_mb + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
     arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
     return {"pasta":ORC_NOTAS,"total":len(arqs),"arquivos":sorted(arqs)}
 
-@app.get("/orc/chamados")
-def orc_chamados(request: Request, q: str="", aba: str="", status: str="", desde: str="", ate: str=""):
-    """Lista os chamados do Trílogo (tabela chamados, sincronizada pelo robô do GitHub)."""
-    from fastapi import HTTPException
-    exige(request,"CHAMADOS_TRILOGO")
+_ST_MAP={"1":"Aberto","5":"Vistoriado","6":"Em execução","7":"Executado"}
+def _chamados_query(q="", aba="", status="", desde="", ate=""):
     parts=["select=numero,aba,loja,status,tipo_predial,prioridade,solicitante,responsavel,data_criacao,prazo",
-           "order=data_criacao.desc","limit=1500"]
+           "order=data_criacao.desc","limit=3000"]
     if aba:    parts.append(f"aba=eq.{urllib.parse.quote(aba)}")
-    if status: parts.append(f"status=eq.{urllib.parse.quote(status)}")
     if desde:  parts.append(f"data_criacao=gte.{desde}")
     if ate:    parts.append(f"data_criacao=lte.{ate}")
     if q and len(q)>=3:
-        val=f"(numero.ilike.*{q}*,loja.ilike.*{q}*,solicitante.ilike.*{q}*)"
-        parts.append("or="+urllib.parse.quote(val))
-    try: rows=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(parts),SB_KEY) or []
+        parts.append("or="+urllib.parse.quote(f"(numero.ilike.*{q}*,loja.ilike.*{q}*,solicitante.ilike.*{q}*)"))
+    rows=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(parts),SB_KEY) or []
+    for r in rows:                       # normaliza status numérico legado -> texto
+        s=str(r.get("status") or "")
+        if s in _ST_MAP: r["status"]=_ST_MAP[s]
+    if status:                           # filtra por status já normalizado (pega legado e novo)
+        alvo=status.strip().lower()
+        rows=[r for r in rows if (r.get("status") or "").strip().lower()==alvo]
+    return rows
+
+@app.get("/orc/chamados")
+def orc_chamados(request: Request, q: str="", aba: str="", status: str="", desde: str="", ate: str=""):
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_TRILOGO")
+    try: rows=_chamados_query(q,aba,status,desde,ate)
     except Exception as e: raise HTTPException(500,f"chamados: {e}")
     return {"itens":rows,"total":len(rows)}
+
+def _abacurta(a): return "Instalações" if (a or "").upper().startswith("INST") else ("Civil" if (a or "").upper().startswith("CIV") else (a or ""))
+
+@app.get("/orc/chamados_pdf")
+def orc_chamados_pdf(request: Request, q: str="", aba: str="", status: str="", desde: str="", ate: str=""):
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_TRILOGO")
+    rows=_chamados_query(q,aba,status,desde,ate)
+    linhas=[[r.get("numero") or "", _abacurta(r.get("aba")), (r.get("loja") or "")[:30], r.get("status") or "",
+             (r.get("tipo_predial") or "")[:22], r.get("prioridade") or "", _data_br(r.get("data_criacao")), _data_br(r.get("prazo"))] for r in rows]
+    sub=" · ".join([x for x in [_abacurta(aba) if aba else "", status if status else "", (f"{desde}→{ate}" if (desde or ate) else "")] if x])
+    pdf=_lista_pdf("Chamados do Trílogo", ["Nº","Conta","Loja","Status","Tipo","Prior.","Criado","Prazo"], linhas,
+                   subtitulo=f"{len(rows)} chamado(s)"+(f" · {sub}" if sub else ""))
+    return Response(content=pdf, media_type="application/pdf", headers={"Content-Disposition":'attachment; filename="chamados_trilogo.pdf"'})
+
+@app.get("/orc/chamados_xlsx")
+def orc_chamados_xlsx(request: Request, q: str="", aba: str="", status: str="", desde: str="", ate: str=""):
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_TRILOGO")
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    rows=_chamados_query(q,aba,status,desde,ate)
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title="Chamados"
+    heads=["Nº","Conta","Loja","Status","Tipo predial","Prioridade","Solicitante","Responsável","Criado em","Prazo"]
+    ws.append(heads)
+    for c in ws[1]:
+        c.font=Font(name="Arial",bold=True,color="FFFFFF"); c.fill=PatternFill("solid",fgColor="7A1517"); c.alignment=Alignment(horizontal="center")
+    for r in rows:
+        ws.append([r.get("numero"),_abacurta(r.get("aba")),r.get("loja"),r.get("status"),r.get("tipo_predial"),
+                   r.get("prioridade"),r.get("solicitante"),r.get("responsavel"),_data_br(r.get("data_criacao")),_data_br(r.get("prazo"))])
+    for i,w in enumerate([10,12,30,14,20,12,26,22,12,12],1): ws.column_dimensions[get_column_letter(i)].width=w
+    ws.freeze_panes="A2"
+    buf=io.BytesIO(); wb.save(buf)
+    return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":'attachment; filename="chamados_trilogo.xlsx"'})
 
 @app.post("/orc/gerar")
 async def orc_gerar(request: Request):
@@ -2131,9 +2186,10 @@ async def orc_gerar(request: Request):
     previa=bool(body.get("previa"))
     if not GEMINI_API_KEY: raise HTTPException(500,"GEMINI_API_KEY não configurada no Render")
     access=dropbox_rateio.obter_token()
-    ORC_NOTAS=_pasta_manut(access,0) or (MANUT_BASE + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
-    P6=_pasta_manut(access,6); P7=_pasta_manut(access,7); P8=_pasta_manut(access,8)
-    P1=_pasta_manut(access,1); P9=_pasta_manut(access,9); P10=_pasta_manut(access,10)
+    _mb=_manut_base(access)
+    ORC_NOTAS=_pasta_manut(access,0,_mb) or (_mb + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
+    P6=_pasta_manut(access,6,_mb); P7=_pasta_manut(access,7,_mb); P8=_pasta_manut(access,8,_mb)
+    P1=_pasta_manut(access,1,_mb); P9=_pasta_manut(access,9,_mb); P10=_pasta_manut(access,10,_mb)
     arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
     def _mime(nm):
         nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
