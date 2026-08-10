@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 54
+#  CONTADOR DE REVISÕES DESTE app.py: 55
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 54}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 55}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1236,6 +1236,148 @@ async def notas_receber(request: Request):
     except urllib.error.HTTPError as e: raise HTTPException(500, "receber: " + e.read().decode()[:200])
     log_frotahub(u["id"], p["papel"], "RECEBER_NOTA", "RECEBEU_NOTA", nota_id)
     return {"ok": True}
+
+# ================= NOTAS FISCAIS — PROCURAR / PENDÊNCIAS / VENCIMENTOS =================
+def _data_br(s):
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(s or ""))
+    return f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else (str(s or ""))
+
+def _lista_pdf(titulo, colunas, linhas, subtitulo="", aligns=None):
+    """PDF paisagem, formatado com a identidade visual da Frota (cabeçalho maroon)."""
+    import io as _io
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=1.1*cm, rightMargin=1.1*cm,
+                            topMargin=1.1*cm, bottomMargin=1.1*cm, title=titulo)
+    ss = getSampleStyleSheet()
+    hh = ParagraphStyle('hh', parent=ss['Title'], textColor=colors.HexColor('#7A1517'), fontSize=16, spaceAfter=1, alignment=0)
+    sb = ParagraphStyle('sb', parent=ss['Normal'], textColor=colors.HexColor('#666666'), fontSize=9, spaceAfter=10)
+    el = [Paragraph("FROTA MACEDO ENGENHARIA", hh), Paragraph(titulo + (f" — {subtitulo}" if subtitulo else ""), sb)]
+    t = Table([colunas] + linhas, repeatRows=1)
+    stl = [('BACKGROUND',(0,0),(-1,0),colors.HexColor('#7A1517')),
+           ('TEXTCOLOR',(0,0),(-1,0),colors.white),
+           ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+           ('FONTSIZE',(0,0),(-1,-1),8.5),
+           ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white, colors.HexColor('#f6f2f2')]),
+           ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#dddddd')),
+           ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+           ('TOPPADDING',(0,0),(-1,-1),4),('BOTTOMPADDING',(0,0),(-1,-1),4),
+           ('LEFTPADDING',(0,0),(-1,-1),5),('RIGHTPADDING',(0,0),(-1,-1),5)]
+    for c, a in (aligns or {}).items():
+        stl.append(('ALIGN',(c,1),(c,-1),a))
+    t.setStyle(TableStyle(stl)); el.append(t)
+    doc.build(el); return buf.getvalue()
+
+@app.get("/notas/procurar")
+def notas_procurar(request: Request, q: str = ""):
+    """Panorama dos 4 marcos (PCO solicitado / conferida / entregue / protocolada) por O.C."""
+    from fastapi import HTTPException
+    exige(request, "PROCURAR_NOTA")
+    q = (q or "").strip()
+    if len(q) < 3: return {"itens": []}
+    val = f"(numero.ilike.*{q}*,fornecedor.ilike.*{q}*,centro_custo.ilike.*{q}*)"
+    url = (f"{SB_URL}/rest/v1/v_ocs?pco_status=eq.enviado&or={urllib.parse.quote(val)}"
+           f"&select=id,numero,data_oc,centro_custo,fornecedor,valor,pco_enviado_em,qtd_notas,valor_notas,fisica_ok,protocolo_ok,ciclo_fechado&order=numero&limit=40")
+    try: rows = _sb_json(url, SB_KEY) or []
+    except Exception as e: raise HTTPException(500, f"procurar: {e}")
+    for r in rows:
+        nurl = (f"{SB_URL}/rest/v1/notas?oc_id=eq.{urllib.parse.quote(r['id'])}"
+                f"&select=numero_nota,emissao,valor,tem_boleto,recebimento,divergencia,entregue,vencimento,forma_pagamento&order=criado_em")
+        try: r["notas"] = _sb_json(nurl, SB_KEY) or []
+        except Exception: r["notas"] = []
+        try: r["saldo"] = round(float(r.get("valor") or 0) - float(r.get("valor_notas") or 0), 2)
+        except Exception: r["saldo"] = None
+    return {"itens": rows}
+
+_MOT_LABEL = {"sem_nota": "Sem nota (aguardando obra)", "a_receber": "A receber (via física)",
+              "a_protocolar": "A protocolar", "divergencia": "Divergência"}
+
+def _pendencias_calc(q="", cats=None):
+    rows = _sb_json(f"{SB_URL}/rest/v1/v_ocs?pco_status=eq.enviado&ciclo_fechado=eq.false"
+                    f"&select=id,numero,data_oc,centro_custo,fornecedor,valor,qtd_notas,valor_notas,fisica_ok,protocolo_ok&order=data_oc", SB_KEY) or []
+    dv = _sb_json(f"{SB_URL}/rest/v1/notas?divergencia=not.is.null&select=oc_id", SB_KEY) or []
+    dvset = {r["oc_id"] for r in dv}
+    ql = (q or "").strip().lower(); out = []
+    for r in rows:
+        mot = []
+        if (r.get("qtd_notas") or 0) == 0: mot.append("sem_nota")
+        elif not r.get("fisica_ok"): mot.append("a_receber")
+        elif not r.get("protocolo_ok"): mot.append("a_protocolar")
+        if r["id"] in dvset: mot.append("divergencia")
+        if not mot: continue
+        if cats and not (set(mot) & set(cats)): continue
+        if len(ql) >= 3:
+            blob = " ".join(str(x or "") for x in (r.get("numero"), r.get("fornecedor"), r.get("centro_custo"))).lower()
+            if ql not in blob: continue
+        r["motivos"] = mot; out.append(r)
+    return out
+
+@app.get("/notas/pendencias")
+def notas_pendencias(request: Request, q: str = ""):
+    from fastapi import HTTPException
+    exige(request, "PENDENCIAS_NOTA")
+    try: return {"itens": _pendencias_calc(q)}
+    except Exception as e: raise HTTPException(500, f"pendencias: {e}")
+
+@app.get("/notas/pendencias_pdf")
+def notas_pendencias_pdf(request: Request, q: str = "", cats: str = ""):
+    from fastapi import HTTPException
+    exige(request, "PENDENCIAS_NOTA")
+    catl = [c for c in (cats or "").split(",") if c]
+    itens = _pendencias_calc(q, catl or None)
+    linhas = [[r.get("numero") or "", _data_br(r.get("data_oc")), (r.get("centro_custo") or "")[:28],
+               (r.get("fornecedor") or "")[:30], _fmt_reais(r.get("valor")),
+               ", ".join(_MOT_LABEL.get(m, m) for m in r.get("motivos", []))] for r in itens]
+    pdf = _lista_pdf("Pendências de notas", ["O.C.", "Data", "Centro de custo", "Fornecedor", "Valor", "Pendência"],
+                     linhas, subtitulo=f"{len(itens)} pendência(s)", aligns={4: 'RIGHT'})
+    return Response(content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="pendencias_notas.pdf"'})
+
+def _vencimentos_calc(q="", filtro="todas"):
+    rows = _sb_json(f"{SB_URL}/rest/v1/v_notas_app?vencimento=not.is.null"
+                    f"&select=numero_nota,valor,vencimento,forma_pagamento,tem_boleto,oc_numero,fornecedor,centro_custo&order=vencimento", SB_KEY) or []
+    hoje = datetime.date.today(); ql = (q or "").strip().lower(); out = []
+    for r in rows:
+        try: dias = (datetime.date.fromisoformat(str(r["vencimento"])[:10]) - hoje).days
+        except Exception: dias = None
+        r["dias"] = dias
+        if filtro == "vencidas" and not (dias is not None and dias < 0): continue
+        if filtro == "a_vencer" and not (dias is not None and dias >= 0): continue
+        if len(ql) >= 3:
+            blob = " ".join(str(x or "") for x in (r.get("oc_numero"), r.get("fornecedor"), r.get("centro_custo"), r.get("numero_nota"))).lower()
+            if ql not in blob: continue
+        out.append(r)
+    return out
+
+@app.get("/notas/vencimentos")
+def notas_vencimentos(request: Request, q: str = "", filtro: str = "todas"):
+    from fastapi import HTTPException
+    exige(request, "VENCIMENTOS_NOTA")
+    try: return {"itens": _vencimentos_calc(q, filtro)}
+    except Exception as e: raise HTTPException(500, f"vencimentos: {e}")
+
+@app.get("/notas/vencimentos_pdf")
+def notas_vencimentos_pdf(request: Request, q: str = "", filtro: str = "todas"):
+    from fastapi import HTTPException
+    exige(request, "VENCIMENTOS_NOTA")
+    itens = _vencimentos_calc(q, filtro)
+    def sit(d):
+        if d is None: return ""
+        if d < 0: return f"vencida há {-d} d"
+        if d == 0: return "vence hoje"
+        return f"em {d} d"
+    linhas = [[r.get("oc_numero") or "", (r.get("fornecedor") or "")[:28], r.get("numero_nota") or "",
+               _fmt_reais(r.get("valor")), r.get("forma_pagamento") or "", _data_br(r.get("vencimento")), sit(r.get("dias"))]
+              for r in itens]
+    titf = {"vencidas": "vencidas", "a_vencer": "a vencer"}.get(filtro, "todas")
+    pdf = _lista_pdf("Vencimentos de notas", ["O.C.", "Fornecedor", "NF", "Valor", "Pagamento", "Vencimento", "Situação"],
+                     linhas, subtitulo=f"{len(itens)} nota(s) · {titf}", aligns={3: 'RIGHT'})
+    return Response(content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition": 'attachment; filename="vencimentos_notas.pdf"'})
 
 # ---------------- ENVIAR_PCO ----------------
 def _fmt_reais(v):
