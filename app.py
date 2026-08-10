@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 51
+#  CONTADOR DE REVISÕES DESTE app.py: 54
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 51}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 54}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1125,6 +1125,117 @@ async def pco_bloqueada_excluir(request: Request):
     _sb_delete(f"{SB_URL}/rest/v1/ocs?numero=eq.{urllib.parse.quote(numero)}&pco_status=eq.bloqueado")
     log_frotahub(u["id"], p["papel"], "OC_INVALIDA", "EXCLUIU_BLOQUEADA", numero)
     return {"ok": True, "numero": numero}
+
+# ================= NOTAS FISCAIS — CONFERIR_NOTA (obra) =================
+@app.get("/notas/buscar_oc")
+def notas_buscar_oc(request: Request, q: str = ""):
+    """Busca O.C. ENVIADAS por número, fornecedor ou centro de custo (a partir de 3 letras)."""
+    from fastapi import HTTPException
+    exige(request, "CONFERIR_NOTA")
+    q = (q or "").strip()
+    if len(q) < 3: return {"itens": []}
+    val = f"(numero.ilike.*{q}*,fornecedor.ilike.*{q}*,centro_custo.ilike.*{q}*)"
+    url = (f"{SB_URL}/rest/v1/v_ocs?pco_status=eq.enviado&or={urllib.parse.quote(val)}"
+           f"&select=id,numero,data_oc,centro_custo,fornecedor,valor,qtd_notas,valor_notas&order=numero&limit=60")
+    try: rows = _sb_json(url, SB_KEY) or []
+    except Exception as e: raise HTTPException(500, f"buscar: {e}")
+    for r in rows:
+        try: r["saldo"] = round(float(r.get("valor") or 0) - float(r.get("valor_notas") or 0), 2)
+        except Exception: r["saldo"] = None
+    return {"itens": rows}
+
+@app.get("/notas/da_oc")
+def notas_da_oc(request: Request, oc_id: str):
+    from fastapi import HTTPException
+    exige(request, "CONFERIR_NOTA")
+    url = (f"{SB_URL}/rest/v1/notas?oc_id=eq.{urllib.parse.quote(oc_id)}"
+           f"&select=numero_nota,emissao,valor,tem_boleto,recebimento,divergencia,entregue&order=criado_em")
+    try: return {"itens": _sb_json(url, SB_KEY) or []}
+    except Exception as e: raise HTTPException(500, f"notas: {e}")
+
+@app.post("/notas/conferir")
+async def notas_conferir(request: Request):
+    """Gera uma N.F. ligada à O.C. (parcial ou total). Total com valor divergente exige observação."""
+    from fastapi import HTTPException
+    u, p = exige(request, "CONFERIR_NOTA")
+    b = await request.json()
+    oc_id       = str(b.get("oc_id", "")).strip()
+    numero_nota = (b.get("numero_nota") or "").strip()
+    emissao     = (b.get("emissao") or "").strip() or None
+    valor       = _valor_br(b.get("valor")) if str(b.get("valor") or "").strip() else None
+    tem_boleto  = bool(b.get("tem_boleto"))
+    recebimento = b.get("recebimento") if b.get("recebimento") in ("parcial", "total") else "total"
+    divergencia = (b.get("divergencia") or "").strip() or None
+    if not oc_id: raise HTTPException(400, "oc_id?")
+    if not (numero_nota and emissao and valor is not None):
+        raise HTTPException(400, "Preencha número da nota, data de emissão e valor.")
+    oc = _sb_json(f"{SB_URL}/rest/v1/ocs?id=eq.{urllib.parse.quote(oc_id)}&select=numero,valor&limit=1", SB_KEY) or []
+    if not oc: raise HTTPException(404, "O.C. não encontrada")
+    oc_valor, oc_num = oc[0].get("valor"), oc[0].get("numero")
+    if recebimento == "total" and oc_valor is not None and abs(float(valor) - float(oc_valor)) > 0.005 and not divergencia:
+        raise HTTPException(400, "Recebimento TOTAL com valor diferente da O.C.: informe a observação.")
+    nota = {"oc_id": oc_id, "numero_nota": numero_nota, "emissao": emissao, "valor": valor,
+            "tem_boleto": tem_boleto, "recebimento": recebimento, "divergencia": divergencia,
+            "conferida": True, "conferida_por": u["id"]}
+    req = urllib.request.Request(f"{SB_URL}/rest/v1/notas",
+        data=json.dumps(nota, ensure_ascii=False).encode(), method="POST",
+        headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "content-type": "application/json",
+                 "prefer": "return=minimal"})
+    try: urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e: raise HTTPException(500, "gravar nota: " + e.read().decode()[:200])
+    log_frotahub(u["id"], p["papel"], "CONFERIR_NOTA", "CONFERIU_NOTA", f"{oc_num}/NF {numero_nota} ({recebimento})")
+    vo = _sb_json(f"{SB_URL}/rest/v1/v_ocs?id=eq.{urllib.parse.quote(oc_id)}&select=valor,qtd_notas,valor_notas&limit=1", SB_KEY) or []
+    resumo = vo[0] if vo else {}
+    if resumo:
+        try: resumo["saldo"] = round(float(resumo.get("valor") or 0) - float(resumo.get("valor_notas") or 0), 2)
+        except Exception: pass
+    return {"ok": True, "oc_numero": oc_num, "resumo": resumo}
+
+# ================= NOTAS FISCAIS — RECEBER_NOTA (adm) =================
+@app.get("/notas/receber_lista")
+def notas_receber_lista(request: Request, q: str = ""):
+    """Notas já conferidas na obra e ainda NÃO entregues (via física pendente no adm)."""
+    from fastapi import HTTPException
+    exige(request, "RECEBER_NOTA")
+    url = (f"{SB_URL}/rest/v1/notas?entregue=eq.false&conferida=eq.true&order=criado_em"
+           f"&select=id,numero_nota,emissao,valor,tem_boleto,recebimento,divergencia,ocs(numero,fornecedor,centro_custo,valor)")
+    try: rows = _sb_json(url, SB_KEY) or []
+    except Exception as e: raise HTTPException(500, f"listar: {e}")
+    ql = (q or "").strip().lower()
+    out = []
+    for r in rows:
+        oc = r.get("ocs") or {}
+        item = {"id": r.get("id"), "numero_nota": r.get("numero_nota"), "emissao": r.get("emissao"),
+                "valor": r.get("valor"), "tem_boleto": r.get("tem_boleto"), "recebimento": r.get("recebimento"),
+                "divergencia": r.get("divergencia"), "oc_numero": oc.get("numero"), "fornecedor": oc.get("fornecedor"),
+                "centro_custo": oc.get("centro_custo"), "oc_valor": oc.get("valor")}
+        if len(ql) >= 3:
+            blob = " ".join(str(x or "") for x in (item["oc_numero"], item["fornecedor"], item["centro_custo"], item["numero_nota"])).lower()
+            if ql not in blob: continue
+        out.append(item)
+    return {"itens": out[:300], "total": len(out)}
+
+@app.post("/notas/receber")
+async def notas_receber(request: Request):
+    """Marca a nota como entregue (via física recebida) e grava forma de pagamento + vencimento."""
+    from fastapi import HTTPException
+    u, p = exige(request, "RECEBER_NOTA")
+    b = await request.json()
+    nota_id = str(b.get("nota_id", "")).strip()
+    forma   = (b.get("forma_pagamento") or "").strip() or None
+    venc    = (b.get("vencimento") or "").strip() or None
+    if not nota_id: raise HTTPException(400, "nota_id?")
+    if not forma:   raise HTTPException(400, "Informe a forma de pagamento.")
+    patch = {"entregue": True, "entregue_em": datetime.datetime.now().isoformat(),
+             "entregue_por": u["id"], "forma_pagamento": forma, "vencimento": venc}
+    req = urllib.request.Request(f"{SB_URL}/rest/v1/notas?id=eq.{urllib.parse.quote(nota_id)}",
+        data=json.dumps(patch, ensure_ascii=False).encode(), method="PATCH",
+        headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "content-type": "application/json",
+                 "prefer": "return=minimal"})
+    try: urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e: raise HTTPException(500, "receber: " + e.read().decode()[:200])
+    log_frotahub(u["id"], p["papel"], "RECEBER_NOTA", "RECEBEU_NOTA", nota_id)
+    return {"ok": True}
 
 # ---------------- ENVIAR_PCO ----------------
 def _fmt_reais(v):
@@ -1496,7 +1607,8 @@ def _basic_auth(app, user, pw):
         # rotas do FrotaHub têm autenticação própria (token Supabase) — não pedir Basic
         _path = scope.get("path", "") or ""
         if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
-                                        or _path.startswith("/migrar") or _path.startswith("/desfazer")
+                                        or _path.startswith("/notas") or _path.startswith("/migrar")
+                                        or _path.startswith("/desfazer")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
