@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 45
+#  CONTADOR DE REVISÕES DESTE app.py: 49
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -844,7 +844,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 45}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 49}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -936,6 +936,24 @@ async def pco_excluir(request: Request):
         raise HTTPException(500, f"falha ao excluir: {e}")
     log_frotahub(u["id"], p["papel"], "CONFERIR_LISTA_PCO", "EXCLUIU_OC", arq)
     return {"ok": True}
+
+@app.post("/pco/reenviar")
+async def pco_reenviar(request: Request):
+    """Libera uma O.C. já enviada para ser enviada de novo: APAGA o registro de envio
+    (numero) no banco. O PDF continua em 0-ENVIAR e volta a aparecer na lista normal."""
+    from fastapi import HTTPException
+    u,p = exige(request, "ENVIAR_PCO")           # reabrir um envio exige permissão de envio
+    body = await request.json()
+    numero = str(body.get("numero","")).strip()
+    if not numero: raise HTTPException(400,"numero?")
+    req = urllib.request.Request(
+        f'{SB_URL}/rest/v1/ocs?numero=eq.{urllib.parse.quote(numero)}&pco_status=eq.enviado',
+        method="DELETE",
+        headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "prefer": "return=minimal"})
+    try: urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e: raise HTTPException(500, "apagar registro: " + e.read().decode()[:150])
+    log_frotahub(u["id"], p["papel"], "ENVIAR_PCO", "REENVIAR_LIBEROU", numero)
+    return {"ok": True, "numero": numero}
 
 # ---------------- ENVIAR_PCO ----------------
 def _fmt_reais(v):
@@ -1078,23 +1096,32 @@ def pco_enviar(request: Request):
         buf = io.BytesIO(); z = zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED)
         for d in aprov: z.writestr(d["arquivo"], d["_pdf"])
         z.close(); zipbytes = buf.getvalue()
-        zipnome = f"Pedidos_PCO_{hoje.replace('/','-')}.zip"
+        # nome do zip com data+hora -> nunca sobrescreve um envio anterior do mesmo dia
+        zipnome = f"Pedidos_PCO_{datetime.datetime.now().strftime('%d-%m-%Y_%H%M%S')}.zip"
         try:
             enviar_email(f"Ordens de Compra (PCO) - {hoje} - Frota Macedo Engenharia",
                          _pco_email_html(aprov, hoje), PCO_TO, PCO_CC,
                          [(zipnome, zipbytes, "application/zip")])
         except Exception as e:
             raise HTTPException(500, f"falha ao enviar e-mail: {e}")
+        # SÓ o ZIP fica arquivado em "1 - PEDIDOS FEITOS" (sem subpasta APAGAR).
         feitos = f"{PCO_BASE}/1 - PEDIDOS FEITOS"
-        dropbox_rateio.criar_pasta(access, feitos); dropbox_rateio.criar_pasta(access, f"{feitos}/APAGAR")
-        try: dropbox_rateio.subir_bytes(access, zipbytes, f"{feitos}/{zipnome}", overwrite=True)
-        except Exception as e: erros.append(f"zip: {e}")
+        dropbox_rateio.criar_pasta(access, feitos)
+        zip_rel = f"1 - PEDIDOS FEITOS/{zipnome}"
+        zip_ok = True
+        try: dropbox_rateio.subir_bytes(access, zipbytes, f"{feitos}/{zipnome}", overwrite=False)
+        except Exception as e: erros.append(f"zip: {e}"); zip_ok = False
         rows = []
         for d in aprov:
-            dest = f"{feitos}/APAGAR/{d['arquivo']}"
-            try: dropbox_rateio.mover(access, f"{PCO_ENVIAR}/{d['arquivo']}", dest)
-            except Exception as e: erros.append(f"mover {d['arquivo']}: {e}")
-            rows.append(_oc_row(d, "enviado", f"1 - PEDIDOS FEITOS/APAGAR/{d['arquivo']}"))
+            if zip_ok:
+                # a via solta sai da pasta 0-ENVIAR (fica preservada dentro do ZIP);
+                # vai para a lixeira do Dropbox (recuperável ~30 dias)
+                try: dropbox_rateio.apagar(access, f"{PCO_ENVIAR}/{d['arquivo']}")
+                except Exception as e: erros.append(f"remover {d['arquivo']}: {e}")
+                path = f"{zip_rel}|{d['arquivo']}"        # <zip>|<arquivo interno>
+            else:
+                path = f"0 - ENVIAR (ADICIONAR AQUI)/{d['arquivo']}"
+            rows.append(_oc_row(d, "enviado", path))
         sb_upsert_ocs(rows)
     # ---- BLOQUEADAS: move + banco + aviso ----
     if bloq:
@@ -1113,6 +1140,162 @@ def pco_enviar(request: Request):
     return {"ok": True, "enviados": len(aprov), "bloqueados": len(bloq),
             "to": PCO_TO, "cc": PCO_CC, "erros": erros}
 
+# ---------------- PCOS_ENVIADOS (planilha do banco) ----------------
+def _pco_enviados_query(desde, ate):
+    parts = ["pco_status=eq.enviado",
+             "select=numero,data_oc,centro_custo,fornecedor,cnpj_fornecedor,valor,pco_enviado_em",
+             "order=pco_enviado_em.desc"]
+    if desde: parts.append(f"pco_enviado_em=gte.{desde}")
+    if ate:   parts.append(f"pco_enviado_em=lte.{ate}T23:59:59")
+    try: return _sb_json(f"{SB_URL}/rest/v1/ocs?" + "&".join(parts), SB_KEY) or []
+    except Exception: return []
+
+@app.get("/pco/enviados")
+def pco_enviados(request: Request, desde: str = "", ate: str = ""):
+    exige(request, "PCOS_ENVIADOS")
+    itens = _pco_enviados_query(desde, ate)
+    total = sum((x.get("valor") or 0) for x in itens)
+    return {"itens": itens, "total": total}
+
+@app.get("/pco/enviados_xlsx")
+def pco_enviados_xlsx(request: Request, desde: str = "", ate: str = ""):
+    exige(request, "PCOS_ENVIADOS")
+    import io, openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    itens = _pco_enviados_query(desde, ate)
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "PCOs enviados"
+    heads = ["O.C.", "Data O.C.", "Centro de custo", "Fornecedor", "CNPJ", "Valor (R$)", "Enviado em"]
+    ws.append(heads)
+    for c in ws[1]:
+        c.font = Font(name="Arial", bold=True, color="FFFFFF")
+        c.fill = PatternFill("solid", fgColor="A11F22"); c.alignment = Alignment(horizontal="center")
+    def br(s): return "/".join(reversed(str(s)[:10].split("-"))) if s else ""
+    for it in itens:
+        ws.append([it.get("numero"), br(it.get("data_oc")), it.get("centro_custo"),
+                   it.get("fornecedor"), it.get("cnpj_fornecedor"), it.get("valor"), br(it.get("pco_enviado_em"))])
+    for i, w in enumerate([12, 12, 28, 34, 20, 14, 12], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO(); wb.save(buf)
+    return Response(content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="PCOs_enviados.xlsx"'})
+
+# ================= FERRAMENTAS DO BUILDER (Config) =================
+# Migração antigo -> novo (1:1) e Desfazer por data. SÓ builder.
+OLD_BASES = {
+    "ADM":   ("/AUTOMACAO ADMINISTRATIVO", "/FROTAHUB/1 - ADMINISTRATIVO"),
+    "MANUT": ("/AUTOMACAO MANUTENCAO",     "/FROTAHUB/2 - MANUTENCAO"),
+}
+_MIG_JUNK = ("ARQUIVOS RESIDUAIS", "SKILLS", "APP (", "APP(", "_RODAR LOCAL")
+def _mig_pular(nome):
+    u = (nome or "").upper()
+    return nome.startswith("_") or any(j in u for j in _MIG_JUNK)
+
+def _exige_builder(request):
+    from fastapi import HTTPException
+    u, p = exige(request, "CONFIG_BUILDER")   # sem linha em permissoes -> só builder passa
+    if p.get("papel") != "builder":
+        raise HTTPException(403, "apenas builder")
+    return u, p
+
+@app.post("/migrar/plano")
+async def migrar_plano(request: Request):
+    from fastapi import HTTPException
+    _exige_builder(request)
+    dep = (await request.json()).get("depto")
+    if dep not in OLD_BASES: raise HTTPException(400, "depto inválido")
+    de_base, para_base = OLD_BASES[dep]
+    access = dropbox_rateio.obter_token()
+    itens = []
+    for e in dropbox_rateio.listar_entradas(access, de_base):
+        if _mig_pular(e["name"]): continue
+        if e["dir"] and e["name"].upper() == "ORCAMENTOS MONTADOS":
+            for m in dropbox_rateio.listar_entradas(access, f"{de_base}/{e['name']}"):
+                if _mig_pular(m["name"]): continue
+                itens.append({"nome": f"{e['name']}/{m['name']}",
+                              "de": f"{de_base}/{e['name']}/{m['name']}",
+                              "para": f"{para_base}/{e['name']}/{m['name']}"})
+        else:
+            itens.append({"nome": e["name"], "de": f"{de_base}/{e['name']}", "para": f"{para_base}/{e['name']}"})
+    return {"depto": dep, "de_base": de_base, "para_base": para_base, "itens": itens}
+
+@app.post("/migrar/limpar")
+async def migrar_limpar(request: Request):
+    from fastapi import HTTPException
+    u, p = _exige_builder(request)
+    dep = (await request.json()).get("depto")
+    if dep not in OLD_BASES: raise HTTPException(400, "depto inválido")
+    _, para_base = OLD_BASES[dep]
+    access = dropbox_rateio.obter_token()
+    apagados = 0
+    for e in dropbox_rateio.listar_entradas(access, para_base):
+        try: dropbox_rateio.apagar(access, f"{para_base}/{e['name']}"); apagados += 1
+        except Exception: pass
+    log_frotahub(u["id"], p["papel"], "CONFIG_BUILDER", "MIGRAR_LIMPAR", dep, {"apagados": apagados})
+    return {"ok": True, "apagados": apagados}
+
+@app.post("/migrar/copiar")
+async def migrar_copiar(request: Request):
+    from fastapi import HTTPException
+    _exige_builder(request)
+    b = await request.json(); de = b.get("de"); para = b.get("para")
+    if not de or not para: raise HTTPException(400, "de/para?")
+    access = dropbox_rateio.obter_token()
+    dropbox_rateio.criar_pasta(access, para.rsplit("/", 1)[0])
+    try:
+        dropbox_rateio.copiar(access, de, para)
+    except Exception as e:
+        return {"ok": False, "erro": str(e)[:200]}
+    return {"ok": True}
+
+@app.post("/desfazer")
+async def desfazer(request: Request):
+    from fastapi import HTTPException
+    u, p = _exige_builder(request)
+    b = await request.json(); dep = b.get("depto"); desde = (b.get("desde") or "").strip()
+    if not desde: raise HTTPException(400, "informe a data")
+    access = dropbox_rateio.obter_token()
+    if dep != "ADM":
+        return {"ok": False, "depto": dep,
+                "msg": "Desfazer da Manutenção virá com o journal. Para resetar a Manutenção nos testes, use a Migração (recopiar do antigo)."}
+    # ADM/PCO: reverte ocs criadas a partir da data -> volta o arquivo p/ 0-ENVIAR e apaga a linha
+    q = urllib.parse.urlencode({"criado_em": f"gte.{desde}", "select": "numero,arquivo_oc_path", "order": "criado_em.desc"})
+    try: rows = _sb_json(f"{SB_URL}/rest/v1/ocs?{q}", SB_KEY) or []
+    except Exception as e: raise HTTPException(500, f"ler ocs: {e}")
+    import io, zipfile
+    voltas, erros, zip_cache = 0, [], {}
+    dropbox_rateio.criar_pasta(access, PCO_ENVIAR)
+    for r in rows:
+        path = r.get("arquivo_oc_path")
+        if not path: continue
+        try:
+            if "|" in path:                         # enviada: extrai a via de dentro do ZIP
+                zrel, inner = path.split("|", 1)
+                zbytes = zip_cache.get(zrel)
+                if zbytes is None:
+                    zbytes = dropbox_rateio.baixar(access, f"{PCO_BASE}/{zrel}")
+                    zip_cache[zrel] = zbytes
+                if not zbytes: erros.append(f"{r.get('numero')}: ZIP não encontrado"); continue
+                with zipfile.ZipFile(io.BytesIO(zbytes)) as zf: pdf = zf.read(inner)
+                dropbox_rateio.subir_bytes(access, pdf, f"{PCO_ENVIAR}/{inner}", overwrite=True)
+                voltas += 1
+            else:                                   # bloqueada/solta: apenas move de volta
+                nome = path.rsplit("/", 1)[-1]
+                dropbox_rateio.mover(access, f"{PCO_BASE}/{path}", f"{PCO_ENVIAR}/{nome}")
+                voltas += 1
+        except Exception as e: erros.append(f"{r.get('numero')}: {str(e)[:70]}")
+    nums = [r["numero"] for r in rows if r.get("numero")]
+    if nums:
+        inlist = ",".join(f'"{n}"' for n in nums)
+        req = urllib.request.Request(f'{SB_URL}/rest/v1/ocs?numero=in.({inlist})', method="DELETE",
+            headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "prefer": "return=minimal"})
+        try: urllib.request.urlopen(req, timeout=30)
+        except urllib.error.HTTPError as e: erros.append("apagar ocs: " + e.read().decode()[:150])
+    log_frotahub(u["id"], p["papel"], "CONFIG_BUILDER", "DESFAZER_ADM", desde, {"ocs": len(rows)})
+    return {"ok": True, "depto": "ADM", "ocs_revertidas": len(rows), "arquivos_voltaram": voltas, "erros": erros}
+
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
     import base64, secrets
@@ -1120,6 +1303,7 @@ def _basic_auth(app, user, pw):
         # rotas do FrotaHub têm autenticação própria (token Supabase) — não pedir Basic
         _path = scope.get("path", "") or ""
         if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
+                                        or _path.startswith("/migrar") or _path.startswith("/desfazer")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
