@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 50
+#  CONTADOR DE REVISÕES DESTE app.py: 51
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 50}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 51}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1029,10 +1029,38 @@ def pco_bloqueada_pdf(request: Request, numero: str):
     return Response(content=pdf, media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="{numero}.pdf"'})
 
+def _oc_corrigir_aplicar(access, numero, campos, orig_pdf, destino_nome):
+    """Valida os campos, carimba o PDF, sobe em 0-ENVIAR/destino_nome (overwrite) e grava o
+    registro pendente+corrigida (que o envio passa a usar no lugar do PDF). Retorna (ok, motivo)."""
+    cc_cnpj  = fmt_cnpj(campos.get("cnpj_centro_custo"))
+    forn     = (campos.get("fornecedor") or "").strip()
+    forn_cnpj= fmt_cnpj(campos.get("cnpj_fornecedor"))
+    endereco = (campos.get("endereco_fornecedor") or "").strip()
+    centro   = (campos.get("centro_custo") or "").strip()
+    valor    = _valor_br(campos.get("valor")) if str(campos.get("valor") or "").strip() else None
+    fat_ok  = bool(cc_cnpj) and re.sub(r"\D","",cc_cnpj).startswith(FART_BASE)
+    forn_ok = len(re.sub(r"\D","",forn_cnpj or "")) == 14
+    if not (fat_ok and forn_ok):
+        m = []
+        if not fat_ok:  m.append("CNPJ de faturamento precisa começar com 03.720.882")
+        if not forn_ok: m.append("CNPJ do fornecedor inválido/ausente")
+        return False, "; ".join(m)
+    if not orig_pdf: return False, "PDF da O.C. não encontrado"
+    linhas = [f"Faturamento: {cc_cnpj}" + (f" — {centro}" if centro else ""),
+              f"Fornecedor: {forn}  CNPJ: {forn_cnpj}"] + ([f"Endereço: {endereco}"] if endereco else [])
+    corrig = _pdf_carimbo_correcao(orig_pdf, linhas)
+    dropbox_rateio.criar_pasta(access, PCO_ENVIAR)
+    dropbox_rateio.subir_bytes(access, corrig, f"{PCO_ENVIAR}/{destino_nome}", overwrite=True)
+    sb_upsert_ocs([{ "numero": numero, "data_oc": campos.get("data_oc"),
+        "centro_custo": centro or None, "cnpj_centro_custo": cc_cnpj,
+        "fornecedor": forn, "cnpj_fornecedor": forn_cnpj, "endereco_fornecedor": endereco or None,
+        "valor": valor, "pco_status": "pendente", "corrigida": True, "bloqueio_motivo": None,
+        "arquivo_oc_path": f"0 - ENVIAR (ADICIONAR AQUI)/{destino_nome}" }])
+    return True, ""
+
 @app.post("/pco/corrigir")
 async def pco_corrigir(request: Request):
-    """Recebe as correções, VALIDA cada uma; as que passam: carimba o PDF, joga em 0-ENVIAR,
-    apaga da pasta de bloqueadas e do banco, e grava um registro pendente+corrigida."""
+    """Correção DEPOIS do envio: O.C. já bloqueadas no banco (pasta 2 - OCS BLOQUEADAS)."""
     from fastapi import HTTPException
     u, p = exige(request, "OC_INVALIDA")
     itens = (await request.json()).get("itens") or []
@@ -1041,47 +1069,46 @@ async def pco_corrigir(request: Request):
     for it in itens:
         numero = str(it.get("numero", "")).strip()
         if not numero: continue
-        cc_cnpj  = fmt_cnpj(it.get("cnpj_centro_custo"))
-        forn     = (it.get("fornecedor") or "").strip()
-        forn_cnpj= fmt_cnpj(it.get("cnpj_fornecedor"))
-        endereco = (it.get("endereco_fornecedor") or "").strip()
-        centro   = (it.get("centro_custo") or "").strip()
-        valor    = _valor_br(it.get("valor")) if str(it.get("valor") or "").strip() else None
-        # validação (mesma regra do envio)
-        fat_ok  = bool(cc_cnpj) and re.sub(r"\D","",cc_cnpj).startswith(FART_BASE)
-        forn_ok = len(re.sub(r"\D","",forn_cnpj or "")) == 14
-        if not (fat_ok and forn_ok):
-            m = []
-            if not fat_ok:  m.append("CNPJ de faturamento precisa começar com 03.720.882")
-            if not forn_ok: m.append("CNPJ do fornecedor inválido/ausente")
-            res.append({"numero": numero, "ok": False, "motivo": "; ".join(m)}); continue
         row = _bloq_row(numero)
         if not row or not row.get("arquivo_oc_path"):
             res.append({"numero": numero, "ok": False, "motivo": "PDF da O.C. não encontrado"}); continue
+        it2 = dict(it); it2.setdefault("data_oc", row.get("data_oc")); it2.setdefault("centro_custo", row.get("centro_custo"))
         try:
             orig = dropbox_rateio.baixar(access, f"{PCO_BASE}/{row['arquivo_oc_path']}")
-            if not orig: raise RuntimeError("PDF não baixou")
-            linhas = [f"Faturamento: {cc_cnpj}" + (f" — {centro}" if centro else ""),
-                      f"Fornecedor: {forn}  CNPJ: {forn_cnpj}"] + ([f"Endereço: {endereco}"] if endereco else [])
-            corrig = _pdf_carimbo_correcao(orig, linhas)
-            dropbox_rateio.criar_pasta(access, PCO_ENVIAR)
-            dropbox_rateio.subir_bytes(access, corrig, f"{PCO_ENVIAR}/{numero}.pdf", overwrite=True)
-            # apaga da pasta de bloqueadas (lixeira do Dropbox)
-            try: dropbox_rateio.apagar(access, f"{PCO_BASE}/{row['arquivo_oc_path']}")
-            except Exception: pass
-            # apaga o registro bloqueado e grava o corrigido (pendente + corrigida)
+            # apaga o registro bloqueado; o corrigido entra como pendente+corrigida
             _sb_delete(f"{SB_URL}/rest/v1/ocs?numero=eq.{urllib.parse.quote(numero)}&pco_status=eq.bloqueado")
-            novo = {"numero": numero, "data_oc": row.get("data_oc"),
-                    "centro_custo": centro or row.get("centro_custo"), "cnpj_centro_custo": cc_cnpj,
-                    "fornecedor": forn, "cnpj_fornecedor": forn_cnpj, "endereco_fornecedor": endereco or None,
-                    "valor": valor, "pco_status": "pendente", "corrigida": True, "bloqueio_motivo": None,
-                    "arquivo_oc_path": f"0 - ENVIAR (ADICIONAR AQUI)/{numero}.pdf"}
-            sb_upsert_ocs([novo])
-            res.append({"numero": numero, "ok": True})
+            ok, motivo = _oc_corrigir_aplicar(access, numero, it2, orig, f"{numero}.pdf")
+            if ok:
+                try: dropbox_rateio.apagar(access, f"{PCO_BASE}/{row['arquivo_oc_path']}")   # tira da pasta de bloqueadas
+                except Exception: pass
+            res.append({"numero": numero, "ok": ok, "motivo": motivo})
         except Exception as e:
             res.append({"numero": numero, "ok": False, "motivo": str(e)[:150]})
     ok = sum(1 for r in res if r.get("ok"))
     log_frotahub(u["id"], p["papel"], "OC_INVALIDA", "CORRIGIU_OC", f"{ok}/{len(res)} corrigidas")
+    return {"resultados": res, "corrigidas": ok, "total": len(res)}
+
+@app.post("/pco/corrigir_previa")
+async def pco_corrigir_previa(request: Request):
+    """Correção ANTES do envio: O.C. ainda em 0-ENVIAR (não bloqueadas no banco)."""
+    from fastapi import HTTPException
+    u, p = exige(request, "ENVIAR_PCO")
+    itens = (await request.json()).get("itens") or []
+    access = dropbox_rateio.obter_token()
+    res = []
+    for it in itens:
+        numero  = str(it.get("numero", "")).strip()
+        arquivo = os.path.basename(it.get("arquivo", "") or "")
+        if not (numero and arquivo):
+            res.append({"numero": numero, "ok": False, "motivo": "arquivo/número ausente"}); continue
+        try:
+            orig = dropbox_rateio.baixar(access, f"{PCO_ENVIAR}/{arquivo}")
+            ok, motivo = _oc_corrigir_aplicar(access, numero, it, orig, arquivo)   # sobrescreve o próprio arquivo
+            res.append({"numero": numero, "ok": ok, "motivo": motivo})
+        except Exception as e:
+            res.append({"numero": numero, "ok": False, "motivo": str(e)[:150]})
+    ok = sum(1 for r in res if r.get("ok"))
+    log_frotahub(u["id"], p["papel"], "ENVIAR_PCO", "CORRIGIU_PREVIA", f"{ok}/{len(res)} corrigidas")
     return {"resultados": res, "corrigidas": ok, "total": len(res)}
 
 @app.post("/pco/bloqueada_excluir")
@@ -1235,7 +1262,12 @@ def pco_enviar_previa(request: Request):
     access = dropbox_rateio.obter_token()
     aprov, bloq = _pco_coleta(access)
     limpo = lambda d: {k: d.get(k) for k in ("arquivo","numero","data_oc","centro_custo","fornecedor","cnpj_fornecedor","valor","motivo")}
-    return {"aprovadas": [limpo(d) for d in aprov], "bloqueadas": [limpo(d) for d in bloq],
+    def limpo_bl(d):
+        r = {k: d.get(k) for k in ("arquivo","numero","data_oc","centro_custo","cnpj_centro_custo","fornecedor","cnpj_fornecedor","valor","motivo")}
+        cc = re.sub(r"\D", "", r.get("cnpj_centro_custo") or "")
+        if not cc.startswith(FART_BASE): r["cnpj_cc_sugerido"] = _sugerir_cnpj_cc(r.get("centro_custo"))
+        return r
+    return {"aprovadas": [limpo(d) for d in aprov], "bloqueadas": [limpo_bl(d) for d in bloq],
             "destinatarios": {"to": PCO_TO, "cc": PCO_CC, "bloqueadas": PCO_BLOQ_TO},
             "smtp_ok": bool(BREVO_API_KEY or (SMTP_USER and SMTP_PASS))}
 
