@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 62
+#  CONTADOR DE REVISÕES DESTE app.py: 63
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 62}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 63}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2066,6 +2066,39 @@ def _pasta_manut(access, n, base=None):
     except Exception: pass
     return None
 
+def _orc_base(access, mb):
+    """Acha a pasta-módulo dos orçamentos: a que CONTÉM a subpasta '0 - ...'.
+       As numeradas 0..10 podem estar direto no depto OU dentro de um módulo
+       (ex.: '2 - MANUTENÇÃO/<algo> - ORÇAMENTOS/0..10'), como o PCO fica em
+       '1 - ADMINISTRATIVO/1 - PCO/...'. Procura no depto e um nível abaixo."""
+    if _pasta_manut(access, 0, mb):        # numeradas direto no depto
+        return mb
+    try:
+        for e in dropbox_rateio.listar_entradas(access, mb):
+            if not e["dir"]: continue
+            sub = f"{mb}/{e['name']}"
+            if _pasta_manut(access, 0, sub):
+                return sub
+    except Exception: pass
+    return mb
+
+def _orc_diag(access):
+    """Radiografia da estrutura para depurar a leitura da pasta 0."""
+    d={"root":FROTAHUB_ROOT,"root_dirs":[],"manut_base":None,"manut_dirs":[],"orc_base":None,"orc_dirs":[],"pasta0":None,"arquivos_pasta0":0}
+    try: d["root_dirs"]=[e["name"] for e in dropbox_rateio.listar_entradas(access,FROTAHUB_ROOT) if e["dir"]]
+    except Exception as e: d["root_erro"]=str(e)[:160]
+    mb=_manut_base(access); d["manut_base"]=mb
+    try: d["manut_dirs"]=[e["name"] for e in dropbox_rateio.listar_entradas(access,mb) if e["dir"]]
+    except Exception as e: d["manut_erro"]=str(e)[:160]
+    ob=_orc_base(access,mb); d["orc_base"]=ob
+    try: d["orc_dirs"]=[e["name"] for e in dropbox_rateio.listar_entradas(access,ob) if e["dir"]]
+    except Exception as e: d["orc_erro"]=str(e)[:160]
+    p0=_pasta_manut(access,0,ob); d["pasta0"]=p0
+    if p0:
+        try: d["arquivos_pasta0"]=len([a for a in dropbox_rateio.listar(access,p0) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))])
+        except Exception as e: d["pasta0_erro"]=str(e)[:160]
+    return d
+
 def _loja_do_ticket(ticket):
     q=urllib.parse.urlencode({"numero":f"eq.{ticket}","select":"loja,aba","limit":"1"})
     ch=_sb_json(f"{SB_URL}/rest/v1/chamados?{q}",SB_KEY) or []
@@ -2109,10 +2142,12 @@ def orc_listar(request: Request):
     exige(request,"CONFERIR_LISTA_ORCAMENTOS")
     if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
     access=dropbox_rateio.obter_token()
-    _mb=_manut_base(access)
-    ORC_NOTAS=_pasta_manut(access,0,_mb) or (_mb + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
+    _mb=_manut_base(access); _ob=_orc_base(access,_mb)
+    ORC_NOTAS=_pasta_manut(access,0,_ob) or (_ob + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
     arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
-    return {"pasta":ORC_NOTAS,"total":len(arqs),"arquivos":sorted(arqs)}
+    out={"pasta":ORC_NOTAS,"total":len(arqs),"arquivos":sorted(arqs)}
+    if not arqs: out["diag"]=_orc_diag(access)   # ajuda a achar a estrutura quando vem vazio
+    return out
 
 _ST_MAP={"1":"Aberto","5":"Vistoriado","6":"Em execução","7":"Executado"}
 def _chamados_query(q="", aba="", status="", desde="", ate=""):
@@ -2186,10 +2221,10 @@ async def orc_gerar(request: Request):
     previa=bool(body.get("previa"))
     if not GEMINI_API_KEY: raise HTTPException(500,"GEMINI_API_KEY não configurada no Render")
     access=dropbox_rateio.obter_token()
-    _mb=_manut_base(access)
-    ORC_NOTAS=_pasta_manut(access,0,_mb) or (_mb + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
-    P6=_pasta_manut(access,6,_mb); P7=_pasta_manut(access,7,_mb); P8=_pasta_manut(access,8,_mb)
-    P1=_pasta_manut(access,1,_mb); P9=_pasta_manut(access,9,_mb); P10=_pasta_manut(access,10,_mb)
+    _mb=_manut_base(access); _ob=_orc_base(access,_mb)
+    ORC_NOTAS=_pasta_manut(access,0,_ob) or (_ob + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
+    P6=_pasta_manut(access,6,_ob); P7=_pasta_manut(access,7,_ob); P8=_pasta_manut(access,8,_ob)
+    P1=_pasta_manut(access,1,_ob); P9=_pasta_manut(access,9,_ob); P10=_pasta_manut(access,10,_ob)
     arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
     def _mime(nm):
         nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
