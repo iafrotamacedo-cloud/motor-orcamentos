@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 55
+#  CONTADOR DE REVISÕES DESTE app.py: 60
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 55}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 60}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1003,6 +1003,73 @@ def _pdf_carimbo_correcao(pdf_bytes, linhas):
     for pg in reader.pages[1:]: writer.add_page(pg)
     out = _io.BytesIO(); writer.write(out); return out.getvalue()
 
+def _oc_words(pdf_bytes):
+    """Palavras da 1ª página com bounding box (via pdftotext -bbox)."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f: f.write(pdf_bytes); pth = f.name
+    outp = pth + ".html"
+    try:
+        subprocess.run(["pdftotext", "-bbox", "-f", "1", "-l", "1", pth, outp], capture_output=True, timeout=30)
+        h = open(outp, encoding="utf-8").read()
+    except Exception: return [], 595.0, 842.0
+    finally:
+        for x in (pth, outp):
+            try: os.unlink(x)
+            except Exception: pass
+    mp = re.search(r'<page width="([\d.]+)" height="([\d.]+)"', h)
+    pageW, pageH = (float(mp.group(1)), float(mp.group(2))) if mp else (595.0, 842.0)
+    words = [(float(a), float(b), float(c), float(d), w) for a, b, c, d, w in
+             re.findall(r'<word xMin="([\d.]+)" yMin="([\d.]+)" xMax="([\d.]+)" yMax="([\d.]+)">([^<]*)</word>', h)]
+    return words, pageW, pageH
+
+def corrige_oc_inplace(pdf_bytes, campos):
+    """Cobre o valor ERRADO e escreve o CERTO no mesmo lugar (sem banner) — deixa a O.C. com
+    aparência de original. campos: cnpj_centro_custo, fornecedor, cnpj_fornecedor, endereco_fornecedor.
+    Retorna bytes do PDF corrigido, ou None se o layout não bater (aí o chamador usa o original)."""
+    import io as _io
+    from reportlab.pdfgen import canvas as _cv
+    from reportlab.lib.colors import white as _wh, black as _bk
+    try:
+        words, pageW, pageH = _oc_words(pdf_bytes)
+    except Exception:
+        return None
+    def yhdr(nm):
+        for x0, y0, x1, y1, w in words:
+            if w == nm: return y0
+        return None
+    y_fat = yhdr("FATURAMENTO"); y_forn = yhdr("FORNECEDOR"); y_obra = yhdr("OBRA/CENTRO") or 9999
+    if y_fat is None or y_forn is None: return None
+    def find_lab(label, ylo, yhi, xmin=0, xmax=250):
+        c = [(x0, y0, x1, y1) for x0, y0, x1, y1, w in words if w == label and ylo < y0 < yhi and xmin <= x0 < xmax]
+        return c[0] if c else None
+    ovl = []
+    def esq(lab, txt): ovl.append((lab[2] + 2, 350.0, lab, txt))
+    def dire(lab, txt): ovl.append((lab[2] + 3, pageW - 28, lab, txt))
+    if campos.get("cnpj_centro_custo"):
+        lab = find_lab("CNPJ:", y_fat, y_forn, xmax=160)
+        if lab: esq(lab, campos["cnpj_centro_custo"])
+    if campos.get("fornecedor"):
+        lab = find_lab("Nome:", y_forn, y_obra, xmax=160)
+        if lab: esq(lab, campos["fornecedor"])
+    if campos.get("cnpj_fornecedor"):
+        lab = find_lab("CNPJ:", y_forn, y_obra, xmax=160)
+        if lab: esq(lab, campos["cnpj_fornecedor"])
+    if campos.get("endereco_fornecedor"):
+        lab = find_lab("Endereço:", y_forn, y_obra, xmin=340, xmax=430)
+        if lab: dire(lab, campos["endereco_fornecedor"])
+    if not ovl: return None
+    buf = _io.BytesIO(); c = _cv.Canvas(buf, pagesize=(pageW, pageH))
+    for cx0, cx1, lab, txt in ovl:
+        lx0, ly0, lx1, ly1 = lab
+        c.setFillColor(_wh); c.rect(cx0, pageH - ly1 - 1.5, cx1 - cx0, (ly1 - ly0) + 4.5, stroke=0, fill=1)
+        c.setFillColor(_bk); c.setFont("Helvetica", 8.5)
+        c.drawString(cx0 + 1, pageH - ly1 + 1.2, str(txt))
+    c.save(); buf.seek(0)
+    ov = PdfReader(buf).pages[0]
+    reader = PdfReader(_io.BytesIO(pdf_bytes)); p0 = reader.pages[0]; p0.merge_page(ov)
+    wr = PdfWriter(); wr.add_page(p0)
+    for pg in reader.pages[1:]: wr.add_page(pg)
+    out = _io.BytesIO(); wr.write(out); return out.getvalue()
+
 @app.get("/pco/bloqueadas")
 def pco_bloqueadas(request: Request):
     from fastapi import HTTPException
@@ -1046,9 +1113,10 @@ def _oc_corrigir_aplicar(access, numero, campos, orig_pdf, destino_nome):
         if not forn_ok: m.append("CNPJ do fornecedor inválido/ausente")
         return False, "; ".join(m)
     if not orig_pdf: return False, "PDF da O.C. não encontrado"
-    linhas = [f"Faturamento: {cc_cnpj}" + (f" — {centro}" if centro else ""),
-              f"Fornecedor: {forn}  CNPJ: {forn_cnpj}"] + ([f"Endereço: {endereco}"] if endereco else [])
-    corrig = _pdf_carimbo_correcao(orig_pdf, linhas)
+    # correção in-place: cobre o valor errado e escreve o certo no mesmo lugar (O.C. fica com cara de original)
+    campos_ov = {"cnpj_centro_custo": cc_cnpj, "fornecedor": forn,
+                 "cnpj_fornecedor": forn_cnpj, "endereco_fornecedor": endereco or None}
+    corrig = corrige_oc_inplace(orig_pdf, campos_ov) or orig_pdf
     dropbox_rateio.criar_pasta(access, PCO_ENVIAR)
     dropbox_rateio.subir_bytes(access, corrig, f"{PCO_ENVIAR}/{destino_nome}", overwrite=True)
     sb_upsert_ocs([{ "numero": numero, "data_oc": campos.get("data_oc"),
@@ -1279,11 +1347,22 @@ def notas_procurar(request: Request, q: str = ""):
     exige(request, "PROCURAR_NOTA")
     q = (q or "").strip()
     if len(q) < 3: return {"itens": []}
+    SEL = "id,numero,data_oc,centro_custo,fornecedor,valor,pco_enviado_em,qtd_notas,valor_notas,fisica_ok,protocolo_ok,ciclo_fechado"
     val = f"(numero.ilike.*{q}*,fornecedor.ilike.*{q}*,centro_custo.ilike.*{q}*)"
     url = (f"{SB_URL}/rest/v1/v_ocs?pco_status=eq.enviado&or={urllib.parse.quote(val)}"
-           f"&select=id,numero,data_oc,centro_custo,fornecedor,valor,pco_enviado_em,qtd_notas,valor_notas,fisica_ok,protocolo_ok,ciclo_fechado&order=numero&limit=40")
+           f"&select={SEL}&order=numero&limit=40")
     try: rows = _sb_json(url, SB_KEY) or []
     except Exception as e: raise HTTPException(500, f"procurar: {e}")
+    # também busca pelo NÚMERO DA NOTA -> traz as O.C. dessas notas
+    have = {r["id"] for r in rows}
+    try:
+        nrows = _sb_json(f"{SB_URL}/rest/v1/notas?numero_nota=ilike.{urllib.parse.quote('*'+q+'*')}&select=oc_id", SB_KEY) or []
+        extra = [n["oc_id"] for n in nrows if n.get("oc_id") and n["oc_id"] not in have]
+        if extra:
+            idlist = ",".join(f'"{i}"' for i in dict.fromkeys(extra))
+            e = _sb_json(f"{SB_URL}/rest/v1/v_ocs?id=in.({idlist})&pco_status=eq.enviado&select={SEL}", SB_KEY) or []
+            rows.extend(e)
+    except Exception: pass
     for r in rows:
         nurl = (f"{SB_URL}/rest/v1/notas?oc_id=eq.{urllib.parse.quote(r['id'])}"
                 f"&select=numero_nota,emissao,valor,tem_boleto,recebimento,divergencia,entregue,vencimento,forma_pagamento&order=criado_em")
@@ -1378,6 +1457,50 @@ def notas_vencimentos_pdf(request: Request, q: str = "", filtro: str = "todas"):
                      linhas, subtitulo=f"{len(itens)} nota(s) · {titf}", aligns={3: 'RIGHT'})
     return Response(content=pdf, media_type="application/pdf",
         headers={"Content-Disposition": 'attachment; filename="vencimentos_notas.pdf"'})
+
+# ================= NOTAS FISCAIS — PROTOCOLO (4º marco) =================
+@app.get("/notas/protocolo_lista")
+def notas_protocolo_lista(request: Request, q: str = ""):
+    """O.C. totalmente entregues (via física recebida) e ainda NÃO protocoladas."""
+    from fastapi import HTTPException
+    exige(request, "GERAR_PROTOCOLO")
+    url = (f"{SB_URL}/rest/v1/v_ocs?pco_status=eq.enviado&fisica_ok=eq.true&protocolo_ok=eq.false&qtd_notas=gt.0"
+           f"&select=id,numero,data_oc,centro_custo,fornecedor,valor,qtd_notas,valor_notas&order=centro_custo,numero")
+    try: rows = _sb_json(url, SB_KEY) or []
+    except Exception as e: raise HTTPException(500, f"listar: {e}")
+    ql = (q or "").strip().lower()
+    if len(ql) >= 3:
+        rows = [r for r in rows if ql in " ".join(str(x or "") for x in (r.get("numero"), r.get("fornecedor"), r.get("centro_custo"))).lower()]
+    return {"itens": rows, "total": len(rows)}
+
+@app.post("/notas/protocolar")
+async def notas_protocolar(request: Request):
+    """Marca a O.C. como protocolada (4º marco): cria o protocolo e fecha o ciclo."""
+    from fastapi import HTTPException
+    u, p = exige(request, "GERAR_PROTOCOLO")
+    b = await request.json()
+    oc_id = str(b.get("oc_id", "")).strip()
+    numero_prot = (b.get("numero") or "").strip() or None
+    if not oc_id: raise HTTPException(400, "oc_id?")
+    oc = _sb_json(f"{SB_URL}/rest/v1/ocs?id=eq.{urllib.parse.quote(oc_id)}&select=numero,centro_custo&limit=1", SB_KEY) or []
+    if not oc: raise HTTPException(404, "O.C. não encontrada")
+    prot = {"data": datetime.date.today().isoformat(), "centro_custo": oc[0].get("centro_custo"),
+            "numero": numero_prot or oc[0].get("numero"), "criado_por": u["id"]}
+    req = urllib.request.Request(f"{SB_URL}/rest/v1/protocolos",
+        data=json.dumps(prot, ensure_ascii=False).encode(), method="POST",
+        headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "content-type": "application/json",
+                 "prefer": "return=representation"})
+    try: pid = (json.loads(urllib.request.urlopen(req, timeout=30).read().decode()) or [{}])[0].get("id")
+    except urllib.error.HTTPError as e: raise HTTPException(500, "criar protocolo: " + e.read().decode()[:200])
+    patch = {"protocolo": True, "protocolado_em": datetime.datetime.now().isoformat(), "protocolo_id": pid}
+    req2 = urllib.request.Request(f"{SB_URL}/rest/v1/ocs?id=eq.{urllib.parse.quote(oc_id)}",
+        data=json.dumps(patch, ensure_ascii=False).encode(), method="PATCH",
+        headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "content-type": "application/json",
+                 "prefer": "return=minimal"})
+    try: urllib.request.urlopen(req2, timeout=30)
+    except urllib.error.HTTPError as e: raise HTTPException(500, "marcar protocolo: " + e.read().decode()[:200])
+    log_frotahub(u["id"], p["papel"], "GERAR_PROTOCOLO", "PROTOCOLOU", f"{oc[0].get('numero')}")
+    return {"ok": True}
 
 # ---------------- ENVIAR_PCO ----------------
 def _fmt_reais(v):
@@ -1742,6 +1865,352 @@ async def desfazer(request: Request):
     log_frotahub(u["id"], p["papel"], "CONFIG_BUILDER", "DESFAZER_ADM", desde, {"ocs": len(rows)})
     return {"ok": True, "depto": "ADM", "ocs_revertidas": len(rows), "arquivos_voltaram": voltas, "erros": erros}
 
+# ================= MANUTENÇÃO — CONFERIR_LISTA_ORCAMENTOS / GERAR_ORCAMENTOS =================
+import base64 as _b64
+from copy import deepcopy as _dcopy
+from reportlab.lib.pagesizes import A4 as _A4
+from reportlab.lib.units import mm as _mm
+from reportlab.lib import colors as _col
+from reportlab.lib.styles import ParagraphStyle as _PS
+from reportlab.platypus import (SimpleDocTemplate as _SDT, Table as _T, TableStyle as _TS,
+                                Paragraph as _P, Spacer as _SP, Image as _IMG)
+from reportlab.lib.enums import TA_RIGHT as _TR, TA_CENTER as _TC
+
+MANUT_BASE   = os.environ.get("MANUT_BASE", "/FROTAHUB/2 - MANUTENCAO").rstrip("/")
+ORC_NOTAS    = MANUT_BASE + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+ORC_EXTRAPOLA  = float(os.environ.get("ORC_EXTRAPOLA", "500"))   # nota (antes do +20%) acima disso -> extrapolado
+_LOGO_ORC_B64  = "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"
+_MODELO_DOCX_B64 = "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"
+
+_NAVY=_col.HexColor("#24344D"); _GRAY=_col.HexColor("#666666"); _LGRAY=_col.HexColor("#EDEDED"); _LN=_col.HexColor("#C9CDD3")
+_MESES=["JANEIRO","FEVEREIRO","MARÇO","ABRIL","MAIO","JUNHO","JULHO","AGOSTO","SETEMBRO","OUTUBRO","NOVEMBRO","DEZEMBRO"]
+def _rs(v): return "R$ " + f"{float(v):,.2f}".replace(",","X").replace(".",",").replace("X",".")
+def _num_limpo(s):
+    d=re.sub(r"\D","",str(s or "")); d=d.lstrip("0"); return d or ("0" if re.search(r"\d",str(s or "")) else "")
+def _data_iso(s):
+    m=re.search(r"(\d{2})/(\d{2})/(\d{4})",str(s or ""))
+    if m: return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+    m=re.search(r"(\d{4})-(\d{2})-(\d{2})",str(s or ""))
+    return m.group(0) if m else None
+def _mes_da_data(s):
+    iso=_data_iso(s)
+    if iso:
+        y,mo,_=iso.split("-"); return f"{_MESES[int(mo)-1]} {y}"
+    h=datetime.date.today(); return f"{_MESES[h.month-1]} {h.year}"
+
+_EU=["zero","um","dois","três","quatro","cinco","seis","sete","oito","nove","dez","onze","doze","treze","quatorze","quinze","dezesseis","dezessete","dezoito","dezenove"]
+_ED=["","","vinte","trinta","quarenta","cinquenta","sessenta","setenta","oitenta","noventa"]
+_EC=["","cento","duzentos","trezentos","quatrocentos","quinhentos","seiscentos","setecentos","oitocentos","novecentos"]
+def _ext999(n):
+    if n==0: return ""
+    if n==100: return "cem"
+    p=[];c=n//100;r=n%100
+    if c:p.append(_EC[c])
+    if 0<r<20:p.append(_EU[r])
+    else:
+        d=r//10;u=r%10
+        if d:p.append(_ED[d])
+        if u:p.append(_EU[u])
+    return " e ".join(p)
+def _extenso_reais(v):
+    v=round(float(v),2);reais=int(v);cent=int(round((v-reais)*100))
+    def g(n):
+        mil=n//1000;resto=n%1000;o=[]
+        if mil:o.append("mil" if mil==1 else _ext999(mil)+" mil")
+        if resto:o.append(_ext999(resto))
+        return " e ".join([x for x in o if x])
+    rp="zero reais" if reais==0 else ("um real" if reais==1 else g(reais)+" reais")
+    if cent==0:return rp+"."
+    cp="um centavo" if cent==1 else _ext999(cent)+" centavos"
+    return f"{rp} e {cp}."
+
+def _oc_hdr(t): return _P(t,_PS("h",fontName="Helvetica-Bold",fontSize=8.5,textColor=_col.white,leading=11))
+def _oc_kv(l,v): return _P(f"<b>{l}:</b> {v}",_PS("kv",fontName="Helvetica",fontSize=8.5,textColor=_col.HexColor('#1e2733'),leading=13))
+
+def gera_orcamento_pdf(d):
+    buf=io.BytesIO()
+    doc=_SDT(buf,pagesize=_A4,leftMargin=16*_mm,rightMargin=16*_mm,topMargin=12*_mm,bottomMargin=14*_mm,title=f"Orçamento {d['num']}")
+    W=doc.width; el=[]
+    emp=_P("<b>FROTA MACEDO ENGENHARIA LTDA</b><br/><font size=7 color='#666666'>"
+        "Eng. Heitor de Oliveira Albuquerque, 295 — Cidade dos Funcionários — Fortaleza/CE<br/>"
+        "(85) 2181-1386 • frotamacedoengenharia@gmail.com • CNPJ 27.363.223/0001-70</font>",
+        _PS("emp",fontName="Helvetica",fontSize=11,textColor=_NAVY,leading=13))
+    dire=_P(f"<font size=8 color='#666666'>{d['data']}<br/>Orçamento nº {d['num']}</font>",_PS("dir",alignment=_TR,fontName="Helvetica",fontSize=8,leading=12))
+    try: logo=_IMG(io.BytesIO(_b64.b64decode(_LOGO_ORC_B64)),width=22*_mm,height=11*_mm)
+    except Exception: logo=_P("",_PS("x"))
+    h=_T([[logo,emp,dire]],colWidths=[24*_mm,W-24*_mm-40*_mm,40*_mm])
+    h.setStyle(_TS([("VALIGN",(0,0),(-1,-1),"MIDDLE"),("LINEBELOW",(0,0),(-1,-1),1.2,_NAVY),("BOTTOMPADDING",(0,0),(-1,-1),8)]))
+    el+=[h,_SP(1,8)]
+    tit=_T([[_P(f"<font size=17 color='white'><b>ORÇAMENTO N° {d['num']}</b></font><br/><font size=8 color='white'>REVISÃO {d.get('revisao',1)}</font>",_PS("t",leading=20))]],colWidths=[W])
+    tit.setStyle(_TS([("BACKGROUND",(0,0),(-1,-1),_NAVY),("LEFTPADDING",(0,0),(-1,-1),12),("TOPPADDING",(0,0),(-1,-1),10),("BOTTOMPADDING",(0,0),(-1,-1),10)]))
+    el+=[tit,_SP(1,8)]
+    obra=_T([[_P(f"<b>OBRA:</b>  MANUTENCAO {d['loja_nome']}  #{d['num']}",_PS("o",fontName="Helvetica",fontSize=9,leading=12))]],colWidths=[W])
+    obra.setStyle(_TS([("BACKGROUND",(0,0),(-1,-1),_LGRAY),("LEFTPADDING",(0,0),(-1,-1),10),("TOPPADDING",(0,0),(-1,-1),7),("BOTTOMPADDING",(0,0),(-1,-1),7)]))
+    el+=[obra,_SP(1,10)]
+    pv=d["prestador"]; tv=d["tomador"]; cw=(W-6)/2
+    pb=[_oc_kv("Nome",pv["nome"]),_oc_kv("CNPJ",pv["cnpj"]),_oc_kv("Forma de pagamento",pv["forma"]),_oc_kv("Data de faturamento",d["data"])]
+    tb=[_oc_kv("Nome",tv["nome"]),_oc_kv("CNPJ",tv.get("cnpj") or "—"),_oc_kv("Endereço",tv.get("endereco") or "—"),_oc_kv("Cidade/Estado",tv.get("cidade") or "—")]
+    def bloco(tt,ls):
+        inner=_T([[_oc_hdr(tt)]]+[[x] for x in ls],colWidths=[cw-2])
+        inner.setStyle(_TS([("BACKGROUND",(0,0),(0,0),_NAVY),("LEFTPADDING",(0,0),(-1,-1),8),("RIGHTPADDING",(0,0),(-1,-1),8),
+            ("TOPPADDING",(0,0),(0,0),5),("BOTTOMPADDING",(0,0),(0,0),5),("TOPPADDING",(0,1),(-1,-1),2),("BOTTOMPADDING",(0,1),(-1,-1),2),
+            ("BOX",(0,1),(0,-1),0.6,_LN),("TOPPADDING",(0,1),(0,1),6),("BOTTOMPADDING",(0,-1),(0,-1),6)]))
+        return inner
+    pt=_T([[bloco("DADOS DO PRESTADOR",pb),bloco("DADOS DO TOMADOR",tb)]],colWidths=[cw,cw],hAlign="LEFT")
+    pt.setStyle(_TS([("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(0,0),0),("RIGHTPADDING",(1,0),(1,0),0)]))
+    el+=[pt,_SP(1,12)]
+    el.append(_P("<b>DISCRIMINAÇÃO DOS ITENS</b>",_PS("di",fontName="Helvetica-Bold",fontSize=9,textColor=_NAVY,spaceAfter=4)))
+    data=[["ITEM","DESCRIÇÃO","QUANT.","UNID.","VALOR UNIT.","TOTAL"]]; tg=0.0
+    ds=_PS("ds",fontName="Helvetica",fontSize=8.5,leading=11)
+    for i,it in enumerate(d["itens"],1):
+        vu=round(float(it["valor_unit"])*1.20,2); tot=round(vu*float(it["quant"]),2); tg+=tot
+        data.append([str(i),_P(it["descricao"],ds),f"{float(it['quant']):.2f}".replace(".",","),it.get("unid","UN"),_rs(vu),_rs(tot)])
+    data.append(["TOTAL GERAL","","","","",_rs(tg)]); n=len(data)-1
+    itb=_T(data,colWidths=[13*_mm,W-13*_mm-22*_mm-16*_mm-26*_mm-26*_mm,22*_mm,16*_mm,26*_mm,26*_mm])
+    itb.setStyle(_TS([("BACKGROUND",(0,0),(-1,0),_NAVY),("TEXTCOLOR",(0,0),(-1,0),_col.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
+        ("FONTSIZE",(0,0),(-1,-1),8.5),("ALIGN",(2,0),(5,-1),"CENTER"),("ALIGN",(4,1),(5,-1),"RIGHT"),("ALIGN",(0,0),(0,-1),"CENTER"),
+        ("VALIGN",(0,0),(-1,-1),"MIDDLE"),("GRID",(0,0),(-1,-1),0.5,_LN),("ROWBACKGROUNDS",(0,1),(-1,n-1),[_col.white,_col.HexColor("#F6F7F9")]),
+        ("SPAN",(0,n),(4,n)),("BACKGROUND",(0,n),(-1,n),_LGRAY),("FONTNAME",(0,n),(-1,n),"Helvetica-Bold"),("ALIGN",(0,n),(4,n),"RIGHT"),
+        ("TOPPADDING",(0,0),(-1,-1),5),("BOTTOMPADDING",(0,0),(-1,-1),5),("LEFTPADDING",(1,0),(1,-1),6)]))
+    el+=[itb,_SP(1,8)]
+    el.append(_P(f"<b>Valor total por extenso:</b>  <i>{_extenso_reais(tg)}</i>",_PS("ex",fontName="Helvetica",fontSize=9,leading=12)))
+    el.append(_SP(1,12))
+    obs=["Orçamento válido por 7 (sete) dias corridos a partir da data de emissão.","Os valores acima incluem material e serviço de entrega."]
+    obt=_T([[_oc_hdr("OBSERVAÇÕES")]]+[[_P("• "+o,_PS("ob",fontName="Helvetica",fontSize=8.5,leading=12))] for o in obs],colWidths=[W-2])
+    obt.setStyle(_TS([("BACKGROUND",(0,0),(0,0),_NAVY),("LEFTPADDING",(0,0),(-1,-1),8),("TOPPADDING",(0,0),(0,0),5),("BOTTOMPADDING",(0,0),(0,0),5),
+        ("BOX",(0,1),(0,-1),0.6,_LN),("TOPPADDING",(0,1),(0,1),6),("BOTTOMPADDING",(0,-1),(0,-1),6),("TOPPADDING",(0,1),(-1,-1),2),("BOTTOMPADDING",(0,1),(-1,-1),2)]))
+    el+=[obt,_SP(1,26)]
+    ass=_T([[_P("Frota Macedo Engenharia LTDA",_PS("a1",alignment=_TC,fontSize=8.5,textColor=_GRAY)),
+             _P("Aceite do Cliente — Nome / Data",_PS("a2",alignment=_TC,fontSize=8.5,textColor=_GRAY))]],colWidths=[(W-10)/2,(W-10)/2])
+    ass.setStyle(_TS([("LINEABOVE",(0,0),(0,0),0.6,_GRAY),("LINEABOVE",(1,0),(1,0),0.6,_GRAY),("TOPPADDING",(0,0),(-1,-1),4),("LEFTPADDING",(0,0),(0,0),20),("RIGHTPADDING",(1,0),(1,0),20)]))
+    el+=[ass]
+    def _rod(c,dd):
+        c.saveState(); c.setFont("Helvetica",7.5); c.setFillColor(_GRAY)
+        c.drawCentredString(_A4[0]/2,9*_mm,"Frota Macedo Engenharia LTDA  •  CNPJ 27.363.223/0001-70"); c.restoreState()
+    doc.build(el,onFirstPage=_rod,onLaterPages=_rod)
+    return buf.getvalue()
+
+# ---- gerador DOCX (usa o modelo Word do usuário como base) ----
+def _dx_set(cell, lines):
+    p=cell.paragraphs[0]; base=p.runs[0] if p.runs else None
+    bold=base.bold if base else None; size=base.font.size if base else None; name=base.font.name if base else None
+    for ex in cell.paragraphs[1:]: ex._element.getparent().remove(ex._element)
+    for r in list(p.runs): r._element.getparent().remove(r._element)
+    for i,ln in enumerate(lines):
+        if i>0: p.add_run().add_break()
+        rr=p.add_run(ln)
+        if bold is not None: rr.bold=bold
+        if size is not None: rr.font.size=size
+        if name is not None: rr.font.name=name
+def gera_orcamento_docx(d):
+    from docx import Document
+    doc=Document(io.BytesIO(_b64.b64decode(_MODELO_DOCX_B64))); T=doc.tables
+    _dx_set(T[0].rows[0].cells[2],[d["data"],f"Orçamento nº {d['num']}"])
+    _dx_set(T[1].rows[0].cells[0],[f"ORÇAMENTO Nº {d['num']}",f"REVISÃO {d.get('revisao',1)}"])
+    _dx_set(T[2].rows[0].cells[0],[f"OBRA:  MANUTENCAO {d['loja_nome']}  #{d['num']}"])
+    itbl=T[4]; total_tr=itbl.rows[-1]._tr; modelo_tr=_dcopy(itbl.rows[1]._tr)
+    for row in list(itbl.rows[1:-1]): itbl._tbl.remove(row._tr)
+    tg=0.0
+    for it in d["itens"]:
+        total_tr.addprevious(_dcopy(modelo_tr))
+    for i,(row,it) in enumerate(zip(itbl.rows[1:-1],d["itens"]),1):
+        vu=round(float(it["valor_unit"])*1.20,2); tot=round(vu*float(it["quant"]),2); tg+=tot
+        vals=[str(i),it["descricao"],f"{float(it['quant']):.2f}".replace(".",","),it.get("unid","UN"),_rs(vu),_rs(tot)]
+        for c,v in zip(row.cells,vals): _dx_set(c,[v])
+    _dx_set(itbl.rows[-1].cells[-1],[_rs(tg)])
+    for p in doc.paragraphs:
+        if p.text.strip().lower().startswith("valor total por extenso"):
+            base=p.runs[0] if p.runs else None
+            for r in list(p.runs): r._element.getparent().remove(r._element)
+            rr=p.add_run("Valor total por extenso:  "+_extenso_reais(tg))
+            if base is not None and base.font.size: rr.font.size=base.font.size
+            break
+    out=io.BytesIO(); doc.save(out); return out.getvalue()
+
+_ORC_PROMPT=(
+"Você recebe um 'DOCUMENTO AUXILIAR DE VENDA - PEDIDO' (nota de material). Pode haver MAIS DE UMA nota (uma por página). "
+"Para CADA nota extraia em JSON:\n"
+"- ticket: número do chamado, no campo 'Observação' (aparece como 'TICKET', 'TICKER' ou '#' seguido de dígitos). Só os dígitos; se não houver, null.\n"
+"- nota_numero: o 'Nº do Documento' da nota (só dígitos).\n"
+"- data_nota: a data de emissão ('Dt. Emis') no formato DD/MM/AAAA.\n"
+"- itens: linhas da tabela de produtos. Para cada item: descricao (nome do produto SEM o código numérico inicial e sem ' - '), "
+"quant (número), unid (coluna 'Embalagem': KG, UN, M...), valor_unit (o 'Preço Unitário', número). Inclua 'SERVICO DE ENTREGA' se existir.\n"
+"Responda só JSON: {\"notas\":[{\"ticket\":\"126486\",\"nota_numero\":\"18747\",\"data_nota\":\"03/08/2026\",\"itens\":[{\"descricao\":\"...\",\"quant\":1.0,\"unid\":\"UN\",\"valor_unit\":1.70}]}]}. Use ponto decimal."
+)
+def _ler_notas_gemini(file_bytes, mime="application/pdf"):
+    import google.generativeai as genai
+    genai.configure(api_key=GEMINI_API_KEY)
+    model=genai.GenerativeModel(GEMINI_MODEL)
+    r=model.generate_content([{"mime_type":mime,"data":file_bytes},_ORC_PROMPT],
+        generation_config={"response_mime_type":"application/json","temperature":0})
+    try: return (json.loads(r.text) or {}).get("notas") or []
+    except Exception: return []
+
+def _pasta_manut(access, n):
+    try:
+        for e in dropbox_rateio.listar_entradas(access, MANUT_BASE):
+            if e["dir"] and re.match(rf"^\s*{n}\s*-", e["name"]):
+                return f"{MANUT_BASE}/{e['name']}"
+    except Exception: pass
+    return None
+
+def _loja_do_ticket(ticket):
+    q=urllib.parse.urlencode({"numero":f"eq.{ticket}","select":"unidade,aba","limit":"1"})
+    ch=_sb_json(f"{SB_URL}/rest/v1/chamados?{q}",SB_KEY) or []
+    if not ch: return None
+    unidade=ch[0].get("unidade") or ""
+    m=re.search(r"LOJA\s*0*(\d{1,3})",unidade,re.I) or re.search(r"\b0*(\d{1,3})\b",unidade)
+    lj=None
+    if m: lj=(_sb_json(f"{SB_URL}/rest/v1/lojas?numero=eq.{int(m.group(1))}&limit=1",SB_KEY) or [None])[0]
+    if not lj and unidade:
+        alvo=re.sub(r"^LOJA\s*\d*\s*-?\s*","",unidade,flags=re.I).strip()
+        if alvo: lj=(_sb_json(f"{SB_URL}/rest/v1/lojas?nome=ilike.*{urllib.parse.quote(alvo[:14])}*&limit=1",SB_KEY) or [None])[0]
+    return {"aba":ch[0].get("aba"),"unidade":unidade,"loja":lj}
+
+def _slug_loja(loja, unidade):
+    num=loja.get("numero") if loja else None
+    nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",unidade or "",flags=re.I).strip() or "SEM_LOJA"
+    slug=re.sub(r"\s+","_",nome.strip())
+    if num is None: return slug
+    return (f"{num:02d}" if num<100 else str(num))+"_"+slug
+
+def _split_pdf(pdf_bytes):
+    from pypdf import PdfReader, PdfWriter
+    out=[]
+    try:
+        r=PdfReader(io.BytesIO(pdf_bytes))
+        for pg in r.pages:
+            w=PdfWriter(); w.add_page(pg); b=io.BytesIO(); w.write(b); out.append(b.getvalue())
+    except Exception: return [pdf_bytes]
+    return out or [pdf_bytes]
+
+def _orc_registra(row):
+    req=urllib.request.Request(f"{SB_URL}/rest/v1/notas_orcamento",
+        data=json.dumps([row],ensure_ascii=False).encode(),method="POST",
+        headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","content-type":"application/json","prefer":"return=minimal"})
+    try: urllib.request.urlopen(req,timeout=30)
+    except urllib.error.HTTPError as e: print("notas_orcamento erro:",e.read().decode()[:200],flush=True)
+
+@app.post("/orc/listar")
+def orc_listar(request: Request):
+    from fastapi import HTTPException
+    exige(request,"CONFERIR_LISTA_ORCAMENTOS")
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    access=dropbox_rateio.obter_token()
+    arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
+    return {"pasta":ORC_NOTAS,"total":len(arqs),"arquivos":sorted(arqs)}
+
+@app.post("/orc/gerar")
+async def orc_gerar(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    body={}
+    try: body=await request.json()
+    except Exception: pass
+    previa=bool(body.get("previa"))
+    if not GEMINI_API_KEY: raise HTTPException(500,"GEMINI_API_KEY não configurada no Render")
+    access=dropbox_rateio.obter_token()
+    P6=_pasta_manut(access,6); P7=_pasta_manut(access,7); P8=_pasta_manut(access,8)
+    P1=_pasta_manut(access,1); P9=_pasta_manut(access,9); P10=_pasta_manut(access,10)
+    arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
+    def _mime(nm):
+        nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
+    res=[]
+    for nome in sorted(arqs):
+        ext=os.path.splitext(nome)[1] or ".pdf"; is_pdf=nome.lower().endswith(".pdf")
+        fb=dropbox_rateio.baixar(access,f"{ORC_NOTAS}/{nome}")
+        if not fb: res.append({"arquivo":nome,"status":"erro","motivo":"não baixou"}); continue
+        try: notas=_ler_notas_gemini(fb,_mime(nome))
+        except Exception as e:
+            res.append({"arquivo":nome,"status":"erro","motivo":f"gemini: {str(e)[:120]}"}); continue
+        if not notas:
+            info={"arquivo":nome,"status":"pendente","motivo":"não identifiquei nota","destino":"6"}
+            if not previa and P6: dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{P6}/{nome}")
+            res.append(info); continue
+        pages=_split_pdf(fb) if (is_pdf and len(notas)>1) else None
+        usou_source=False
+        for i,nt in enumerate(notas):
+            page=pages[i] if (pages and i<len(pages)) else fb
+            ticket=_num_limpo(nt.get("ticket")); nota_num=_num_limpo(nt.get("nota_numero")) or "SN"
+            itens=nt.get("itens") or []
+            valor_nota=0.0
+            for it in itens:
+                try: valor_nota+=float(it.get("valor_unit") or 0)*float(it.get("quant") or 0)
+                except Exception: pass
+            valor_nota=round(valor_nota,2); valor_orc=round(valor_nota*1.20,2)
+            info={"arquivo":nome,"ticket":ticket or None,"nota":nota_num,"itens":len(itens),"valor_nota":valor_nota,"valor_orcamento":valor_orc}
+            def _mv_nota(destino_folder, destino_nome):
+                nonlocal usou_source
+                if previa or not destino_folder: return
+                if pages is None:
+                    dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{destino_folder}/{destino_nome}"); usou_source=True
+                else:
+                    dropbox_rateio.subir_bytes(access,page,f"{destino_folder}/{destino_nome}",overwrite=True)
+            if not ticket:
+                info.update(status="pendente",motivo="sem ticket",destino="6")
+                _mv_nota(P6, nome if pages is None else f"{os.path.splitext(nome)[0]}_p{i+1}{ext}")
+                if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket","valor_nota":valor_nota,"itens":itens,"criado_por":u["id"]})
+                res.append(info); continue
+            lj=_loja_do_ticket(ticket)
+            if not lj:
+                info.update(status="pendente",motivo="ticket não encontrado nos chamados",destino="7")
+                _mv_nota(P7, nome if pages is None else f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
+                if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,"status":"ticket_nao_associado","valor_nota":valor_nota,"itens":itens,"criado_por":u["id"]})
+                res.append(info); continue
+            loja=lj.get("loja") or {}
+            loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
+            extrap=valor_nota>ORC_EXTRAPOLA
+            slug=_slug_loja(loja,lj.get("unidade"))
+            mes=_mes_da_data(nt.get("data_nota"))
+            info.update(status="ok",loja=loja_nome,loja_numero=(loja.get("numero") if loja else None),extrapolado=extrap,mes=mes)
+            if not previa:
+                # dados do orçamento
+                hoje=datetime.date.today().strftime("%d/%m/%Y")
+                itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
+                dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
+                    "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Boleto 30 dias"},
+                    "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":(loja.get("cnpj") if loja else None),
+                               "endereco":(loja.get("endereco") if loja else None),
+                               "cidade":((loja.get("cidade") if loja else None) or "")+(" - CE" if (loja.get("cidade") if loja else None) else "")},
+                    "itens":itens_orc}
+                base_nome=f"{slug}_{ticket}_NOTA_{nota_num}"
+                doc_bytes=gera_orcamento_docx(dados)
+                arq_pdf=arq_doc=None
+                try:
+                    if extrap:
+                        if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                    else:
+                        pdf_bytes=gera_orcamento_pdf(dados)
+                        if P1: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P1}/{base_nome}.pdf",overwrite=True)
+                        if P10:
+                            dropbox_rateio.criar_pasta(access,f"{P10}/{mes}"); dropbox_rateio.criar_pasta(access,f"{P10}/{mes}/{slug}")
+                            dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P10}/{mes}/{slug}/{base_nome}.pdf",overwrite=True)
+                            dropbox_rateio.subir_bytes(access,doc_bytes,f"{P10}/{mes}/{slug}/{base_nome}.docx",overwrite=True)
+                            arq_pdf=f"10/{mes}/{slug}/{base_nome}.pdf"; arq_doc=f"10/{mes}/{slug}/{base_nome}.docx"
+                except Exception as e: info.update(motivo=f"salvar: {str(e)[:90]}")
+                # nota renomeada -> pasta 8 / <aba>
+                sub="INSTALACOES" if (lj.get("aba") or "").upper().startswith("INST") else ("CIVIL" if (lj.get("aba") or "").upper().startswith("CIV") else "SEM CLASSIFICACAO")
+                arq_nota=None
+                if P8:
+                    dropbox_rateio.criar_pasta(access,f"{P8}/{sub}")
+                    _mv_nota(f"{P8}/{sub}", f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
+                    arq_nota=f"8/{sub}/TICKET_{ticket}_NOTA_{nota_num}{ext}"
+                _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,
+                    "loja_numero":(loja.get("numero") if loja else None),"loja_nome":loja_nome,"aba":lj.get("aba"),
+                    "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
+                    "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
+                    "arquivo_nota":arq_nota,"arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc,"criado_por":u["id"]})
+            res.append(info)
+        # se dividiu em páginas, remove o arquivo-fonte da pasta 0 (páginas já foram espalhadas)
+        if not previa and pages is not None and not usou_source:
+            try: dropbox_rateio.apagar(access,f"{ORC_NOTAS}/{nome}")
+            except Exception: pass
+    ok=sum(1 for r in res if r.get("status")=="ok")
+    if not previa: log_frotahub(u["id"],p["papel"],"GERAR_ORCAMENTOS","GEROU",f"{ok}/{len(res)}")
+    return {"previa":previa,"resultados":res,"gerados":ok,"total":len(res)}
+
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
     import base64, secrets
@@ -1749,7 +2218,7 @@ def _basic_auth(app, user, pw):
         # rotas do FrotaHub têm autenticação própria (token Supabase) — não pedir Basic
         _path = scope.get("path", "") or ""
         if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
-                                        or _path.startswith("/notas") or _path.startswith("/migrar")
+                                        or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
                                         or _path.startswith("/desfazer")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
