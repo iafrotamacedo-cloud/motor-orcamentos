@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 60
+#  CONTADOR DE REVISÕES DESTE app.py: 61
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 60}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 61}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2057,10 +2057,10 @@ def _pasta_manut(access, n):
     return None
 
 def _loja_do_ticket(ticket):
-    q=urllib.parse.urlencode({"numero":f"eq.{ticket}","select":"unidade,aba","limit":"1"})
+    q=urllib.parse.urlencode({"numero":f"eq.{ticket}","select":"loja,aba","limit":"1"})
     ch=_sb_json(f"{SB_URL}/rest/v1/chamados?{q}",SB_KEY) or []
     if not ch: return None
-    unidade=ch[0].get("unidade") or ""
+    unidade=ch[0].get("loja") or ""
     m=re.search(r"LOJA\s*0*(\d{1,3})",unidade,re.I) or re.search(r"\b0*(\d{1,3})\b",unidade)
     lj=None
     if m: lj=(_sb_json(f"{SB_URL}/rest/v1/lojas?numero=eq.{int(m.group(1))}&limit=1",SB_KEY) or [None])[0]
@@ -2099,8 +2099,27 @@ def orc_listar(request: Request):
     exige(request,"CONFERIR_LISTA_ORCAMENTOS")
     if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
     access=dropbox_rateio.obter_token()
+    ORC_NOTAS=_pasta_manut(access,0) or (MANUT_BASE + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
     arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
     return {"pasta":ORC_NOTAS,"total":len(arqs),"arquivos":sorted(arqs)}
+
+@app.get("/orc/chamados")
+def orc_chamados(request: Request, q: str="", aba: str="", status: str="", desde: str="", ate: str=""):
+    """Lista os chamados do Trílogo (tabela chamados, sincronizada pelo robô do GitHub)."""
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_TRILOGO")
+    parts=["select=numero,aba,loja,status,tipo_predial,prioridade,solicitante,responsavel,data_criacao,prazo",
+           "order=data_criacao.desc","limit=1500"]
+    if aba:    parts.append(f"aba=eq.{urllib.parse.quote(aba)}")
+    if status: parts.append(f"status=eq.{urllib.parse.quote(status)}")
+    if desde:  parts.append(f"data_criacao=gte.{desde}")
+    if ate:    parts.append(f"data_criacao=lte.{ate}")
+    if q and len(q)>=3:
+        val=f"(numero.ilike.*{q}*,loja.ilike.*{q}*,solicitante.ilike.*{q}*)"
+        parts.append("or="+urllib.parse.quote(val))
+    try: rows=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(parts),SB_KEY) or []
+    except Exception as e: raise HTTPException(500,f"chamados: {e}")
+    return {"itens":rows,"total":len(rows)}
 
 @app.post("/orc/gerar")
 async def orc_gerar(request: Request):
@@ -2112,6 +2131,7 @@ async def orc_gerar(request: Request):
     previa=bool(body.get("previa"))
     if not GEMINI_API_KEY: raise HTTPException(500,"GEMINI_API_KEY não configurada no Render")
     access=dropbox_rateio.obter_token()
+    ORC_NOTAS=_pasta_manut(access,0) or (MANUT_BASE + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
     P6=_pasta_manut(access,6); P7=_pasta_manut(access,7); P8=_pasta_manut(access,8)
     P1=_pasta_manut(access,1); P9=_pasta_manut(access,9); P10=_pasta_manut(access,10)
     arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
