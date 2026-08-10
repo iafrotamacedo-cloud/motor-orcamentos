@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 63
+#  CONTADOR DE REVISÕES DESTE app.py: 64
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 63}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 64}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2049,13 +2049,24 @@ def _ler_notas_gemini(file_bytes, mime="application/pdf"):
     except Exception: return []
 
 FROTAHUB_ROOT = os.environ.get("FROTAHUB_ROOT", "/FROTAHUB")
-def _manut_base(access):
-    """Acha a pasta do depto Manutenção pelo número '2 -' (robusto a acento/grafia)."""
+def _find_dir(access, base, pattern):
+    """Acha, em 'base', a 1ª subpasta cujo nome bate 'pattern'. base='' = raiz real do token."""
     try:
-        for e in dropbox_rateio.listar_entradas(access, FROTAHUB_ROOT):
-            if e["dir"] and re.match(r"^\s*2\s*-", e["name"]):
-                return f"{FROTAHUB_ROOT}/{e['name']}"
+        for e in dropbox_rateio.listar_entradas(access, base):
+            if e["dir"] and re.search(pattern, e["name"], re.I):
+                return f"{base}/{e['name']}" if base else f"/{e['name']}"
     except Exception: pass
+    return None
+def _manut_base(access):
+    """Acha o depto Manutenção ('2 -') — a raiz do token pode ser a conta (tem /FROTAHUB)
+       OU já ser a própria FROTAHUB (App folder: os deptos ficam direto na raiz '')."""
+    for root in (FROTAHUB_ROOT, ""):            # tenta /FROTAHUB e a raiz real do token
+        p=_find_dir(access, root, r"^\s*2\s*-")
+        if p: return p
+    fh=_find_dir(access, "", r"^\s*FROTAHUB\s*$") # ou uma pasta 'FROTAHUB' na raiz real
+    if fh:
+        p=_find_dir(access, fh, r"^\s*2\s*-")
+        if p: return p
     return MANUT_BASE
 def _pasta_manut(access, n, base=None):
     base = base or _manut_base(access)
@@ -2084,19 +2095,20 @@ def _orc_base(access, mb):
 
 def _orc_diag(access):
     """Radiografia da estrutura para depurar a leitura da pasta 0."""
-    d={"root":FROTAHUB_ROOT,"root_dirs":[],"manut_base":None,"manut_dirs":[],"orc_base":None,"orc_dirs":[],"pasta0":None,"arquivos_pasta0":0}
-    try: d["root_dirs"]=[e["name"] for e in dropbox_rateio.listar_entradas(access,FROTAHUB_ROOT) if e["dir"]]
-    except Exception as e: d["root_erro"]=str(e)[:160]
-    mb=_manut_base(access); d["manut_base"]=mb
-    try: d["manut_dirs"]=[e["name"] for e in dropbox_rateio.listar_entradas(access,mb) if e["dir"]]
-    except Exception as e: d["manut_erro"]=str(e)[:160]
-    ob=_orc_base(access,mb); d["orc_base"]=ob
-    try: d["orc_dirs"]=[e["name"] for e in dropbox_rateio.listar_entradas(access,ob) if e["dir"]]
-    except Exception as e: d["orc_erro"]=str(e)[:160]
+    def _ls(p):
+        try:
+            es=dropbox_rateio.listar_entradas(access,p)
+            return {"dirs":[e["name"] for e in es if e["dir"]],"arqs":len([e for e in es if not e["dir"]])}
+        except Exception as e:
+            return {"erro":str(e)[:180]}
+    d={"root":FROTAHUB_ROOT}
+    d["api_root"]=_ls("")                    # raiz REAL do token Dropbox
+    d["frotahub"]=_ls(FROTAHUB_ROOT)         # /FROTAHUB
+    d["pco_base"]=_ls(PCO_BASE)              # âncora conhecida que funciona
+    mb=_manut_base(access); d["manut_base"]=mb; d["manut"]=_ls(mb)
+    ob=_orc_base(access,mb); d["orc_base"]=ob; d["orc"]=_ls(ob)
     p0=_pasta_manut(access,0,ob); d["pasta0"]=p0
-    if p0:
-        try: d["arquivos_pasta0"]=len([a for a in dropbox_rateio.listar(access,p0) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))])
-        except Exception as e: d["pasta0_erro"]=str(e)[:160]
+    d["pasta0_arqs"]=(_ls(p0).get("arqs") if p0 else 0)
     return d
 
 def _loja_do_ticket(ticket):
