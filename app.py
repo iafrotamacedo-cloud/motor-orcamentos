@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 76
+#  CONTADOR DE REVISÕES DESTE app.py: 77
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 76}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 77}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2232,6 +2232,18 @@ def orc_chamados(request: Request, q: str="", aba: str="", status: str="", desde
     return {"itens":rows,"total":len(rows)}
 
 def _abacurta(a): return "Instalações" if (a or "").upper().startswith("INST") else ("Civil" if (a or "").upper().startswith("CIV") else (a or ""))
+
+@app.get("/orc/chamado_det")
+def orc_chamado_det(request: Request, numero: str="", aba: str=""):
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_TRILOGO")
+    parts=["select=*","limit=1",f"numero=eq.{urllib.parse.quote(numero)}"]
+    if aba: parts.append(f"aba=eq.{urllib.parse.quote(aba)}")
+    rows=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(parts),SB_KEY) or []
+    if not rows: raise HTTPException(404,"chamado não encontrado")
+    r=rows[0]; s=str(r.get("status") or "")
+    if s in _ST_MAP: r["status"]=_ST_MAP[s]
+    return r
 
 @app.get("/orc/chamados_pdf")
 def orc_chamados_pdf(request: Request, q: str="", aba: str="", status: str="", desde: str="", ate: str=""):
