@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 72
+#  CONTADOR DE REVISÕES DESTE app.py: 73
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -49,6 +49,11 @@ SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 # anon key (pública) — usada para validar o token do usuário do FrotaHub
 SB_ANON = os.environ.get("SUPABASE_ANON_KEY",
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZhYWxnZmJ1Z3Zla2J1aGh0YXR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU4NzA0OTIsImV4cCI6MjEwMTQ0NjQ5Mn0.Vwba3hsm43bwOXMXf2iQMkCWXqrGZaHKojHvV6mhFSI")
+# --- GitHub (disparo do robô do Trílogo via workflow_dispatch) ---
+GH_TOKEN    = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", "")
+GH_REPO     = os.environ.get("GH_REPO", "")                     # ex.: "usuario/trilogo_robo"
+GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "trilogo-chamados.yml")
+GH_REF      = os.environ.get("GH_REF", "main")
 # base do PCO no Dropbox (novo layout FROTAHUB)
 PCO_BASE = os.environ.get("PCO_BASE", "/FROTAHUB/1 - ADMINISTRATIVO/1 - PCO")
 # --- ENVIAR_PCO: SMTP + destinatários (padrão = TESTE p/ igor@; trocar por env p/ ir ao ar) ---
@@ -850,7 +855,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 72}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 73}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2252,6 +2257,56 @@ def orc_chamados_xlsx(request: Request, q: str="", aba: str="", status: str="", 
     buf=io.BytesIO(); wb.save(buf)
     return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition":'attachment; filename="chamados_trilogo.xlsx"'})
+
+# ================= ATUALIZAÇÃO REAL DO TRÍLOGO (dispara o robô no GitHub) =================
+def _github_dispatch(modo="rotina"):
+    """Aciona o workflow do robô (login real no Trílogo -> Supabase) via workflow_dispatch."""
+    if not (GH_TOKEN and GH_REPO):
+        raise RuntimeError("Configure GITHUB_TOKEN e GH_REPO no Render.")
+    url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WORKFLOW)}/dispatches"
+    data=json.dumps({"ref":GH_REF,"inputs":{"modo":modo}}).encode()
+    req=urllib.request.Request(url,data=data,method="POST",headers={
+        "Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
+        "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor","Content-Type":"application/json"})
+    urllib.request.urlopen(req,timeout=30)   # 204 No Content em caso de sucesso
+    return True
+
+@app.post("/orc/trilogo_run")
+async def orc_trilogo_run(request: Request):
+    """Atualização REAL Trílogo->Supabase, sob demanda. SOMENTE builder."""
+    from fastapi import HTTPException
+    u,p=exige(request,"CHAMADOS_TRILOGO")
+    if p.get("papel")!="builder": raise HTTPException(403,"Somente o builder pode disparar a atualização manual.")
+    body={}
+    try: body=await request.json()
+    except Exception: pass
+    modo=(body.get("modo") or "rotina").strip()
+    if modo not in ("rotina","inicial"): modo="rotina"
+    try: _github_dispatch(modo)
+    except urllib.error.HTTPError as e:
+        raise HTTPException(500,f"GitHub {e.code}: {e.read().decode()[:200]}")
+    except Exception as e:
+        raise HTTPException(500,f"disparo falhou: {e}")
+    log_frotahub(u["id"],p["papel"],"CHAMADOS_TRILOGO","DISPAROU_ROBO",modo)
+    return {"ok":True,"modo":modo,"msg":"Robô disparado no GitHub. A atualização leva ~2 min — recarregue a lista depois."}
+
+@app.get("/orc/trilogo_status")
+def orc_trilogo_status(request: Request):
+    """Status da última execução do robô no GitHub (para a tela mostrar 'rodando/concluído')."""
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_TRILOGO")
+    if not (GH_TOKEN and GH_REPO): return {"ok":False,"msg":"GitHub não configurado no Render"}
+    url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WORKFLOW)}/runs?per_page=1"
+    req=urllib.request.Request(url,headers={"Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
+        "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor"})
+    try:
+        r=json.loads(urllib.request.urlopen(req,timeout=20).read().decode())
+        run=(r.get("workflow_runs") or [None])[0]
+        if not run: return {"ok":True,"estado":"nenhuma execução"}
+        return {"ok":True,"estado":run.get("status"),"conclusao":run.get("conclusion"),
+                "em":run.get("run_started_at") or run.get("created_at"),"url":run.get("html_url")}
+    except Exception as e:
+        return {"ok":False,"msg":str(e)[:160]}
 
 # ================= ESTATÍSTICAS (Manutenção) =================
 _ATENDIDOS=("Em execução","Executado","Vistoriado")
