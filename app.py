@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 68
+#  CONTADOR DE REVISÕES DESTE app.py: 69
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -29,7 +29,7 @@ Segredos no Render (Environment):
   Dropbox:  DROPBOX_APP_KEY, DROPBOX_APP_SECRET, DROPBOX_REFRESH_TOKEN, DROPBOX_BASE
   Opcionais: GROQ_MODEL, GEMINI_MODEL, FAT_NOME, FAT_CNPJ
 """
-import os, re, json, subprocess, tempfile, datetime, unicodedata, urllib.parse, urllib.request, urllib.error
+import os, re, io, json, subprocess, tempfile, datetime, unicodedata, urllib.parse, urllib.request, urllib.error
 import google.generativeai as genai
 import dropbox_rateio
 
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 68}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 69}
 
 @app.get("/api/me")
 def api_me(request: Request):
