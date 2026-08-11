@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 66
+#  CONTADOR DE REVISÕES DESTE app.py: 68
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 66}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 68}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2049,27 +2049,24 @@ def _ler_notas_gemini(file_bytes, mime="application/pdf"):
         GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest",
         "gemini-2.5-flash-lite", "gemini-2.0-flash-lite",
     ]))
-    import time as _t
     ultimo=None
-    for nome in candidatos:
+    for nome in candidatos:                  # tenta cada modelo 1x (cotas separadas), sem esperas longas
         if not nome: continue
-        for tent in range(3):               # até 3 tentativas por modelo (backoff no 429)
-            try:
-                model=genai.GenerativeModel(nome)
-                r=model.generate_content([{"mime_type":mime,"data":file_bytes},_ORC_PROMPT],
-                    generation_config={"response_mime_type":"application/json","temperature":0})
-                _ORC_GEMINI_OK=nome
-                try: return (json.loads(r.text) or {}).get("notas") or []
-                except Exception: return []
-            except Exception as e:
-                ultimo=e; m=str(e).lower()
-                if any(s in m for s in ("not available","not found","404","no longer","unsupported","is not supported")):
-                    break              # modelo inexistente → próximo modelo
-                if any(s in m for s in ("429","quota","exceeded","rate limit","resource_exhausted")):
-                    if tent<2: _t.sleep(6*(tent+1)); continue   # espera e tenta de novo
-                    break              # cota estourada nesse modelo → tenta o próximo (cotas separadas)
-                raise                  # chave/rede/outro → propaga
-    raise RuntimeError(f"Gemini indisponível (cota?): {ultimo}")
+        try:
+            model=genai.GenerativeModel(nome)
+            r=model.generate_content([{"mime_type":mime,"data":file_bytes},_ORC_PROMPT],
+                generation_config={"response_mime_type":"application/json","temperature":0})
+            _ORC_GEMINI_OK=nome
+            try: return (json.loads(r.text) or {}).get("notas") or []
+            except Exception: return []
+        except Exception as e:
+            ultimo=e; m=str(e).lower()
+            if any(s in m for s in ("not available","not found","404","no longer","unsupported","is not supported")):
+                continue           # modelo inexistente → próximo
+            if any(s in m for s in ("429","quota","exceeded","rate limit","resource_exhausted")):
+                continue           # cota nesse modelo → tenta o próximo (cotas separadas)
+            raise                  # chave/rede/outro → propaga
+    raise RuntimeError(f"Gemini indisponível: {ultimo}")
 
 FROTAHUB_ROOT = os.environ.get("FROTAHUB_ROOT", "/FROTAHUB")
 def _find_dir(access, base, pattern):
@@ -2246,118 +2243,161 @@ def orc_chamados_xlsx(request: Request, q: str="", aba: str="", status: str="", 
     return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition":'attachment; filename="chamados_trilogo.xlsx"'})
 
+ORC_LOTE     = int(os.environ.get("ORC_LOTE", "10"))     # lê N notas
+ORC_DESCANSO = int(os.environ.get("ORC_DESCANSO", "60"))  # descansa M segundos entre lotes
+_ORC_JOBS = {}   # job_id -> estado/progresso
+_ORC_JOB_SEQ = [0]
+
+def _orc_job_run(job, previa, uid, papel):
+    import time as _t
+    st=_ORC_JOBS[job]
+    try:
+        access=dropbox_rateio.obter_token()
+        _mb=_manut_base(access); _ob=_orc_base(access,_mb)
+        ORC_NOTAS=_pasta_manut(access,0,_ob) or (_ob + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
+        P6=_pasta_manut(access,6,_ob); P7=_pasta_manut(access,7,_ob); P8=_pasta_manut(access,8,_ob)
+        P1=_pasta_manut(access,1,_ob); P9=_pasta_manut(access,9,_ob); P10=_pasta_manut(access,10,_ob)
+        arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
+        def _mime(nm):
+            nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
+        res=st["res"]; _lista=sorted(arqs); st["total"]=len(_lista)
+        for _idx,nome in enumerate(_lista):
+            # lotes: a cada ORC_LOTE notas lidas, descansa ORC_DESCANSO segundos (respeita o limite/min)
+            if _idx and _idx % ORC_LOTE == 0:
+                st["pausa"]=True; st["retoma_em"]=ORC_DESCANSO
+                for _s in range(ORC_DESCANSO):
+                    _t.sleep(1); st["retoma_em"]=ORC_DESCANSO-_s-1
+                st["pausa"]=False
+            ext=os.path.splitext(nome)[1] or ".pdf"; is_pdf=nome.lower().endswith(".pdf")
+            fb=dropbox_rateio.baixar(access,f"{ORC_NOTAS}/{nome}")
+            if not fb: res.append({"arquivo":nome,"status":"erro","motivo":"não baixou"}); st["feitas"]=_idx+1; continue
+            try: notas=_ler_notas_gemini(fb,_mime(nome))
+            except Exception as e:
+                msg=str(e); res.append({"arquivo":nome,"status":"erro","motivo":f"gemini: {msg[:120]}"})
+                if any(s in msg.lower() for s in ("429","quota","exceeded","resource_exhausted","rate limit")):
+                    # cota do Gemini esgotada: as demais notas falhariam igual → aborta o lote já
+                    for resto in _lista[_idx+1:]:
+                        res.append({"arquivo":resto,"status":"pulado","motivo":"cota Gemini esgotada — ative o faturamento e rode de novo"})
+                    st["feitas"]=len(_lista); break
+                st["feitas"]=_idx+1; continue
+            if not notas:
+                info={"arquivo":nome,"status":"pendente","motivo":"não identifiquei nota","destino":"6"}
+                if not previa and P6: dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{P6}/{nome}")
+                res.append(info); st["feitas"]=_idx+1; continue
+            pages=_split_pdf(fb) if (is_pdf and len(notas)>1) else None
+            usou_source=False
+            for i,nt in enumerate(notas):
+                page=pages[i] if (pages and i<len(pages)) else fb
+                ticket=_num_limpo(nt.get("ticket")); nota_num=_num_limpo(nt.get("nota_numero")) or "SN"
+                itens=nt.get("itens") or []
+                valor_nota=0.0
+                for it in itens:
+                    try: valor_nota+=float(it.get("valor_unit") or 0)*float(it.get("quant") or 0)
+                    except Exception: pass
+                valor_nota=round(valor_nota,2); valor_orc=round(valor_nota*1.20,2)
+                info={"arquivo":nome,"ticket":ticket or None,"nota":nota_num,"itens":len(itens),"valor_nota":valor_nota,"valor_orcamento":valor_orc}
+                def _mv_nota(destino_folder, destino_nome):
+                    nonlocal usou_source
+                    if previa or not destino_folder: return
+                    if pages is None:
+                        dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{destino_folder}/{destino_nome}"); usou_source=True
+                    else:
+                        dropbox_rateio.subir_bytes(access,page,f"{destino_folder}/{destino_nome}",overwrite=True)
+                if not ticket:
+                    info.update(status="pendente",motivo="sem ticket",destino="6")
+                    _mv_nota(P6, nome if pages is None else f"{os.path.splitext(nome)[0]}_p{i+1}{ext}")
+                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket","valor_nota":valor_nota,"itens":itens,"criado_por":uid})
+                    res.append(info); continue
+                lj=_loja_do_ticket(ticket)
+                if not lj:
+                    info.update(status="pendente",motivo="ticket não encontrado nos chamados",destino="7")
+                    _mv_nota(P7, nome if pages is None else f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
+                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,"status":"ticket_nao_associado","valor_nota":valor_nota,"itens":itens,"criado_por":uid})
+                    res.append(info); continue
+                loja=lj.get("loja") or {}
+                loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
+                extrap=valor_nota>ORC_EXTRAPOLA
+                slug=_slug_loja(loja,lj.get("unidade"))
+                mes=_mes_da_data(nt.get("data_nota"))
+                info.update(status="ok",loja=loja_nome,loja_numero=(loja.get("numero") if loja else None),extrapolado=extrap,mes=mes)
+                if not previa:
+                    # dados do orçamento
+                    hoje=datetime.date.today().strftime("%d/%m/%Y")
+                    itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
+                    dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
+                        "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Boleto 30 dias"},
+                        "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":(loja.get("cnpj") if loja else None),
+                                   "endereco":(loja.get("endereco") if loja else None),
+                                   "cidade":((loja.get("cidade") if loja else None) or "")+(" - CE" if (loja.get("cidade") if loja else None) else "")},
+                        "itens":itens_orc}
+                    base_nome=f"{slug}_{ticket}_NOTA_{nota_num}"
+                    doc_bytes=gera_orcamento_docx(dados)
+                    arq_pdf=arq_doc=None
+                    try:
+                        if extrap:
+                            if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                        else:
+                            pdf_bytes=gera_orcamento_pdf(dados)
+                            if P1: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P1}/{base_nome}.pdf",overwrite=True)
+                            if P10:
+                                dropbox_rateio.criar_pasta(access,f"{P10}/{mes}"); dropbox_rateio.criar_pasta(access,f"{P10}/{mes}/{slug}")
+                                dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P10}/{mes}/{slug}/{base_nome}.pdf",overwrite=True)
+                                dropbox_rateio.subir_bytes(access,doc_bytes,f"{P10}/{mes}/{slug}/{base_nome}.docx",overwrite=True)
+                                arq_pdf=f"10/{mes}/{slug}/{base_nome}.pdf"; arq_doc=f"10/{mes}/{slug}/{base_nome}.docx"
+                    except Exception as e: info.update(motivo=f"salvar: {str(e)[:90]}")
+                    # nota renomeada -> pasta 8 / <aba>
+                    sub="INSTALACOES" if (lj.get("aba") or "").upper().startswith("INST") else ("CIVIL" if (lj.get("aba") or "").upper().startswith("CIV") else "SEM CLASSIFICACAO")
+                    arq_nota=None
+                    if P8:
+                        dropbox_rateio.criar_pasta(access,f"{P8}/{sub}")
+                        _mv_nota(f"{P8}/{sub}", f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
+                        arq_nota=f"8/{sub}/TICKET_{ticket}_NOTA_{nota_num}{ext}"
+                    _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,
+                        "loja_numero":(loja.get("numero") if loja else None),"loja_nome":loja_nome,"aba":lj.get("aba"),
+                        "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
+                        "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
+                        "arquivo_nota":arq_nota,"arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc,"criado_por":uid})
+                res.append(info)
+            # se dividiu em páginas, remove o arquivo-fonte da pasta 0 (páginas já foram espalhadas)
+            if not previa and pages is not None and not usou_source:
+                try: dropbox_rateio.apagar(access,f"{ORC_NOTAS}/{nome}")
+                except Exception: pass
+            st["feitas"]=_idx+1
+        ok=sum(1 for r in res if r.get("status")=="ok")
+        if not previa: log_frotahub(uid,papel,"GERAR_ORCAMENTOS","GEROU",f"{ok}/{len(res)}")
+        st["gerados"]=ok; st["estado"]="pronto"
+    except Exception as e:
+        st["estado"]="erro"; st["erro"]=str(e)[:300]
+
 @app.post("/orc/gerar")
 async def orc_gerar(request: Request):
     from fastapi import HTTPException
+    import threading
     u,p=exige(request,"GERAR_ORCAMENTOS")
     body={}
     try: body=await request.json()
     except Exception: pass
     previa=bool(body.get("previa"))
     if not GEMINI_API_KEY: raise HTTPException(500,"GEMINI_API_KEY não configurada no Render")
-    access=dropbox_rateio.obter_token()
-    _mb=_manut_base(access); _ob=_orc_base(access,_mb)
-    ORC_NOTAS=_pasta_manut(access,0,_ob) or (_ob + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
-    P6=_pasta_manut(access,6,_ob); P7=_pasta_manut(access,7,_ob); P8=_pasta_manut(access,8,_ob)
-    P1=_pasta_manut(access,1,_ob); P9=_pasta_manut(access,9,_ob); P10=_pasta_manut(access,10,_ob)
-    arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
-    def _mime(nm):
-        nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
-    import time as _t
-    res=[]
-    for _idx,nome in enumerate(sorted(arqs)):
-        if _idx: _t.sleep(2)           # respiro entre notas p/ não estourar limite por minuto
-        ext=os.path.splitext(nome)[1] or ".pdf"; is_pdf=nome.lower().endswith(".pdf")
-        fb=dropbox_rateio.baixar(access,f"{ORC_NOTAS}/{nome}")
-        if not fb: res.append({"arquivo":nome,"status":"erro","motivo":"não baixou"}); continue
-        try: notas=_ler_notas_gemini(fb,_mime(nome))
-        except Exception as e:
-            res.append({"arquivo":nome,"status":"erro","motivo":f"gemini: {str(e)[:120]}"}); continue
-        if not notas:
-            info={"arquivo":nome,"status":"pendente","motivo":"não identifiquei nota","destino":"6"}
-            if not previa and P6: dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{P6}/{nome}")
-            res.append(info); continue
-        pages=_split_pdf(fb) if (is_pdf and len(notas)>1) else None
-        usou_source=False
-        for i,nt in enumerate(notas):
-            page=pages[i] if (pages and i<len(pages)) else fb
-            ticket=_num_limpo(nt.get("ticket")); nota_num=_num_limpo(nt.get("nota_numero")) or "SN"
-            itens=nt.get("itens") or []
-            valor_nota=0.0
-            for it in itens:
-                try: valor_nota+=float(it.get("valor_unit") or 0)*float(it.get("quant") or 0)
-                except Exception: pass
-            valor_nota=round(valor_nota,2); valor_orc=round(valor_nota*1.20,2)
-            info={"arquivo":nome,"ticket":ticket or None,"nota":nota_num,"itens":len(itens),"valor_nota":valor_nota,"valor_orcamento":valor_orc}
-            def _mv_nota(destino_folder, destino_nome):
-                nonlocal usou_source
-                if previa or not destino_folder: return
-                if pages is None:
-                    dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{destino_folder}/{destino_nome}"); usou_source=True
-                else:
-                    dropbox_rateio.subir_bytes(access,page,f"{destino_folder}/{destino_nome}",overwrite=True)
-            if not ticket:
-                info.update(status="pendente",motivo="sem ticket",destino="6")
-                _mv_nota(P6, nome if pages is None else f"{os.path.splitext(nome)[0]}_p{i+1}{ext}")
-                if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket","valor_nota":valor_nota,"itens":itens,"criado_por":u["id"]})
-                res.append(info); continue
-            lj=_loja_do_ticket(ticket)
-            if not lj:
-                info.update(status="pendente",motivo="ticket não encontrado nos chamados",destino="7")
-                _mv_nota(P7, nome if pages is None else f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
-                if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,"status":"ticket_nao_associado","valor_nota":valor_nota,"itens":itens,"criado_por":u["id"]})
-                res.append(info); continue
-            loja=lj.get("loja") or {}
-            loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
-            extrap=valor_nota>ORC_EXTRAPOLA
-            slug=_slug_loja(loja,lj.get("unidade"))
-            mes=_mes_da_data(nt.get("data_nota"))
-            info.update(status="ok",loja=loja_nome,loja_numero=(loja.get("numero") if loja else None),extrapolado=extrap,mes=mes)
-            if not previa:
-                # dados do orçamento
-                hoje=datetime.date.today().strftime("%d/%m/%Y")
-                itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
-                dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
-                    "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Boleto 30 dias"},
-                    "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":(loja.get("cnpj") if loja else None),
-                               "endereco":(loja.get("endereco") if loja else None),
-                               "cidade":((loja.get("cidade") if loja else None) or "")+(" - CE" if (loja.get("cidade") if loja else None) else "")},
-                    "itens":itens_orc}
-                base_nome=f"{slug}_{ticket}_NOTA_{nota_num}"
-                doc_bytes=gera_orcamento_docx(dados)
-                arq_pdf=arq_doc=None
-                try:
-                    if extrap:
-                        if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
-                    else:
-                        pdf_bytes=gera_orcamento_pdf(dados)
-                        if P1: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P1}/{base_nome}.pdf",overwrite=True)
-                        if P10:
-                            dropbox_rateio.criar_pasta(access,f"{P10}/{mes}"); dropbox_rateio.criar_pasta(access,f"{P10}/{mes}/{slug}")
-                            dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P10}/{mes}/{slug}/{base_nome}.pdf",overwrite=True)
-                            dropbox_rateio.subir_bytes(access,doc_bytes,f"{P10}/{mes}/{slug}/{base_nome}.docx",overwrite=True)
-                            arq_pdf=f"10/{mes}/{slug}/{base_nome}.pdf"; arq_doc=f"10/{mes}/{slug}/{base_nome}.docx"
-                except Exception as e: info.update(motivo=f"salvar: {str(e)[:90]}")
-                # nota renomeada -> pasta 8 / <aba>
-                sub="INSTALACOES" if (lj.get("aba") or "").upper().startswith("INST") else ("CIVIL" if (lj.get("aba") or "").upper().startswith("CIV") else "SEM CLASSIFICACAO")
-                arq_nota=None
-                if P8:
-                    dropbox_rateio.criar_pasta(access,f"{P8}/{sub}")
-                    _mv_nota(f"{P8}/{sub}", f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
-                    arq_nota=f"8/{sub}/TICKET_{ticket}_NOTA_{nota_num}{ext}"
-                _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,
-                    "loja_numero":(loja.get("numero") if loja else None),"loja_nome":loja_nome,"aba":lj.get("aba"),
-                    "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
-                    "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
-                    "arquivo_nota":arq_nota,"arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc,"criado_por":u["id"]})
-            res.append(info)
-        # se dividiu em páginas, remove o arquivo-fonte da pasta 0 (páginas já foram espalhadas)
-        if not previa and pages is not None and not usou_source:
-            try: dropbox_rateio.apagar(access,f"{ORC_NOTAS}/{nome}")
-            except Exception: pass
-    ok=sum(1 for r in res if r.get("status")=="ok")
-    if not previa: log_frotahub(u["id"],p["papel"],"GERAR_ORCAMENTOS","GEROU",f"{ok}/{len(res)}")
-    return {"previa":previa,"resultados":res,"gerados":ok,"total":len(res)}
+    # limpa jobs antigos (evita crescer sem fim)
+    if len(_ORC_JOBS)>20:
+        for k in list(_ORC_JOBS)[:-10]: _ORC_JOBS.pop(k,None)
+    _ORC_JOB_SEQ[0]+=1; job=str(_ORC_JOB_SEQ[0])
+    _ORC_JOBS[job]={"estado":"rodando","previa":previa,"total":0,"feitas":0,"gerados":0,
+                    "res":[],"pausa":False,"retoma_em":0,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
+    t=threading.Thread(target=_orc_job_run,args=(job,previa,u["id"],p["papel"]),daemon=True); t.start()
+    return {"job":job,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
+
+@app.get("/orc/gerar_status")
+def orc_gerar_status(request: Request, job: str=""):
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS")
+    j=_ORC_JOBS.get(job)
+    if not j: raise HTTPException(404,"job não encontrado (o motor pode ter reiniciado)")
+    return {"estado":j["estado"],"previa":j["previa"],"total":j["total"],"feitas":j["feitas"],
+            "gerados":j["gerados"],"pausa":j["pausa"],"retoma_em":j["retoma_em"],
+            "lote":j["lote"],"descanso":j["descanso"],"erro":j.get("erro"),
+            "resultados":j["res"] if j["estado"]!="rodando" else j["res"][-1:]}
 
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
