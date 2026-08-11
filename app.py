@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 69
+#  CONTADOR DE REVISÕES DESTE app.py: 71
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 69}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 71}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1025,7 +1025,15 @@ def corrige_oc_inplace(pdf_bytes, campos):
     """Cobre o valor ERRADO e escreve o CERTO no mesmo lugar (sem banner) — deixa a O.C. com
     aparência de original. campos: cnpj_centro_custo, fornecedor, cnpj_fornecedor, endereco_fornecedor.
     Retorna bytes do PDF corrigido, ou None se o layout não bater (aí o chamador usa o original)."""
+    try:
+        return _corrige_oc_inplace(pdf_bytes, campos)
+    except Exception as e:
+        print("corrige_oc_inplace falhou (usa original):", str(e)[:160], flush=True)
+        return None   # qualquer erro (PdfReader/pypdf/reportlab) -> cai no PDF original, nunca quebra
+
+def _corrige_oc_inplace(pdf_bytes, campos):
     import io as _io
+    from pypdf import PdfReader, PdfWriter
     from reportlab.pdfgen import canvas as _cv
     from reportlab.lib.colors import white as _wh, black as _bk
     try:
@@ -1900,6 +1908,8 @@ def _mes_da_data(s):
     if iso:
         y,mo,_=iso.split("-"); return f"{_MESES[int(mo)-1]} {y}"
     h=datetime.date.today(); return f"{_MESES[h.month-1]} {h.year}"
+def _mes_atual():
+    h=datetime.date.today(); return f"{_MESES[h.month-1]} {h.year}"
 
 _EU=["zero","um","dois","três","quatro","cinco","seis","sete","oito","nove","dez","onze","doze","treze","quatorze","quinze","dezesseis","dezessete","dezoito","dezenove"]
 _ED=["","","vinte","trinta","quarenta","cinquenta","sessenta","setenta","oitenta","noventa"]
@@ -2318,14 +2328,14 @@ def _orc_job_run(job, previa, uid, papel):
                 loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
                 extrap=valor_nota>ORC_EXTRAPOLA
                 slug=_slug_loja(loja,lj.get("unidade"))
-                mes=_mes_da_data(nt.get("data_nota"))
+                mes=_mes_atual()   # roteia pelo mês em que o orçamento é GERADO (não pela data da nota/DAV)
                 info.update(status="ok",loja=loja_nome,loja_numero=(loja.get("numero") if loja else None),extrapolado=extrap,mes=mes)
                 if not previa:
                     # dados do orçamento
                     hoje=datetime.date.today().strftime("%d/%m/%Y")
                     itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
                     dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
-                        "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Boleto 30 dias"},
+                        "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
                         "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":(loja.get("cnpj") if loja else None),
                                    "endereco":(loja.get("endereco") if loja else None),
                                    "cidade":((loja.get("cidade") if loja else None) or "")+(" - CE" if (loja.get("cidade") if loja else None) else "")},
