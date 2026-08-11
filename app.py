@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 74
+#  CONTADOR DE REVISÕES DESTE app.py: 75
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -857,7 +857,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 74}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 75}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2353,26 +2353,26 @@ async def orc_agendador_exec(request: Request):
     return {"ok":True,"itens":res}
 
 # ================= ESTATÍSTICAS (Manutenção) =================
-_ATENDIDOS=("Em execução","Executado","Vistoriado")
+# "atendidos" = apenas Executado + Vistoriado (aberto/em execução NÃO contam)
+_ATENDIDOS=("Executado","Vistoriado")
 def _numf(x):
     try: return float(x or 0)
     except Exception: return 0.0
 def _reais(v): return "R$ "+f"{_numf(v):,.2f}".replace(",","·").replace(".",",").replace("·",".")
 
 def _stat_chamados(q="",aba="",desde="",ate=""):
-    rows=_chamados_query(q,aba,"",desde,ate)
-    ORD=["Aberto","Em execução","Executado","Vistoriado"]
-    por_status={s:0 for s in ORD}; por_aba={"Civil":0,"Instalações":0}; por_loja={}; por_tipo={}
+    # só chamados ATENDIDOS (Executado/Vistoriado) entram nas estatísticas
+    rows=[r for r in _chamados_query(q,aba,"",desde,ate) if (r.get("status") in _ATENDIDOS)]
+    por_status={"Executado":0,"Vistoriado":0}; por_aba={"Civil":0,"Instalações":0}; por_loja={}; por_tipo={}
     for r in rows:
         s=r.get("status") or "—"; por_status[s]=por_status.get(s,0)+1
         ab=_abacurta(r.get("aba"))
         if ab in por_aba: por_aba[ab]+=1
         lj=r.get("loja") or "—"; por_loja[lj]=por_loja.get(lj,0)+1
         tp=r.get("tipo_predial") or "—"; por_tipo[tp]=por_tipo.get(tp,0)+1
-    atend=sum(por_status.get(s,0) for s in _ATENDIDOS)
     lojas=sorted(({"loja":k,"total":v} for k,v in por_loja.items()),key=lambda x:-x["total"])
     tipos=sorted(({"tipo":k,"total":v} for k,v in por_tipo.items()),key=lambda x:-x["total"])
-    return {"total":len(rows),"atendidos":atend,"por_status":por_status,"por_aba":por_aba,"por_loja":lojas,"por_tipo":tipos}
+    return {"total":len(rows),"atendidos":len(rows),"por_status":por_status,"por_aba":por_aba,"por_loja":lojas,"por_tipo":tipos}
 
 @app.get("/orc/stat_chamados")
 def orc_stat_chamados(request: Request, q: str="", aba: str="", desde: str="", ate: str=""):
@@ -2388,8 +2388,7 @@ def orc_stat_chamados_pdf(request: Request, q: str="", aba: str="", desde: str="
     d=_stat_chamados(q,aba,desde,ate)
     linhas=[[l["loja"][:34], str(l["total"])] for l in d["por_loja"]]
     sub=(f"{_abacurta(aba)} · " if aba else "")+(f"{desde}→{ate}" if (desde or ate) else "")
-    resumo=(f"Total {d['total']} · Atendidos {d['atendidos']} · "
-            f"Aberto {d['por_status'].get('Aberto',0)} · Em execução {d['por_status'].get('Em execução',0)} · "
+    resumo=(f"Atendidos {d['atendidos']} · "
             f"Executado {d['por_status'].get('Executado',0)} · Vistoriado {d['por_status'].get('Vistoriado',0)}")
     pdf=_lista_pdf("Estatística — Chamados atendidos", ["Loja","Chamados"], linhas,
                    subtitulo=resumo+(f"  |  {sub}" if sub else ""), aligns={1:'RIGHT'})
@@ -2464,6 +2463,8 @@ def _orc_job_run(job, previa, uid, papel):
         def _mime(nm):
             nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
         res=st["res"]; _lista=sorted(arqs); st["total"]=len(_lista)
+        if not _lista:                     # pasta vazia -> não é erro, só não processa nada
+            st["estado"]="pronto"; st["gerados"]=0; st["vazio"]=True; return
         for _idx,nome in enumerate(_lista):
             # lotes: a cada ORC_LOTE notas lidas, descansa ORC_DESCANSO segundos (respeita o limite/min)
             if _idx and _idx % ORC_LOTE == 0:
