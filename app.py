@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 71
+#  CONTADOR DE REVISÕES DESTE app.py: 72
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 71}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 72}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2252,6 +2252,100 @@ def orc_chamados_xlsx(request: Request, q: str="", aba: str="", status: str="", 
     buf=io.BytesIO(); wb.save(buf)
     return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition":'attachment; filename="chamados_trilogo.xlsx"'})
+
+# ================= ESTATÍSTICAS (Manutenção) =================
+_ATENDIDOS=("Em execução","Executado","Vistoriado")
+def _numf(x):
+    try: return float(x or 0)
+    except Exception: return 0.0
+def _reais(v): return "R$ "+f"{_numf(v):,.2f}".replace(",","·").replace(".",",").replace("·",".")
+
+def _stat_chamados(q="",aba="",desde="",ate=""):
+    rows=_chamados_query(q,aba,"",desde,ate)
+    ORD=["Aberto","Em execução","Executado","Vistoriado"]
+    por_status={s:0 for s in ORD}; por_aba={"Civil":0,"Instalações":0}; por_loja={}; por_tipo={}
+    for r in rows:
+        s=r.get("status") or "—"; por_status[s]=por_status.get(s,0)+1
+        ab=_abacurta(r.get("aba"))
+        if ab in por_aba: por_aba[ab]+=1
+        lj=r.get("loja") or "—"; por_loja[lj]=por_loja.get(lj,0)+1
+        tp=r.get("tipo_predial") or "—"; por_tipo[tp]=por_tipo.get(tp,0)+1
+    atend=sum(por_status.get(s,0) for s in _ATENDIDOS)
+    lojas=sorted(({"loja":k,"total":v} for k,v in por_loja.items()),key=lambda x:-x["total"])
+    tipos=sorted(({"tipo":k,"total":v} for k,v in por_tipo.items()),key=lambda x:-x["total"])
+    return {"total":len(rows),"atendidos":atend,"por_status":por_status,"por_aba":por_aba,"por_loja":lojas,"por_tipo":tipos}
+
+@app.get("/orc/stat_chamados")
+def orc_stat_chamados(request: Request, q: str="", aba: str="", desde: str="", ate: str=""):
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_ATENDIDOS")
+    try: return _stat_chamados(q,aba,desde,ate)
+    except Exception as e: raise HTTPException(500,f"stat: {e}")
+
+@app.get("/orc/stat_chamados_pdf")
+def orc_stat_chamados_pdf(request: Request, q: str="", aba: str="", desde: str="", ate: str=""):
+    from fastapi import HTTPException
+    exige(request,"CHAMADOS_ATENDIDOS")
+    d=_stat_chamados(q,aba,desde,ate)
+    linhas=[[l["loja"][:34], str(l["total"])] for l in d["por_loja"]]
+    sub=(f"{_abacurta(aba)} · " if aba else "")+(f"{desde}→{ate}" if (desde or ate) else "")
+    resumo=(f"Total {d['total']} · Atendidos {d['atendidos']} · "
+            f"Aberto {d['por_status'].get('Aberto',0)} · Em execução {d['por_status'].get('Em execução',0)} · "
+            f"Executado {d['por_status'].get('Executado',0)} · Vistoriado {d['por_status'].get('Vistoriado',0)}")
+    pdf=_lista_pdf("Estatística — Chamados atendidos", ["Loja","Chamados"], linhas,
+                   subtitulo=resumo+(f"  |  {sub}" if sub else ""), aligns={1:'RIGHT'})
+    return Response(content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition":'attachment; filename="estatistica_chamados.pdf"'})
+
+def _stat_financeiro(aba="",desde="",ate="",mes="",loja=""):
+    parts=["select=ticket,loja_nome,aba,valor_nota,valor_orcamento,mes_ref,extrapolado",
+           "status=eq.gerado","limit=5000"]
+    if aba:  parts.append(f"aba=eq.{urllib.parse.quote(aba)}")
+    if mes:  parts.append(f"mes_ref=eq.{urllib.parse.quote(mes)}")
+    if desde:parts.append(f"criado_em=gte.{desde}")
+    if ate:  parts.append(f"criado_em=lte.{ate}T23:59:59")
+    if loja and len(loja)>=3: parts.append("loja_nome=ilike.*"+urllib.parse.quote(loja)+"*")
+    notas=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(parts),SB_KEY) or []
+    tickets=set(); v_orc=0.0; v_nota=0.0; por_loja={}; por_aba={"Civil":{"n":0,"orc":0.0},"Instalações":{"n":0,"orc":0.0}}; por_mes={}
+    for r in notas:
+        t=r.get("ticket")
+        if t: tickets.add(str(t))
+        vo=_numf(r.get("valor_orcamento")); vn=_numf(r.get("valor_nota")); v_orc+=vo; v_nota+=vn
+        lj=r.get("loja_nome") or "—"; dd=por_loja.setdefault(lj,{"n":0,"orc":0.0,"nota":0.0}); dd["n"]+=1; dd["orc"]+=vo; dd["nota"]+=vn
+        ab=_abacurta(r.get("aba"))
+        if ab in por_aba: por_aba[ab]["orc"]+=vo; por_aba[ab]["n"]+=1
+        mr=r.get("mes_ref") or "—"; mm=por_mes.setdefault(mr,{"n":0,"orc":0.0}); mm["n"]+=1; mm["orc"]+=vo
+    try: ch=_chamados_query("",aba,"",desde,ate)
+    except Exception: ch=[]
+    n_atend=sum(1 for c in ch if (c.get("status") in _ATENDIDOS))
+    com_mat=len(tickets)
+    lojas=sorted(({"loja":k,**v} for k,v in por_loja.items()),key=lambda x:-x["orc"])
+    meses=[{"mes":k,**v} for k,v in por_mes.items()]
+    return {"orcamentos":len(notas),"com_material":com_mat,"valor_orcamento":round(v_orc,2),
+            "valor_nota":round(v_nota,2),"margem":round(v_orc-v_nota,2),"chamados_atendidos":n_atend,
+            "pct_material":(round(com_mat*100.0/n_atend,1) if n_atend else None),
+            "por_aba":por_aba,"por_loja":lojas,"por_mes":meses}
+
+@app.get("/orc/stat_financeiro")
+def orc_stat_financeiro(request: Request, aba: str="", desde: str="", ate: str="", mes: str="", loja: str=""):
+    from fastapi import HTTPException
+    exige(request,"FINANCEIRO_MATERIAIS")
+    try: return _stat_financeiro(aba,desde,ate,mes,loja)
+    except Exception as e: raise HTTPException(500,f"stat: {e}")
+
+@app.get("/orc/stat_financeiro_pdf")
+def orc_stat_financeiro_pdf(request: Request, aba: str="", desde: str="", ate: str="", mes: str="", loja: str=""):
+    from fastapi import HTTPException
+    exige(request,"FINANCEIRO_MATERIAIS")
+    d=_stat_financeiro(aba,desde,ate,mes,loja)
+    linhas=[[l["loja"][:30], str(l["n"]), _reais(l["orc"]), _reais(l.get("nota",0))] for l in d["por_loja"]]
+    sub=(f"{_abacurta(aba)} · " if aba else "")+(mes+" · " if mes else "")+(f"{desde}→{ate}" if (desde or ate) else "")
+    resumo=(f"Orçamentos {d['orcamentos']} · Chamados c/ material {d['com_material']} · "
+            f"Valor orçamentos {_reais(d['valor_orcamento'])} · Notas {_reais(d['valor_nota'])} · Margem {_reais(d['margem'])}")
+    pdf=_lista_pdf("Estatística — Financeiro de materiais", ["Loja","Qtd","Orçamentos","Notas"], linhas,
+                   subtitulo=resumo+(f"  |  {sub}" if sub else ""), aligns={1:'RIGHT',2:'RIGHT',3:'RIGHT'})
+    return Response(content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition":'attachment; filename="estatistica_financeiro.pdf"'})
 
 ORC_LOTE     = int(os.environ.get("ORC_LOTE", "10"))     # lê N notas
 ORC_DESCANSO = int(os.environ.get("ORC_DESCANSO", "60"))  # descansa M segundos entre lotes
