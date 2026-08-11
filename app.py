@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 73
+#  CONTADOR DE REVISÕES DESTE app.py: 74
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -54,6 +54,8 @@ GH_TOKEN    = os.environ.get("GITHUB_TOKEN", "") or os.environ.get("GH_TOKEN", "
 GH_REPO     = os.environ.get("GH_REPO", "")                     # ex.: "usuario/trilogo_robo"
 GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "trilogo-chamados.yml")
 GH_REF      = os.environ.get("GH_REF", "main")
+# segredo compartilhado com o Supabase (pg_cron/pg_net) para o agendador
+AGENDADOR_SECRET = os.environ.get("AGENDADOR_SECRET", "")
 # base do PCO no Dropbox (novo layout FROTAHUB)
 PCO_BASE = os.environ.get("PCO_BASE", "/FROTAHUB/1 - ADMINISTRATIVO/1 - PCO")
 # --- ENVIAR_PCO: SMTP + destinatários (padrão = TESTE p/ igor@; trocar por env p/ ir ao ar) ---
@@ -855,7 +857,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 73}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 74}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2307,6 +2309,48 @@ def orc_trilogo_status(request: Request):
                 "em":run.get("run_started_at") or run.get("created_at"),"url":run.get("html_url")}
     except Exception as e:
         return {"ok":False,"msg":str(e)[:160]}
+
+# ================= AGENDADOR (executor chamado pelo Supabase pg_cron) =================
+def _ag_log(ag_id, rotina, status, detalhe=""):
+    try:
+        _sb_json(f"{SB_URL}/rest/v1/agendamento_exec", SB_KEY,
+                 data={"agendamento_id":ag_id,"rotina":rotina,"status":status,"detalhe":str(detalhe)[:400]},
+                 method="POST")
+    except Exception: pass
+
+def _run_rotina_auto(rotina):
+    """Executa uma rotina de forma automática (sem UI). Só as automatizáveis; as demais levantam erro."""
+    if rotina=="CHAMADOS_TRILOGO":
+        _github_dispatch("rotina"); return "robô do Trílogo disparado"
+    if rotina=="GERAR_ORCAMENTOS":
+        import threading
+        _ORC_JOB_SEQ[0]+=1; job=str(_ORC_JOB_SEQ[0])
+        _ORC_JOBS[job]={"estado":"rodando","previa":False,"total":0,"feitas":0,"gerados":0,
+                        "res":[],"pausa":False,"retoma_em":0,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
+        threading.Thread(target=_orc_job_run,args=(job,False,None,"agendador"),daemon=True).start()
+        return f"geração de orçamentos iniciada (job {job})"
+    raise RuntimeError(f"rotina '{rotina}' ainda não é automatizável")
+
+@app.post("/orc/agendador_exec")
+async def orc_agendador_exec(request: Request):
+    """Chamado pelo Supabase (pg_cron/pg_net). Executa a fila de rotinas do agendamento."""
+    from fastapi import HTTPException
+    if not AGENDADOR_SECRET or request.headers.get("x-agendador-secret","")!=AGENDADOR_SECRET:
+        raise HTTPException(401,"não autorizado")
+    body={}
+    try: body=await request.json()
+    except Exception: pass
+    ag_id=body.get("agendamento_id")
+    if not ag_id: raise HTTPException(400,"agendamento_id ausente")
+    itens=_sb_json(f"{SB_URL}/rest/v1/agendamento_itens?agendamento_id=eq.{urllib.parse.quote(str(ag_id))}&order=ordem&select=rotina,ordem",SB_KEY) or []
+    res=[]
+    for it in itens:
+        rot=it.get("rotina")
+        try:
+            det=_run_rotina_auto(rot); _ag_log(ag_id,rot,"ok",det); res.append({"rotina":rot,"ok":True,"detalhe":det})
+        except Exception as e:
+            _ag_log(ag_id,rot,"erro",str(e)[:200]); res.append({"rotina":rot,"ok":False,"erro":str(e)[:200]})
+    return {"ok":True,"itens":res}
 
 # ================= ESTATÍSTICAS (Manutenção) =================
 _ATENDIDOS=("Em execução","Executado","Vistoriado")
