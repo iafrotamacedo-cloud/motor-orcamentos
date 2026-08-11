@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 75
+#  CONTADOR DE REVISÕES DESTE app.py: 76
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -706,17 +706,24 @@ def auth_user(tok):
     except Exception: return None
 
 def perfil_de(uid):
-    q=urllib.parse.urlencode({"id":f"eq.{uid}","select":"papel,nome,ativo","limit":"1"})
+    q=urllib.parse.urlencode({"id":f"eq.{uid}",
+        "select":"papel,nome,ativo,categoria_id,primeiro_acesso,must_change_pw,usuario,nome_completo,categorias(nivel)",
+        "limit":"1"})
     try:
         d=_sb_json(f"{SB_URL}/rest/v1/perfis?{q}", SB_KEY)
-        return d[0] if d else None
+        if not d: return None
+        r=d[0]; cat=r.get("categorias")
+        r["nivel"]=(cat.get("nivel") if isinstance(cat,dict) else None) or ("builder" if r.get("papel")=="builder" else ("gerente" if r.get("papel")=="gerente" else "comum"))
+        return r
     except Exception: return None
 
-def pode_rotina(papel, rotina):
-    if papel=="builder": return True
-    q=urllib.parse.urlencode({"papel":f"eq.{papel}","rotina":f"eq.{rotina}","pode":"is.true","select":"rotina","limit":"1"})
+def pode_rotina(perfil, rotina):
+    nivel=(perfil or {}).get("nivel") or ("builder" if (perfil or {}).get("papel")=="builder" else "comum")
+    if nivel in ("builder","gerente"): return True   # gerente também tem acesso pleno às rotinas
+    cat=(perfil or {}).get("categoria_id") or (perfil or {}).get("papel")
+    q=urllib.parse.urlencode({"categoria_id":f"eq.{cat}","rotina":f"eq.{rotina}","pode":"is.true","select":"rotina","limit":"1"})
     try:
-        return bool(_sb_json(f"{SB_URL}/rest/v1/permissoes?{q}", SB_KEY))
+        return bool(_sb_json(f"{SB_URL}/rest/v1/categoria_permissoes?{q}", SB_KEY))
     except Exception: return False
 
 def exige(request, rotina):
@@ -726,7 +733,7 @@ def exige(request, rotina):
     if not u or not u.get("id"): raise HTTPException(401, "não autenticado")
     p=perfil_de(u["id"])
     if not p or p.get("ativo") is False: raise HTTPException(403, "usuário sem perfil ativo")
-    if not pode_rotina(p["papel"], rotina): raise HTTPException(403, f"sem permissão para {rotina}")
+    if not pode_rotina(p, rotina): raise HTTPException(403, f"sem permissão para {rotina}")
     return u, p
 
 def log_frotahub(uid, papel, rotina, acao, alvo="", detalhe=None):
@@ -857,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 75}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 76}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2603,6 +2610,272 @@ def orc_gerar_status(request: Request, job: str=""):
             "lote":j["lote"],"descanso":j["descanso"],"erro":j.get("erro"),
             "resultados":j["res"] if j["estado"]!="rodando" else j["res"][-1:]}
 
+# ================= USUÁRIOS / LOGINS / CATEGORIAS / PIN =================
+import hashlib
+PIN_PEPPER  = os.environ.get("PIN_PEPPER", "frotahub-pin-v1")
+USUARIO_DOM = os.environ.get("USUARIO_DOMINIO", "frotahub.local")
+
+def _pin_hash(uid, pin): return hashlib.sha256(f"{PIN_PEPPER}:{uid}:{pin}".encode()).hexdigest()
+def _slug(s):
+    s=unicodedata.normalize("NFKD",s or "").encode("ascii","ignore").decode().lower()
+    s=re.sub(r"[^a-z0-9]+","_",s).strip("_"); return s or "cat"
+def _usuario_email(usuario):
+    u=(usuario or "").strip()
+    return u if "@" in u else (re.sub(r"\s+","",u.lower())+"@"+USUARIO_DOM)
+
+def _sb_write(path, data, method="POST", prefer="return=minimal"):
+    url=f"{SB_URL}/rest/v1/{path}"
+    hdrs={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","content-type":"application/json","prefer":prefer}
+    req=urllib.request.Request(url,data=json.dumps(data).encode(),headers=hdrs,method=method)
+    with urllib.request.urlopen(req,timeout=30) as r:
+        b=r.read().decode(); return json.loads(b) if b else None
+
+def _sb_admin(path, data=None, method="GET"):
+    url=f"{SB_URL}/auth/v1{path}"
+    hdrs={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}"}
+    if data is not None: hdrs["content-type"]="application/json"
+    req=urllib.request.Request(url,data=(json.dumps(data).encode() if data is not None else None),headers=hdrs,method=method)
+    with urllib.request.urlopen(req,timeout=30) as r:
+        b=r.read().decode(); return json.loads(b) if b else None
+
+def _verifica_senha(email, senha):
+    if not email or not senha: return False
+    try:
+        _sb_json(f"{SB_URL}/auth/v1/token?grant_type=password", SB_ANON,
+                 data={"email":email,"password":senha}, method="POST"); return True
+    except Exception: return False
+
+def _pin_do(uid):
+    d=_sb_json(f"{SB_URL}/rest/v1/perfis?id=eq.{uid}&select=pin_hash&limit=1",SB_KEY) or []
+    return d[0].get("pin_hash") if d else None
+def _verifica_pin(uid, nivel, pin):
+    pin=str(pin or "").strip()
+    if not pin: return False
+    ph=_pin_do(uid)
+    if not ph: return nivel=="builder" and pin=="1234"   # PIN inicial do builder
+    return _pin_hash(uid,pin)==ph
+
+def _exige_gestor(request):
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request))
+    if not u or not u.get("id"): raise HTTPException(401,"não autenticado")
+    p=perfil_de(u["id"])
+    if not p or p.get("ativo") is False: raise HTTPException(403,"sem perfil ativo")
+    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
+    return u,p
+
+def _nivel_categoria(cat_id):
+    c=_sb_json(f"{SB_URL}/rest/v1/categorias?id=eq.{urllib.parse.quote(str(cat_id))}&select=nivel,protegida&limit=1",SB_KEY) or []
+    return (c[0] if c else {"nivel":"comum","protegida":False})
+
+@app.get("/usuarios/listar")
+def usuarios_listar(request: Request):
+    _exige_gestor(request)
+    rows=_sb_json(f"{SB_URL}/rest/v1/perfis?select=id,usuario,nome,nome_completo,cpf,ativo,categoria_id,primeiro_acesso,must_change_pw,categorias(nivel,nome)&order=usuario",SB_KEY) or []
+    for r in rows:
+        c=r.get("categorias") or {}; r["nivel"]=c.get("nivel"); r["categoria_nome"]=c.get("nome"); r.pop("categorias",None)
+    return {"itens":rows}
+
+@app.post("/usuarios/criar")
+async def usuarios_criar(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    usuario=(b.get("usuario") or "").strip(); senha=b.get("senha") or ""; cat=(b.get("categoria_id") or "").strip()
+    nome=(b.get("nome_completo") or "").strip()
+    if not (usuario and senha and cat): raise HTTPException(400,"usuário, senha e categoria são obrigatórios")
+    if len(senha)<6: raise HTTPException(400,"senha muito curta (mín. 6)")
+    nc=_nivel_categoria(cat); niv=nc.get("nivel")
+    if niv in ("builder","gerente") and p.get("nivel")!="builder":
+        raise HTTPException(403,"apenas o builder cria/edita logins builder ou gerente")
+    papel={"builder":"builder","gerente":"gerente"}.get(niv,"administrativo")
+    try:
+        novo=_sb_admin("/admin/users", {"email":_usuario_email(usuario),"password":senha,"email_confirm":True}, "POST")
+    except urllib.error.HTTPError as e:
+        raise HTTPException(400,f"criar usuário: {e.read().decode()[:180]}")
+    uid=novo.get("id")
+    try:
+        _sb_write("perfis", {"id":uid,"usuario":usuario,"nome":nome or usuario,"nome_completo":nome or None,
+            "papel":papel,"categoria_id":cat,"ativo":True,"must_change_pw":True,"primeiro_acesso":True})
+    except Exception as e:
+        try: _sb_admin(f"/admin/users/{uid}", method="DELETE")   # desfaz se o perfil falhar
+        except Exception: pass
+        raise HTTPException(400,f"criar perfil: {str(e)[:180]}")
+    log_frotahub(u["id"],p.get("papel"),"CONFIG_USUARIOS","CRIOU_LOGIN",usuario)
+    return {"ok":True,"id":uid,"login":_usuario_email(usuario)}
+
+@app.post("/usuarios/editar")
+async def usuarios_editar(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    uid=b.get("id");  alvo=_sb_json(f"{SB_URL}/rest/v1/perfis?id=eq.{uid}&select=categoria_id,categorias(nivel)&limit=1",SB_KEY) or []
+    if not alvo: raise HTTPException(404,"login não encontrado")
+    niv_alvo=(alvo[0].get("categorias") or {}).get("nivel")
+    if niv_alvo in ("builder","gerente") and p.get("nivel")!="builder": raise HTTPException(403,"apenas o builder edita builder/gerente")
+    patch={}
+    for k in ("usuario","nome_completo","cpf","categoria_id","ativo"):
+        if k in b and b[k] is not None: patch[k]=b[k]
+    if "nome_completo" in patch: patch["nome"]=patch["nome_completo"]
+    if patch.get("categoria_id"):
+        nc=_nivel_categoria(patch["categoria_id"])
+        if nc.get("nivel") in ("builder","gerente") and p.get("nivel")!="builder": raise HTTPException(403,"só o builder promove a builder/gerente")
+        patch["papel"]={"builder":"builder","gerente":"gerente"}.get(nc.get("nivel"),"administrativo")
+    if patch: _sb_write(f"perfis?id=eq.{uid}", patch, "PATCH")
+    log_frotahub(u["id"],p.get("papel"),"CONFIG_USUARIOS","EDITOU_LOGIN",str(uid))
+    return {"ok":True}
+
+@app.post("/usuarios/excluir")
+async def usuarios_excluir(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    uid=b.get("id")
+    alvo=_sb_json(f"{SB_URL}/rest/v1/perfis?id=eq.{uid}&select=usuario,categorias(nivel)&limit=1",SB_KEY) or []
+    if not alvo: raise HTTPException(404,"login não encontrado")
+    niv=(alvo[0].get("categorias") or {}).get("nivel")
+    if niv=="builder": raise HTTPException(403,"o login builder não pode ser excluído")
+    if niv=="gerente" and p.get("nivel")!="builder": raise HTTPException(403,"apenas o builder exclui gerentes")
+    try: _sb_admin(f"/admin/users/{uid}", method="DELETE")   # perfil cai por cascade (FK on delete cascade)
+    except urllib.error.HTTPError as e: raise HTTPException(400,f"excluir: {e.read().decode()[:160]}")
+    log_frotahub(u["id"],p.get("papel"),"CONFIG_USUARIOS","EXCLUIU_LOGIN",alvo[0].get("usuario") or str(uid))
+    return {"ok":True}
+
+@app.post("/usuarios/reset_senha")
+async def usuarios_reset_senha(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    uid=b.get("id"); nova=b.get("nova_senha") or ""
+    if len(nova)<6: raise HTTPException(400,"senha muito curta (mín. 6)")
+    alvo=_sb_json(f"{SB_URL}/rest/v1/perfis?id=eq.{uid}&select=categorias(nivel)&limit=1",SB_KEY) or []
+    if not alvo: raise HTTPException(404,"login não encontrado")
+    if (alvo[0].get("categorias") or {}).get("nivel")=="gerente" and p.get("nivel")!="builder":
+        raise HTTPException(403,"apenas o builder reseta senha de gerente")
+    try: _sb_admin(f"/admin/users/{uid}", {"password":nova}, "PUT")
+    except urllib.error.HTTPError as e: raise HTTPException(400,f"reset: {e.read().decode()[:160]}")
+    _sb_write(f"perfis?id=eq.{uid}", {"must_change_pw":True}, "PATCH")
+    log_frotahub(u["id"],p.get("papel"),"CONFIG_USUARIOS","RESETOU_SENHA",str(uid))
+    return {"ok":True}
+
+@app.post("/usuarios/primeiro_acesso")
+async def usuarios_primeiro_acesso(request: Request):
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request))
+    if not u or not u.get("id"): raise HTTPException(401,"não autenticado")
+    b=await request.json()
+    pin=str(b.get("pin") or "").strip()
+    if len(pin)!=4 or not pin.isdigit(): raise HTTPException(400,"o PIN deve ter 4 dígitos")
+    nome=(b.get("nome_completo") or "").strip(); cpf=(b.get("cpf") or "").strip()
+    if not nome: raise HTTPException(400,"informe o nome completo")
+    _sb_write(f"perfis?id=eq.{u['id']}", {"nome_completo":nome,"nome":nome,"cpf":cpf or None,
+        "pin_hash":_pin_hash(u["id"],pin),"primeiro_acesso":False,"must_change_pw":False}, "PATCH")
+    return {"ok":True}
+
+@app.post("/usuarios/senha_trocada")
+async def usuarios_senha_trocada(request: Request):
+    """Chamado após o usuário trocar a senha no 1º acesso/reset (limpa a flag)."""
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request))
+    if not u or not u.get("id"): raise HTTPException(401,"não autenticado")
+    _sb_write(f"perfis?id=eq.{u['id']}", {"must_change_pw":False}, "PATCH")
+    return {"ok":True}
+
+@app.post("/usuarios/mudar_pin")
+async def usuarios_mudar_pin(request: Request):
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request));  p=perfil_de(u["id"]) if u else None
+    if not u or not p: raise HTTPException(401,"não autenticado")
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin_atual")): raise HTTPException(403,"PIN atual incorreto")
+    novo=str(b.get("pin_novo") or "").strip()
+    if len(novo)!=4 or not novo.isdigit(): raise HTTPException(400,"o novo PIN deve ter 4 dígitos")
+    _sb_write(f"perfis?id=eq.{u['id']}", {"pin_hash":_pin_hash(u["id"],novo)}, "PATCH")
+    return {"ok":True}
+
+@app.post("/usuarios/verifica_pin")
+async def usuarios_verifica_pin(request: Request):
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request));  p=perfil_de(u["id"]) if u else None
+    if not u or not p: raise HTTPException(401,"não autenticado")
+    b=await request.json()
+    return {"ok": _verifica_pin(u["id"], p.get("nivel"), b.get("pin"))}
+
+# ---- categorias e matriz de permissões ----
+@app.get("/config/categorias")
+def config_categorias(request: Request):
+    _exige_gestor(request)
+    cats=_sb_json(f"{SB_URL}/rest/v1/categorias?select=id,nome,nivel,protegida&order=nome",SB_KEY) or []
+    perms=_sb_json(f"{SB_URL}/rest/v1/categoria_permissoes?select=categoria_id,rotina,pode",SB_KEY) or []
+    return {"categorias":cats,"permissoes":perms}
+
+@app.post("/config/categoria_criar")
+async def config_categoria_criar(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    nome=(b.get("nome") or "").strip()
+    if not nome: raise HTTPException(400,"informe o nome da categoria")
+    cid=_slug(nome)
+    try: _sb_write("categorias", {"id":cid,"nome":nome,"nivel":"comum","protegida":False})
+    except urllib.error.HTTPError as e: raise HTTPException(400,f"criar categoria: {e.read().decode()[:160]}")
+    log_frotahub(u["id"],p.get("papel"),"CONFIG_CATEGORIAS","CRIOU_CATEGORIA",cid)
+    return {"ok":True,"id":cid}
+
+@app.post("/config/categoria_excluir")
+async def config_categoria_excluir(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    cid=b.get("id"); nc=_nivel_categoria(cid)
+    if nc.get("protegida"): raise HTTPException(403,"categoria protegida não pode ser excluída")
+    emuso=_sb_json(f"{SB_URL}/rest/v1/perfis?categoria_id=eq.{urllib.parse.quote(str(cid))}&select=id&limit=1",SB_KEY) or []
+    if emuso: raise HTTPException(400,"há logins usando esta categoria")
+    try:
+        req=urllib.request.Request(f"{SB_URL}/rest/v1/categorias?id=eq.{urllib.parse.quote(str(cid))}",method="DELETE",
+            headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","prefer":"return=minimal"})
+        urllib.request.urlopen(req,timeout=20)
+    except Exception as e: raise HTTPException(400,f"excluir: {str(e)[:120]}")
+    return {"ok":True}
+
+@app.post("/config/permissoes_set")
+async def config_permissoes_set(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    cid=b.get("categoria_id"); nc=_nivel_categoria(cid)
+    if nc.get("protegida") and p.get("nivel")!="builder": raise HTTPException(403,"categoria protegida — só o builder altera")
+    rows=[{"categoria_id":cid,"rotina":it.get("rotina"),"pode":bool(it.get("pode"))} for it in (b.get("permissoes") or []) if it.get("rotina")]
+    if rows: _sb_write("categoria_permissoes", rows, "POST", "resolution=merge-duplicates,return=minimal")
+    log_frotahub(u["id"],p.get("papel"),"CONFIG_CATEGORIAS","AJUSTOU_PERMISSOES",str(cid))
+    return {"ok":True,"n":len(rows)}
+
+# ---- política de PIN (builder-only, exige senha do builder) ----
+@app.get("/config/pin_policy")
+def config_pin_policy(request: Request):
+    _exige_gestor(request)
+    rows=_sb_json(f"{SB_URL}/rest/v1/pin_policy?select=rotina,exige_pin",SB_KEY) or []
+    return {"itens":rows}
+
+@app.post("/config/pin_policy_set")
+async def config_pin_policy_set(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    if p.get("nivel")!="builder": raise HTTPException(403,"apenas o builder altera a política de PIN")
+    b=await request.json()
+    if not _verifica_senha(u.get("email"), b.get("senha")): raise HTTPException(403,"senha do builder incorreta")
+    rows=[{"rotina":it.get("rotina"),"exige_pin":bool(it.get("exige_pin"))} for it in (b.get("itens") or []) if it.get("rotina")]
+    if rows: _sb_write("pin_policy", rows, "POST", "resolution=merge-duplicates,return=minimal")
+    log_frotahub(u["id"],p.get("papel"),"CONFIG_PIN","AJUSTOU_POLITICA_PIN",f"{len(rows)} itens")
+    return {"ok":True}
+
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
     import base64, secrets
@@ -2611,7 +2884,7 @@ def _basic_auth(app, user, pw):
         _path = scope.get("path", "") or ""
         if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
                                         or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
-                                        or _path.startswith("/desfazer")
+                                        or _path.startswith("/desfazer") or _path.startswith("/usuarios") or _path.startswith("/config")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
