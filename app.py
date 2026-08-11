@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 65
+#  CONTADOR DE REVISÕES DESTE app.py: 66
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -850,7 +850,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 65}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 66}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2049,23 +2049,27 @@ def _ler_notas_gemini(file_bytes, mime="application/pdf"):
         GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest",
         "gemini-2.5-flash-lite", "gemini-2.0-flash-lite",
     ]))
+    import time as _t
     ultimo=None
     for nome in candidatos:
         if not nome: continue
-        try:
-            model=genai.GenerativeModel(nome)
-            r=model.generate_content([{"mime_type":mime,"data":file_bytes},_ORC_PROMPT],
-                generation_config={"response_mime_type":"application/json","temperature":0})
-            _ORC_GEMINI_OK=nome
-            try: return (json.loads(r.text) or {}).get("notas") or []
-            except Exception: return []
-        except Exception as e:
-            ultimo=e
-            m=str(e).lower()
-            if any(s in m for s in ("not available","not found","404","no longer","unsupported","is not supported")):
-                continue           # modelo inexistente → tenta o próximo
-            raise                  # outro erro (cota, chave, rede) → propaga
-    raise RuntimeError(f"nenhum modelo Gemini disponível: {ultimo}")
+        for tent in range(3):               # até 3 tentativas por modelo (backoff no 429)
+            try:
+                model=genai.GenerativeModel(nome)
+                r=model.generate_content([{"mime_type":mime,"data":file_bytes},_ORC_PROMPT],
+                    generation_config={"response_mime_type":"application/json","temperature":0})
+                _ORC_GEMINI_OK=nome
+                try: return (json.loads(r.text) or {}).get("notas") or []
+                except Exception: return []
+            except Exception as e:
+                ultimo=e; m=str(e).lower()
+                if any(s in m for s in ("not available","not found","404","no longer","unsupported","is not supported")):
+                    break              # modelo inexistente → próximo modelo
+                if any(s in m for s in ("429","quota","exceeded","rate limit","resource_exhausted")):
+                    if tent<2: _t.sleep(6*(tent+1)); continue   # espera e tenta de novo
+                    break              # cota estourada nesse modelo → tenta o próximo (cotas separadas)
+                raise                  # chave/rede/outro → propaga
+    raise RuntimeError(f"Gemini indisponível (cota?): {ultimo}")
 
 FROTAHUB_ROOT = os.environ.get("FROTAHUB_ROOT", "/FROTAHUB")
 def _find_dir(access, base, pattern):
@@ -2259,8 +2263,10 @@ async def orc_gerar(request: Request):
     arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
     def _mime(nm):
         nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
+    import time as _t
     res=[]
-    for nome in sorted(arqs):
+    for _idx,nome in enumerate(sorted(arqs)):
+        if _idx: _t.sleep(2)           # respiro entre notas p/ não estourar limite por minuto
         ext=os.path.splitext(nome)[1] or ".pdf"; is_pdf=nome.lower().endswith(".pdf")
         fb=dropbox_rateio.baixar(access,f"{ORC_NOTAS}/{nome}")
         if not fb: res.append({"arquivo":nome,"status":"erro","motivo":"não baixou"}); continue
