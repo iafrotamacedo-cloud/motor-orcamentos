@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 95
+#  CONTADOR DE REVISÕES DESTE app.py: 96
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 95}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 96}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -3757,6 +3757,91 @@ def orc_corrigir_gerar_status(request: Request, job: str=""):
     if not j: raise HTTPException(404,"job não encontrado")
     return {"estado":j["estado"],"total":j["total"],"feitas":j["feitas"],"gerados":j["gerados"],
             "erro":j.get("erro"),"resultados":j["res"]}
+
+# ==================================================================
+#  DASHBOARD (métricas gerais desde 01/07/2026)
+# ==================================================================
+DASH_INICIO = os.environ.get("DASH_INICIO","2026-07-01")
+META_MATERIAL_MES = float(os.environ.get("META_MATERIAL_MES","40000"))
+def _seg_semana(iso):
+    """Devolve a segunda-feira (YYYY-MM-DD) da semana da data iso YYYY-MM-DD."""
+    try:
+        d=datetime.date.fromisoformat(iso[:10]); d=d-datetime.timedelta(days=d.weekday()); return d.isoformat()
+    except Exception: return None
+
+@app.get("/orc/dashboard")
+def orc_dashboard(request: Request):
+    from fastapi import HTTPException
+    exige(request,"DASHBOARD")
+    try:
+        # ---- atendidos (marco vistoriado) desde o início ----
+        ap=["select=numero,aba,loja,tipo_predial,responsavel,atendido_em","atendido=is.true",
+            f"atendido_em=gte.{DASH_INICIO}","limit=50000"]
+        at=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
+        # ---- orçamentos gerados (custo de material) ----
+        op=["select=ticket,loja_nome,aba,valor_nota,valor_orcamento,criado_em","status=eq.gerado","limit=50000"]
+        orc=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(op),SB_KEY) or []
+    except Exception as e:
+        raise HTTPException(500,f"dashboard: {str(e)[:160]}")
+
+    por_dia={}; por_sem={}; por_mes={}; por_tipo={}; por_loja={}; por_resp={}; hab={}
+    atendidos_set=set()
+    for r in at:
+        num=str(r.get("numero") or ""); atendidos_set.add(num)
+        d=(r.get("atendido_em") or "")[:10]
+        if d: por_dia[d]=por_dia.get(d,0)+1
+        sw=_seg_semana(d)
+        if sw: por_sem[sw]=por_sem.get(sw,0)+1
+        mm=d[:7]
+        if mm: por_mes[mm]=por_mes.get(mm,0)+1
+        tp=(r.get("tipo_predial") or "—").strip() or "—"; por_tipo[tp]=por_tipo.get(tp,0)+1
+        lj=_loja_padrao(r.get("loja")); por_loja[lj]=por_loja.get(lj,0)+1
+        rp=(r.get("responsavel") or "—").strip() or "—"; por_resp[rp]=por_resp.get(rp,0)+1
+        h=hab.setdefault(rp,{"total":0,"por_tipo":{}}); h["total"]+=1
+        h["por_tipo"][tp]=h["por_tipo"].get(tp,0)+1
+
+    # ---- custo de material por mês + tickets com custo ----
+    custo_mes={}; custo_set=set(); v_orc_total=0.0; v_nota_total=0.0
+    for o in orc:
+        tk=str(o.get("ticket") or "")
+        if tk: custo_set.add(tk)
+        vo=_numf(o.get("valor_orcamento")); vn=_numf(o.get("valor_nota"))
+        v_orc_total+=vo; v_nota_total+=vn
+        mm=(o.get("criado_em") or "")[:7]
+        if mm:
+            c=custo_mes.setdefault(mm,{"orc":0.0,"nota":0.0,"n":0}); c["orc"]+=vo; c["nota"]+=vn; c["n"]+=1
+
+    com_custo=len(atendidos_set & custo_set)
+    total_at=len(atendidos_set); sem_custo=max(0,total_at-com_custo)
+
+    def _serie(d, label_fmt=None):
+        return [{"x":k,"y":v} for k,v in sorted(d.items())]
+    def _rank(d, n=None):
+        it=sorted(({"nome":k,"total":v} for k,v in d.items()), key=lambda x:-x["total"])
+        return it[:n] if n else it
+    # meta por mês
+    meta_serie=[]
+    for mm in sorted(custo_mes):
+        c=custo_mes[mm]["orc"]
+        meta_serie.append({"mes":mm,"custo":round(c,2),"meta":META_MATERIAL_MES,
+                           "pct":round(c*100.0/META_MATERIAL_MES,1) if META_MATERIAL_MES else None,
+                           "saldo":round(META_MATERIAL_MES-c,2)})
+    # habilidade -> top tipo por responsável
+    hab_out=[]
+    for rp,h in sorted(hab.items(), key=lambda x:-x[1]["total"]):
+        tipos=sorted(({"tipo":k,"n":v} for k,v in h["por_tipo"].items()), key=lambda x:-x["n"])
+        forte=tipos[0]["tipo"] if tipos else "—"
+        hab_out.append({"responsavel":rp,"total":h["total"],"forte":forte,"tipos":tipos[:6]})
+
+    return {
+        "inicio":DASH_INICIO,"meta_mes":META_MATERIAL_MES,
+        "total_atendidos":total_at,"com_custo":com_custo,"sem_custo":sem_custo,
+        "pct_com_custo":(round(com_custo*100.0/total_at,1) if total_at else 0),
+        "valor_orcamentos":round(v_orc_total,2),"valor_notas":round(v_nota_total,2),
+        "atendidos_dia":_serie(por_dia),"atendidos_semana":_serie(por_sem),"atendidos_mes":_serie(por_mes),
+        "por_tipo":_rank(por_tipo),"por_loja":_rank(por_loja),"por_responsavel":_rank(por_resp),
+        "custo_mes":meta_serie,"habilidade":hab_out,
+    }
 
 # ================= USUÁRIOS / LOGINS / CATEGORIAS / PIN =================
 import hashlib
