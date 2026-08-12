@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 93
+#  CONTADOR DE REVISÕES DESTE app.py: 95
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 93}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 95}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2365,6 +2365,59 @@ def _parse_nota_local(txt):
     """Leitor local sem IA: tenta DANFE (NF-e) e depois DAV (pedido)."""
     return _parse_danfe_texto(txt) or _parse_dav_texto(txt)
 
+def _data_br_any(v):
+    """Aceita datetime ou texto e devolve DD/MM/AAAA."""
+    if v is None: return None
+    try:
+        if hasattr(v,"strftime"): return v.strftime("%d/%m/%Y")
+    except Exception: pass
+    m=re.search(r"(\d{2})/(\d{2})/(\d{4})", str(v))
+    if m: return m.group(0)
+    m=re.search(r"(\d{4})-(\d{2})-(\d{2})", str(v))
+    return f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else None
+
+def _parse_excel_nota(fb):
+    """Leitor da nota digitada em EXCEL (quando o PDF está ilegível).
+       Cabeçalho: FORNECEDOR, CNPJ, NUMERO DA NOTA, DATA DE EMISSAO, COD. PRODUTO,
+       DESCRICAO DO ITEM, UNIDADE, QUANTIDADE, PRECO UNITARIO, PRECO TOTAL.
+       1 linha por item; a linha 'TOTAL DA NOTA' é ignorada."""
+    import openpyxl, io as _io
+    try:
+        wb=openpyxl.load_workbook(_io.BytesIO(fb), data_only=True)
+    except Exception:
+        return []
+    ws=wb.worksheets[0]
+    rows=[list(r) for r in ws.iter_rows(values_only=True)]
+    if not rows: return []
+    hdr=[str(c or "").strip().upper() for c in rows[0]]
+    def col(*names):
+        for n in names:
+            for i,h in enumerate(hdr):
+                if n in h: return i
+        return None
+    ci_forn=col("FORNECEDOR"); ci_cnpj=col("CNPJ"); ci_num=col("NUMERO DA NOTA","NUMERO","NOTA")
+    ci_data=col("DATA"); ci_desc=col("DESCRICAO","DESCRIÇÃO"); ci_un=col("UNIDADE","UNID")
+    ci_q=col("QUANTIDADE","QUANT"); ci_vu=col("PRECO UNITARIO","PREÇO UNIT","VALOR UNIT")
+    ci_vt=col("PRECO TOTAL","PREÇO TOTAL","VALOR TOTAL")
+    if ci_desc is None or ci_q is None: return []
+    g=lambda r,i: (r[i] if (i is not None and i<len(r)) else None)
+    fornecedor=cnpj=nota=data=None; itens=[]
+    for r in rows[1:]:
+        if "TOTAL" in str(g(r,ci_q) or "").upper(): continue     # linha de total
+        desc=g(r,ci_desc)
+        if not desc or not str(desc).strip(): continue
+        q=_num_br(g(r,ci_q)); vu=_num_br(g(r,ci_vu)); vt=_num_br(g(r,ci_vt))
+        if vu<=0 and vt>0 and q>0: vu=round(vt/q,4)
+        if q<=0 or vu<=0: continue
+        itens.append({"descricao":str(desc).strip()[:120],"unid":str(g(r,ci_un) or "UN").strip()[:6],
+                      "quant":q,"valor_unit":_reconcilia(q,vu,vt)})
+        fornecedor=fornecedor or (str(g(r,ci_forn)).strip() if g(r,ci_forn) else None)
+        cnpj=cnpj or (re.sub(r"\D","",str(g(r,ci_cnpj))) if g(r,ci_cnpj) else None)
+        nota=nota or (_num_limpo(g(r,ci_num)) if g(r,ci_num) else None)
+        data=data or _data_br_any(g(r,ci_data))
+    if not itens: return []
+    return [{"fornecedor":fornecedor,"cnpj":cnpj,"nota_numero":nota,"data_nota":data,"itens":itens}]
+
 def _via_gemini(fb, mime, it, st):
     """Gemini como ÚLTIMO recurso, respeitando a cota diária."""
     if st.get("gemini_bloqueado"): raise _CotaExcedida()
@@ -3081,14 +3134,16 @@ def _orc_job_run(job, previa, uid, papel):
                         dropbox_rateio.subir_bytes(access,page,f"{destino_folder}/{destino_nome}",overwrite=True)
                 if not ticket:
                     info.update(status="pendente",motivo="sem ticket",destino="6")
-                    _mv_nota(P6, nome if pages is None else f"{os.path.splitext(nome)[0]}_p{i+1}{ext}")
-                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket","valor_nota":valor_nota,"itens":itens,"criado_por":uid})
+                    dest6 = nome if pages is None else f"{os.path.splitext(nome)[0]}_p{i+1}{ext}"
+                    _mv_nota(P6, dest6)
+                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket","valor_nota":valor_nota,"itens":itens,"arquivo_nota":f"6/{dest6}","criado_por":uid})
                     res.append(info); continue
                 lj=_loja_do_ticket(ticket)
                 if not lj:
                     info.update(status="pendente",motivo="ticket não encontrado nos chamados",destino="7")
-                    _mv_nota(P7, nome if pages is None else f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
-                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,"status":"ticket_nao_associado","valor_nota":valor_nota,"itens":itens,"criado_por":uid})
+                    dest7 = nome if pages is None else f"TICKET_{ticket}_NOTA_{nota_num}{ext}"
+                    _mv_nota(P7, dest7)
+                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,"status":"ticket_nao_associado","valor_nota":valor_nota,"itens":itens,"arquivo_nota":f"7/{dest7}","criado_por":uid})
                     res.append(info); continue
                 loja=lj.get("loja") or {}
                 loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
@@ -3301,7 +3356,9 @@ def config_formatos(request: Request):
 # ==================================================================
 def _mime_de(nome):
     nl=(nome or "").lower()
-    return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
+    if nl.endswith(".pdf"): return "application/pdf"
+    if nl.endswith((".xlsx",".xls")): return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return "image/png" if nl.endswith(".png") else "image/jpeg"
 
 def _rateio_base(access):
     mb=_manut_base(access); ob=_orc_base(access,mb); return ob
@@ -3311,8 +3368,15 @@ def _rateio_pasta3(access, ob=None):
     return _pasta_manut(access,3,ob) or (ob + "/3 - NOTAS PARA RATEIO")
 
 def _rateio_leitura(fb, mime, nome):
-    """Lê a nota do rateio pela mesma cascata (sem Gemini): texto/OCR -> parser local -> Groq.
+    """Lê a nota do rateio. Excel -> parser de planilha; senão a cascata (texto/OCR -> local -> Groq).
        Devolve (notas, texto)."""
+    nl=(nome or "").lower()
+    if nl.endswith(".xlsx") or nl.endswith(".xls"):
+        notas=_parse_excel_nota(fb)
+        if notas and _notas_seguras(notas):
+            try: _formato_registra("", "excel", notas[0].get("nota_numero"))
+            except Exception: pass
+        return (notas or []), ""
     is_pdf=(nome or "").lower().endswith(".pdf") or mime=="application/pdf"
     texto=""
     if is_pdf: texto=_pdf_texto(fb)
@@ -3340,9 +3404,9 @@ def _rateio_info(access, pasta3, arquivo):
         info={"ok":False,"erro":"não consegui ler a nota (formato novo?)"}
     else:
         nt=notas[0]
-        info={"ok":True,"arquivo":arquivo,"fornecedor":_nome_emitente(texto) or "—",
+        info={"ok":True,"arquivo":arquivo,"fornecedor":nt.get("fornecedor") or _nome_emitente(texto) or "—",
               "data":nt.get("data_nota"),"valor":_soma_itens(notas),
-              "nota_numero":nt.get("nota_numero"),"cnpj":_cnpj_emitente(texto),
+              "nota_numero":nt.get("nota_numero"),"cnpj":nt.get("cnpj") or _cnpj_emitente(texto),
               "itens":nt.get("itens") or []}
     _RAT_INFO[arquivo]=info
     if len(_RAT_INFO)>60:
@@ -3407,7 +3471,7 @@ def rateio_notas(request: Request):
     exige(request,"RATEIO_NOTAS")
     try:
         access=dropbox_rateio.obter_token(); p3=_rateio_pasta3(access)
-        arqs=sorted([a for a in dropbox_rateio.listar(access,p3) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))])
+        arqs=sorted([a for a in dropbox_rateio.listar(access,p3) if a.lower().endswith((".pdf",".jpg",".jpeg",".png",".xlsx",".xls"))])
         return {"arquivos":arqs,"total":len(arqs)}
     except Exception as e: raise HTTPException(500,f"lista: {str(e)[:160]}")
 
@@ -3570,6 +3634,126 @@ def rateio_gerar_status(request: Request, job: str=""):
     from fastapi import HTTPException
     exige(request,"RATEIO_NOTAS")
     j=_RAT_JOBS.get(job)
+    if not j: raise HTTPException(404,"job não encontrado")
+    return {"estado":j["estado"],"total":j["total"],"feitas":j["feitas"],"gerados":j["gerados"],
+            "erro":j.get("erro"),"resultados":j["res"]}
+
+# ==================================================================
+#  CORRIGIR NOTAS PENDENTES + GERAR ORÇAMENTOS CORRIGIDOS
+# ==================================================================
+@app.get("/orc/corrigir_listar")
+def orc_corrigir_listar(request: Request):
+    """Notas pendentes no BD (sem ticket / ticket não associado) + as já corrigidas."""
+    exige(request,"CORRIGIR_NOTAS")
+    q=("select=id,nota_numero,ticket,valor_nota,itens,status,arquivo_nota,loja_nome,criado_em"
+       "&status=in.(sem_ticket,ticket_nao_associado,corrigido)&order=criado_em.desc&limit=1000")
+    try: rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY) or []
+    except Exception: rows=[]
+    return {"itens":rows}
+
+@app.post("/orc/corrigir_salvar")
+async def orc_corrigir_salvar(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"CORRIGIR_NOTAS")
+    b=await request.json()
+    _id=b.get("id"); ticket=re.sub(r"\D","",str(b.get("ticket") or ""))[:6]; nota_num=_num_limpo(b.get("nota_numero"))
+    if not _id: raise HTTPException(400,"id ausente")
+    if len(ticket)<4: raise HTTPException(400,"informe um ticket válido (6 dígitos)")
+    lj=_loja_do_ticket(ticket)
+    if not lj: raise HTTPException(400,"ticket não encontrado nos chamados — atualize a Lista do Trílogo e tente de novo")
+    loja=lj.get("loja") or {}
+    ch=_sb_json(f"{SB_URL}/rest/v1/chamados?numero=eq.{urllib.parse.quote(ticket)}&select=descricao&limit=1",SB_KEY) or []
+    desc=(ch[0].get("descricao") if ch else None)
+    patch={"ticket":ticket,"nota_numero":(nota_num or None),"status":"corrigido",
+           "loja_numero":loja.get("numero"),"loja_nome":loja.get("nome"),"aba":lj.get("aba")}
+    try: _sb_write(f"notas_orcamento?id=eq.{_id}", patch, "PATCH")
+    except Exception as e: raise HTTPException(400,f"salvar: {str(e)[:120]}")
+    log_frotahub(u["id"],p.get("papel"),"CORRIGIR_NOTAS","CORRIGIU",f"{ticket}/NF {nota_num or '—'}")
+    return {"ok":True,"loja_numero":loja.get("numero"),"loja_nome":loja.get("nome"),"aba":lj.get("aba"),"descricao":desc}
+
+_CORR_JOBS={}; _CORR_SEQ=[0]
+def _corr_job_run(job, uid, papel):
+    st=_CORR_JOBS[job]
+    try:
+        access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+        P1=_pasta_manut(access,1,ob); P8=_pasta_manut(access,8,ob); P9=_pasta_manut(access,9,ob)
+        P10=_pasta_manut(access,10,ob); P6=_pasta_manut(access,6,ob); P7=_pasta_manut(access,7,ob)
+        recs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?select=id,nota_numero,ticket,itens,aba,loja_numero,loja_nome,arquivo_nota&status=eq.corrigido&limit=1000",SB_KEY) or []
+        st["total"]=len(recs); res=st["res"]; mes=_mes_atual(); hoje=datetime.date.today().strftime("%d/%m/%Y")
+        for _i,rec in enumerate(recs):
+            tk=str(rec.get("ticket") or ""); nota_num=_num_limpo(rec.get("nota_numero")) or "SN"
+            itens=rec.get("itens") or []
+            r={"ticket":tk,"nota":nota_num,"itens":len(itens)}
+            lj=_loja_do_ticket(tk); loja=(lj or {}).get("loja") or {}
+            if not lj: r.update(status="erro",motivo="ticket não encontrado"); res.append(r); st["feitas"]=_i+1; continue
+            if _nota_ja_gerada(tk, nota_num):
+                _sb_write(f"notas_orcamento?id=eq.{rec['id']}", {"status":"duplicada"}, "PATCH")
+                r.update(status="duplicada",motivo="orçamento já existe"); res.append(r); st["feitas"]=_i+1; continue
+            loja_nome=loja.get("nome") or rec.get("loja_nome") or "—"
+            valor_nota=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for x in itens),2)
+            valor_orc=round(valor_nota*1.20,2); extrap=valor_nota>ORC_EXTRAPOLA
+            slug=_slug_loja(loja,(lj or {}).get("unidade"))
+            itens_orc=[{"descricao":x.get("descricao"),"quant":_num_br(x.get("quant")),"unid":x.get("unid") or "UN","valor_unit":_num_br(x.get("valor_unit"))} for x in itens]
+            dados={"num":tk,"revisao":1,"data":hoje,"loja_nome":loja_nome,
+                "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
+                "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":loja.get("cnpj"),
+                           "endereco":loja.get("endereco"),"cidade":((loja.get("cidade") or ""))+(" - CE" if loja.get("cidade") else "")},
+                "itens":itens_orc}
+            base_nome=f"{slug}_{tk}_NOTA_{nota_num}"; arq_pdf=arq_doc=None
+            try:
+                doc_bytes=gera_orcamento_docx(dados)
+                if extrap:
+                    if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                else:
+                    pdf_bytes=gera_orcamento_pdf(dados)
+                    if P1: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P1}/{base_nome}.pdf",overwrite=True)
+                    if P10:
+                        dropbox_rateio.criar_pasta(access,f"{P10}/{mes}"); dropbox_rateio.criar_pasta(access,f"{P10}/{mes}/{slug}")
+                        dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P10}/{mes}/{slug}/{base_nome}.pdf",overwrite=True)
+                        dropbox_rateio.subir_bytes(access,doc_bytes,f"{P10}/{mes}/{slug}/{base_nome}.docx",overwrite=True)
+                        arq_pdf=f"10/{mes}/{slug}/{base_nome}.pdf"; arq_doc=f"10/{mes}/{slug}/{base_nome}.docx"
+            except Exception as e: r["motivo"]=f"salvar: {str(e)[:80]}"
+            # move a nota da pasta 6/7 -> 8/<aba>
+            aba=(lj or {}).get("aba") or rec.get("aba") or ""
+            sub="INSTALACOES" if aba.upper().startswith("INST") else ("CIVIL" if aba.upper().startswith("CIV") else "SEM CLASSIFICACAO")
+            arq_nota=rec.get("arquivo_nota"); dest_nota=None
+            if P8 and arq_nota and "/" in arq_nota:
+                npasta,_,nfile=arq_nota.partition("/")
+                origem = P6 if npasta=="6" else (P7 if npasta=="7" else None)
+                if origem:
+                    try:
+                        dropbox_rateio.criar_pasta(access,f"{P8}/{sub}")
+                        ext=os.path.splitext(nfile)[1] or ".pdf"
+                        dest_nota=f"8/{sub}/TICKET_{tk}_NOTA_{nota_num}{ext}"
+                        dropbox_rateio.mover(access,f"{origem}/{nfile}",f"{P8}/{sub}/TICKET_{tk}_NOTA_{nota_num}{ext}")
+                    except Exception: pass
+            _sb_write(f"notas_orcamento?id=eq.{rec['id']}",
+                {"status":"gerado","valor_nota":valor_nota,"valor_orcamento":valor_orc,"extrapolado":extrap,
+                 "itens":itens_orc,"mes_ref":mes,"arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc,"arquivo_nota":dest_nota or arq_nota}, "PATCH")
+            r.update(status="ok",loja=loja_nome,valor_orcamento=valor_orc); res.append(r); st["feitas"]=_i+1
+        ok=sum(1 for x in res if x.get("status")=="ok")
+        log_frotahub(uid,papel,"GERAR_ORCAMENTOS_CORRIGIDOS","GEROU",f"{ok}/{len(recs)}")
+        st["gerados"]=ok; st["estado"]="pronto"
+    except Exception as e:
+        st["estado"]="erro"; st["erro"]=str(e)[:300]
+
+@app.post("/orc/corrigir_gerar")
+async def orc_corrigir_gerar(request: Request):
+    from fastapi import HTTPException
+    import threading
+    u,p=exige(request,"GERAR_ORCAMENTOS_CORRIGIDOS")
+    _CORR_SEQ[0]+=1; job=str(_CORR_SEQ[0])
+    if len(_CORR_JOBS)>20:
+        for k in list(_CORR_JOBS)[:-10]: _CORR_JOBS.pop(k,None)
+    _CORR_JOBS[job]={"estado":"rodando","total":0,"feitas":0,"gerados":0,"res":[]}
+    threading.Thread(target=_corr_job_run,args=(job,u["id"],p["papel"]),daemon=True).start()
+    return {"job":job}
+
+@app.get("/orc/corrigir_gerar_status")
+def orc_corrigir_gerar_status(request: Request, job: str=""):
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS_CORRIGIDOS")
+    j=_CORR_JOBS.get(job)
     if not j: raise HTTPException(404,"job não encontrado")
     return {"estado":j["estado"],"total":j["total"],"feitas":j["feitas"],"gerados":j["gerados"],
             "erro":j.get("erro"),"resultados":j["res"]}
