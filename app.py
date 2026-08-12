@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 84
+#  CONTADOR DE REVISÕES DESTE app.py: 85
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 84}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 85}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2130,9 +2130,13 @@ def _pdf_texto(fb):
     except Exception:
         return ""
 
-def _groq_chat(messages, model):
-    payload={"model":model,"temperature":0,"messages":messages,
-             "response_format":{"type":"json_object"}}
+GROQ_TEXT_FALLBACK = [GROQ_TEXT_MODEL, "llama-3.1-8b-instant", "openai/gpt-oss-20b"]
+GROQ_VIS_FALLBACK  = [GROQ_VIS_MODEL, "meta-llama/llama-4-maverick-17b-128e-instruct"]
+
+def _groq_post(messages, model, json_mode=True):
+    """1 chamada ao Groq. Devolve o texto da resposta ou levanta RuntimeError('Groq <code>: <body>')."""
+    payload={"model":model,"temperature":0,"messages":messages,"max_tokens":4096}
+    if json_mode: payload["response_format"]={"type":"json_object"}
     req=urllib.request.Request("https://api.groq.com/openai/v1/chat/completions",
         data=json.dumps(payload).encode(),
         headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json","Accept":"application/json"})
@@ -2142,25 +2146,72 @@ def _groq_chat(messages, model):
         body=""
         try: body=e.read().decode("utf-8","ignore")
         except Exception: pass
-        raise RuntimeError(f"Groq {e.code}: {body[:300]}") from None
-    c=json.loads(raw)["choices"][0]["message"]["content"]
-    try: return (json.loads(c) or {}).get("notas") or []
-    except Exception: return []
+        raise RuntimeError(f"Groq {e.code}: {body[:400]}") from None
+    return json.loads(raw)["choices"][0]["message"]["content"]
+
+def _groq_chat(messages, modelos):
+    """Tenta uma lista de modelos; no 1º que responder, devolve o texto. Guarda o último erro."""
+    ultimo=None
+    for m in modelos:
+        if not m: continue
+        try:
+            return _groq_post(messages, m, json_mode=True)
+        except RuntimeError as e:
+            s=str(e); ultimo=e
+            # modelo não aceita response_format json -> tenta sem
+            if "400" in s and ("json" in s.lower() or "response_format" in s.lower()):
+                try: return _groq_post(messages, m, json_mode=False)
+                except RuntimeError as e2: ultimo=e2
+            # modelo inexistente/desativado -> próximo
+            if any(x in s.lower() for x in ("not found","does not exist","decommission","not supported","400","404")):
+                continue
+            raise
+    raise (ultimo or RuntimeError("Groq: nenhum modelo respondeu"))
+
+def _notas_de_conteudo(c):
+    d=_parse_json(c)
+    if isinstance(d,list): return d
+    if isinstance(d,dict):
+        if isinstance(d.get("notas"),list): return d["notas"]
+        if d.get("itens"): return [d]              # formato de nota única
+    return []
 
 def _groq_notas_texto(texto):
-    """Lê as notas a partir do TEXTO do PDF (gratuito, sem gastar cota do Gemini)."""
+    """Lê as notas a partir do TEXTO do PDF (grátis, sem gastar cota do Gemini)."""
     msgs=[{"role":"system","content":_ORC_PROMPT},
           {"role":"user","content":"TEXTO EXTRAÍDO DO PDF (pode conter mais de uma nota):\n\n"+texto[:24000]}]
-    return _groq_chat(msgs, GROQ_TEXT_MODEL)
+    return _notas_de_conteudo(_groq_chat(msgs, GROQ_TEXT_FALLBACK))
 
-def _groq_notas_img_bytes(fb, mime):
-    """PDF escaneado (sem texto): manda a 1ª página como imagem para o Groq (visão)."""
-    import base64
-    b64=base64.b64encode(fb).decode()
+def _pdf_png_bytes(fb):
+    """Rasteriza a 1ª página do PDF em PNG (o Groq visão só aceita imagem, não PDF)."""
+    import tempfile, glob
+    d=tempfile.mkdtemp()
+    pth=os.path.join(d,"n.pdf"); open(pth,"wb").write(fb)
+    pref=os.path.join(d,"pg")
+    subprocess.run(["pdftoppm","-r","170","-png","-f","1","-l","1",pth,pref],capture_output=True,timeout=60)
+    pngs=sorted(glob.glob(pref+"*.png"))
+    return open(pngs[0],"rb").read() if pngs else None
+
+def _img_png_b64(fb, mime, nome):
+    """Normaliza qualquer nota (PDF escaneado ou imagem) para PNG base64 que o Groq aceita."""
+    import base64, io
+    from PIL import Image
+    is_pdf=(nome or "").lower().endswith(".pdf") or mime=="application/pdf"
+    png = _pdf_png_bytes(fb) if is_pdf else fb
+    if not png: return None
+    im=Image.open(io.BytesIO(png)).convert("RGB")
+    if im.width>1600: im=im.resize((1600,int(im.height*1600/im.width)))
+    buf=io.BytesIO(); im.save(buf,"PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+def _groq_notas_img_bytes(fb, mime, nome=""):
+    """PDF escaneado/imagem -> converte para PNG e manda ao Groq (visão)."""
+    b64=_img_png_b64(fb, mime, nome)
+    if not b64: raise RuntimeError("Groq visão: não consegui rasterizar a página")
     msgs=[{"role":"user","content":[
         {"type":"text","text":_ORC_PROMPT},
-        {"type":"image_url","image_url":{"url":f"data:{mime};base64,{b64}"}}]}]
-    return _groq_chat(msgs, GROQ_VIS_MODEL)
+        {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}}]}]
+    return _notas_de_conteudo(_groq_chat(msgs, GROQ_VIS_FALLBACK))
 
 class _CotaExcedida(Exception):
     """Gemini indisponível por limite diário — pula a nota e avisa."""
@@ -2247,23 +2298,26 @@ def _ler_notas_rota(fb, mime, nome, it, st):
                 try:
                     g=_groq_notas_texto(txt)
                     if _notas_seguras(g): return g, "groq"
-                except Exception: pass
+                    it["diag"]="Groq(texto) leu incompleto"
+                except Exception as e: it["diag"]=f"Groq(texto): {str(e)[:180]}"; st["groq_erro"]=it["diag"]
             return _via_gemini(fb, mime, it, st), "gemini"
         # PDF escaneado -> Groq (visão)
         if GROQ_KEY:
             it["etapa"]="groq"; it["status"]="lendo com Groq"
             try:
-                g=_groq_notas_img_bytes(fb, mime)
+                g=_groq_notas_img_bytes(fb, mime, nome)
                 if _notas_seguras(g): return g, "groq"
-            except Exception: pass
+                it["diag"]="Groq(visão) leu incompleto"
+            except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:180]}"; st["groq_erro"]=it["diag"]
         return _via_gemini(fb, mime, it, st), "gemini"
     # 2) IMAGEM -> Groq (visão)
     if GROQ_KEY:
         it["etapa"]="groq"; it["status"]="lendo com Groq"
         try:
-            g=_groq_notas_img_bytes(fb, mime)
+            g=_groq_notas_img_bytes(fb, mime, nome)
             if _notas_seguras(g): return g, "groq"
-        except Exception: pass
+            it["diag"]="Groq(visão) leu incompleto"
+        except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:180]}"; st["groq_erro"]=it["diag"]
     return _via_gemini(fb, mime, it, st), "gemini"
 
 # ---------- PADRONIZAÇÃO DO NOME DA LOJA (item: "LOJA NN - NOME"; CD -> Centro de Distribuição) ----------
@@ -2914,8 +2968,12 @@ def _orc_job_run(job, previa, uid, papel):
                 mes=_mes_atual()   # roteia pelo mês em que o orçamento é GERADO (não pela data da nota/DAV)
                 info.update(status="ok",loja=loja_nome,loja_numero=(loja.get("numero") if loja else None),extrapolado=extrap,mes=mes)
                 if _nota_ja_gerada(ticket, nota_num):
-                    # nota já processada antes -> não gera, não grava, não move (fica na pasta 0 sinalizada)
-                    info.update(status="duplicada",motivo="nota já processada — orçamento já existe",destino="—")
+                    # nota já processada antes -> orçamento já existe: EXCLUI a nota da pasta 0
+                    # (arquivo único vai para a lixeira do Dropbox; multipágina é apagado no fim do laço)
+                    info.update(status="duplicada",motivo="nota já processada — excluída da pasta 0",destino="lixeira")
+                    if not previa and pages is None:
+                        try: dropbox_rateio.apagar(access,f"{ORC_NOTAS}/{nome}"); usou_source=True
+                        except Exception as e: info.update(motivo=f"duplicada — não consegui excluir: {str(e)[:80]}")
                     res.append(info); continue
                 if not previa:
                     # dados do orçamento
@@ -2995,13 +3053,37 @@ def orc_gerar_status(request: Request, job: str=""):
     return {"estado":j["estado"],"previa":j["previa"],"total":j["total"],"feitas":j["feitas"],
             "gerados":j["gerados"],"pausa":j["pausa"],"retoma_em":j["retoma_em"],
             "lote":j["lote"],"descanso":j["descanso"],"erro":j.get("erro"),
-            "itens":j.get("itens",[]),
+            "itens":j.get("itens",[]),"groq_erro":j.get("groq_erro"),
             "resultados":j["res"] if j["estado"]!="rodando" else j["res"][-1:]}
 
 @app.get("/orc/gemini_cota")
 def orc_gemini_cota(request: Request):
     exige(request,"GERAR_ORCAMENTOS")
     return _gemini_cota()
+
+@app.get("/orc/groq_teste")
+def orc_groq_teste(request: Request):
+    """Diagnóstico da chamada ao Groq: confirma a chave e testa os modelos de texto e visão."""
+    exige(request,"GERAR_ORCAMENTOS")
+    out={"groq_key_set": bool(GROQ_KEY), "modelo_texto":GROQ_TEXT_MODEL, "modelo_visao":GROQ_VIS_MODEL}
+    if not GROQ_KEY:
+        out["texto"]={"ok":False,"erro":"GROQ_API_KEY não configurada no Render"}; return out
+    # 1) teste de TEXTO
+    try:
+        c=_groq_chat([{"role":"user","content":'Responda em JSON: {"notas":[{"ticket":"1","itens":[{"descricao":"x","quant":1,"unid":"UN","valor_unit":1}]}]}'}], GROQ_TEXT_FALLBACK)
+        out["texto"]={"ok":True,"amostra":(c or "")[:200]}
+    except Exception as e:
+        out["texto"]={"ok":False,"erro":str(e)[:400]}
+    # 2) teste de VISÃO (imagem 1x1 png)
+    try:
+        px=("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+        msgs=[{"role":"user","content":[{"type":"text","text":'Responda em JSON: {"notas":[]}'},
+              {"type":"image_url","image_url":{"url":"data:image/png;base64,"+px}}]}]
+        c=_groq_chat(msgs, GROQ_VIS_FALLBACK)
+        out["visao"]={"ok":True,"amostra":(c or "")[:200]}
+    except Exception as e:
+        out["visao"]={"ok":False,"erro":str(e)[:400]}
+    return out
 
 @app.get("/orc/notas_pasta")
 def orc_notas_pasta(request: Request):
