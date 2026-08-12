@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 90
+#  CONTADOR DE REVISÕES DESTE app.py: 91
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 90}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 91}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2283,35 +2283,74 @@ def _notas_seguras(notas):
             if _num_br(it.get("quant"))<=0 or _num_br(it.get("valor_unit"))<=0: return False
     return True
 
-def _parse_dav_texto(txt):
-    """LEITOR DE PDF (sem IA) para o 'DOCUMENTO AUXILIAR DE VENDA - PEDIDO'.
-       Provisório: só devolve resultado quando reconhece o layout com segurança;
-       caso contrário devolve [] e a rota escala para Groq/Gemini."""
-    if not txt or "PRE" not in txt.upper() and "UNIT" not in txt.upper():
+def _reconcilia(q, vu, vt):
+    """Se quant*unit não bate com o total impresso da linha (erro de OCR),
+       confia no TOTAL e recalcula o unitário. Mantém o dinheiro correto."""
+    if vt>0 and q>0 and abs(q*vu - vt) > max(0.02, 0.02*vt):
+        return round(vt/q, 4)
+    return vu
+
+def _parse_danfe_texto(txt):
+    """LEITOR (sem IA) da DANFE / Nota Fiscal Eletrônica (ex.: DISMONZA).
+       Extrai nº da nota (N°. com pontos de milhar), ticket, itens (código, desc,
+       NCM, CST, CFOP, UNID, QUANT, VALOR UNIT, VALOR TOTAL)."""
+    T=txt or ""; up=T.upper()
+    if "DADOS DO PRODUTO" not in up and "DOCUMENTO AUXILIAR DA" not in up:
         return []
-    notas=[]
-    for chunk in re.split(r"\f", txt):               # 1 página por nota
-        if not chunk.strip(): continue
-        mt=re.search(r"(?:TICK\w*|#)\s*[:\-]?\s*(\d{4,})", chunk, re.I)
-        mn=re.search(r"N[ºo°\.]*\s*d[eo]?\s*Documento\s*[:\-]?\s*(\d+)", chunk, re.I)
-        md=re.search(r"(?:Dt\.?\s*Emis\S*|Emiss\S*)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", chunk, re.I)
-        itens=[]
-        for ln in chunk.splitlines():
-            nums=re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2,3}|\d+,\d{2,3}", ln)
-            if len(nums)>=2 and re.search(r"[A-Za-zÀ-ÿ]{4,}", ln):
-                unid_m=re.search(r"\b(KG|UN|MT?|M2|M3|CX|PC|PÇ|L|LT|SC|BR|RL)\b", ln, re.I)
-                desc=re.sub(r"^\s*\d+\s*[-–]\s*","",ln)
-                desc=re.split(r"\s{2,}", desc.strip())[0]
-                q=_num_br(nums[-3]) if len(nums)>=3 else _num_br(nums[0])
-                vu=_num_br(nums[-2])
-                if q>0 and vu>0 and len(desc)>=3:
-                    itens.append({"descricao":desc[:120],"quant":q,
-                                  "unid":(unid_m.group(1).upper() if unid_m else "UN"),"valor_unit":vu})
-        if itens:
-            notas.append({"ticket":(mt.group(1) if mt else None),
-                          "nota_numero":(mn.group(1) if mn else None),
-                          "data_nota":(md.group(1) if md else None),"itens":itens})
-    return notas if _notas_seguras(notas) else []
+    mn=re.search(r"N[ºo°]\.?\s*([\d][\d.]*\d)", T);  nota=_num_limpo(mn.group(1)) if mn else None
+    mt=re.search(r"(?:TICK\w*|#)\s*[:\-]?\s*(\d{4,})", T, re.I); ticket=mt.group(1) if mt else None
+    md=re.search(r"DATA DA EMISS[ÃA]O.*?(\d{2}/\d{2}/\d{4})", T, re.S|re.I); data=md.group(1) if md else None
+    m0=re.search(r"DADOS DO PRODUTO", up); seg=T
+    if m0:
+        m1=re.search(r"C[ÁA]LCULO DO ISSQN|DADOS ADICIONAIS", up[m0.end():])
+        seg=T[m0.end(): m0.end()+(m1.start() if m1 else len(T))]
+    IT=re.compile(r"^\s*(\d{3,})\s+(.+?)\s+(\d{8})\s+\d{1,3}\s+\d{3,4}\s+([A-Za-zÇç][A-Za-z0-9²³ºÇç]{0,4})\s+([\d.]+,\d+)\s+([\d.]+,\d+)\s+([\d.]+,\d+)")
+    itens=[]
+    for ln in seg.splitlines():
+        m=IT.search(ln)
+        if m:
+            q=_num_br(m.group(5)); vu=_num_br(m.group(6)); vt=_num_br(m.group(7))
+            itens.append({"descricao":m.group(2).strip()[:120],"quant":q,"unid":m.group(4).upper(),
+                          "valor_unit":_reconcilia(q,vu,vt)})
+        else:
+            t=ln.strip()
+            if itens and t and not re.search(r"\d{8}",t) and len(t)>=3 and not re.match(r"^[\d,.\s%]+$",t) and not re.match(r"^\s*C[ÓO]DIGO",t,re.I):
+                itens[-1]["descricao"]=(itens[-1]["descricao"]+" "+t)[:160]
+    if not itens: return []
+    o={"ticket":ticket,"nota_numero":nota,"data_nota":data,"itens":itens}
+    return [o] if _notas_seguras([o]) else []
+
+def _parse_dav_texto(txt):
+    """LEITOR (sem IA) do 'DOCUMENTO AUXILIAR DE VENDA - PEDIDO' (ex.: RODRIGUES).
+       Item = 'código - descrição UNID QUANT PREÇO ... VALOR TOTAL'."""
+    T=txt or ""
+    mn=re.search(r"N[ºo°]?\s*d[eo]?\s*Documento\s*[:\-]?\s*(\d+)", T, re.I); nota=_num_limpo(mn.group(1)) if mn else None
+    mt=re.search(r"(?:Observa\w*|TICK\w*|#)\s*[:\-]?\s*(\d{4,})", T, re.I); ticket=mt.group(1) if mt else None
+    md=re.search(r"Dt\.?\s*Emis\S*\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", T, re.I); data=md.group(1) if md else None
+    up=T.upper(); seg=T
+    mh=re.search(r"QUANTIDADE|PRE[ÇC]O UNIT|PREGO UNIT|EMBALAGEM|MBALAGEM", up)
+    me=re.search(r"TOTAL BRUTO|TOTAL A PAGAR|PLANO DE PAGAMENTO", up)
+    if mh: seg=T[mh.end(): (me.start() if me else len(T))]
+    IT=re.compile(r"^\s*(\d{5,})\s*-\s*(.+?)\s+([A-Za-zÇç]{1,4})\s+([\d.]+,\d+)\s+([\d.]+,\d+)")
+    itens=[]
+    for ln in seg.splitlines():
+        m=IT.search(ln)
+        if m:
+            q=_num_br(m.group(4)); vu=_num_br(m.group(5))
+            dec=re.findall(r"[\d.]+,\d+", ln); vt=_num_br(dec[-1]) if dec else 0
+            itens.append({"descricao":m.group(2).strip()[:120],"quant":q,"unid":m.group(3).upper(),
+                          "valor_unit":_reconcilia(q,vu,vt)})
+        else:
+            t=ln.strip()
+            if itens and t and not re.match(r"^\s*\d{5,}\s*-",t) and len(t)>=3 and not re.match(r"^[\d,.\s%]+$",t):
+                itens[-1]["descricao"]=(itens[-1]["descricao"]+" "+t)[:160]
+    if not itens: return []
+    o={"ticket":ticket,"nota_numero":nota,"data_nota":data,"itens":itens}
+    return [o] if _notas_seguras([o]) else []
+
+def _parse_nota_local(txt):
+    """Leitor local sem IA: tenta DANFE (NF-e) e depois DAV (pedido)."""
+    return _parse_danfe_texto(txt) or _parse_dav_texto(txt)
 
 def _via_gemini(fb, mime, it, st):
     """Gemini como ÚLTIMO recurso, respeitando a cota diária."""
@@ -2339,7 +2378,7 @@ def _ler_notas_rota(fb, mime, nome, it, st):
         txt=_pdf_texto(fb)
         digital = len(txt) >= 40
         if digital:
-            notas=_parse_dav_texto(txt)
+            notas=_parse_nota_local(txt)               # DANFE (NF-e) ou DAV (pedido), sem IA
             if _notas_seguras(notas): return notas, "pdf"
             # digital mas o leitor não fechou tudo -> Groq no TEXTO (grátis, sem Gemini)
             if GROQ_KEY:
@@ -2364,19 +2403,21 @@ def _ler_escaneado(fb, mime, nome, it, st):
             g=_groq_notas_img_bytes(fb, mime, nome)
             if _notas_seguras(g): return g, "groq"
         except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:160]}"; st["groq_erro"]=it["diag"]
-    if GROQ_KEY:                                     # OCR local -> Groq texto
-        it["etapa"]="ocr"; it["status"]="extraindo texto (OCR)"
-        try:
-            ocr=_ocr_texto(fb, mime, nome)
-            if len(ocr) >= 30:
+    it["etapa"]="ocr"; it["status"]="extraindo texto (OCR)"
+    try:
+        ocr=_ocr_texto(fb, mime, nome)               # OCR local roda sempre (grátis)
+        if len(ocr) >= 30:
+            notas=_parse_nota_local(ocr)             # 1) leitor DANFE/DAV no texto do OCR — sem IA
+            if _notas_seguras(notas): return notas, "ocr-pdf"
+            if GROQ_KEY:                             # 2) Groq no texto do OCR
                 it["etapa"]="groq"; it["status"]="lendo com Groq (OCR)"
                 g=_groq_notas_texto(ocr)
                 if _notas_seguras(g): return g, "groq-ocr"
                 it["diag"]="OCR+Groq leu incompleto"
-            else:
-                it["diag"]="OCR não extraiu texto (imagem ruim?)"
-        except Exception as e: it["diag"]=f"OCR/Groq: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
-    return _via_gemini(fb, mime, it, st), "gemini"
+        else:
+            it["diag"]="OCR não extraiu texto (imagem ruim?)"
+    except Exception as e: it["diag"]=f"OCR: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
+    return _via_gemini(fb, mime, it, st), "gemini"    # 3) Gemini por último
 
 # ---------- PADRONIZAÇÃO DO NOME DA LOJA (item: "LOJA NN - NOME"; CD -> Centro de Distribuição) ----------
 _LOJA_NOME_FULL = {20:"RUI BARBOSA", 23:"JÚLIO VENTURA", 101:"CENTRO DE DISTRIBUIÇÃO"}   # nomes por extenso/oficiais
