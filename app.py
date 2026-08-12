@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 88
+#  CONTADOR DE REVISÕES DESTE app.py: 90
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 88}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 90}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2225,28 +2225,38 @@ def _groq_notas_img_bytes(fb, mime, nome=""):
         {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}}]}]
     return _notas_de_conteudo(_groq_chat(msgs, GROQ_VIS_FALLBACK))
 
-def _ocr_texto(fb, mime, nome, max_pag=8):
+OCR_MAX_PAG = int(os.environ.get("OCR_MAX_PAG", "3"))   # nº de páginas por nota que passam pelo OCR
+OCR_DPI     = os.environ.get("OCR_DPI", "150")          # 150 dpi já é suficiente e MUITO mais rápido
+def _ocr_texto(fb, mime, nome, max_pag=None):
     """OCR local (tesseract) da nota escaneada/imagem -> texto. Sem IA e sem cota.
-       Usado quando a conta Groq não tem modelo de visão."""
+       Leve e limitado (poucas páginas, dpi baixo) para não travar o lote."""
     import tempfile, glob, io as _io
+    max_pag = max_pag or OCR_MAX_PAG
     d=tempfile.mkdtemp(); pngs=[]
     is_pdf=(nome or "").lower().endswith(".pdf") or mime=="application/pdf"
     if is_pdf:
         pth=os.path.join(d,"n.pdf"); open(pth,"wb").write(fb)
         pref=os.path.join(d,"pg")
-        subprocess.run(["pdftoppm","-r","200","-png","-f","1","-l",str(max_pag),pth,pref],capture_output=True,timeout=180)
+        try:
+            subprocess.run(["pdftoppm","-r",OCR_DPI,"-png","-f","1","-l",str(max_pag),pth,pref],
+                           capture_output=True,timeout=90)
+        except Exception: pass
         pngs=sorted(glob.glob(pref+"*.png"))
     else:
         try:
             from PIL import Image
-            p=os.path.join(d,"img.png"); Image.open(_io.BytesIO(fb)).convert("RGB").save(p,"PNG"); pngs=[p]
+            im=Image.open(_io.BytesIO(fb)).convert("RGB")
+            if im.width>2000: im=im.resize((2000,int(im.height*2000/im.width)))
+            p=os.path.join(d,"img.png"); im.save(p,"PNG"); pngs=[p]
         except Exception: pngs=[]
+    env=dict(os.environ, OMP_THREAD_LIMIT="1")      # tesseract 1 thread -> previsível, não engasga a CPU
     textos=[]
     for pg in pngs:
         txt=""
-        for lang in ("por","eng"):                 # tenta português; cai p/ inglês se faltar o pacote
+        for lang in ("por","eng"):                  # tenta português; cai p/ inglês se faltar o pacote
             try:
-                r=subprocess.run(["tesseract",pg,"stdout","-l",lang],capture_output=True,text=True,timeout=120)
+                r=subprocess.run(["tesseract",pg,"stdout","-l",lang,"--psm","6"],
+                                 capture_output=True,text=True,timeout=45,env=env)
                 if r.returncode==0 and (r.stdout or "").strip(): txt=r.stdout; break
             except Exception: pass
         if txt: textos.append(txt)
@@ -2355,10 +2365,11 @@ def _ler_escaneado(fb, mime, nome, it, st):
             if _notas_seguras(g): return g, "groq"
         except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:160]}"; st["groq_erro"]=it["diag"]
     if GROQ_KEY:                                     # OCR local -> Groq texto
-        it["etapa"]="groq"; it["status"]="lendo com Groq (OCR)"
+        it["etapa"]="ocr"; it["status"]="extraindo texto (OCR)"
         try:
             ocr=_ocr_texto(fb, mime, nome)
             if len(ocr) >= 30:
+                it["etapa"]="groq"; it["status"]="lendo com Groq (OCR)"
                 g=_groq_notas_texto(ocr)
                 if _notas_seguras(g): return g, "groq-ocr"
                 it["diag"]="OCR+Groq leu incompleto"
@@ -2950,12 +2961,15 @@ def _orc_job_run(job, previa, uid, papel):
             st["estado"]="pronto"; st["gerados"]=0; st["vazio"]=True; return
         for _idx,nome in enumerate(_lista):
             fst=st["itens"][_idx]
+            if st.get("cancelar"): break          # interrompido pelo usuário
             # lotes: a cada ORC_LOTE notas lidas, descansa ORC_DESCANSO segundos (respeita o limite/min)
             if _idx and _idx % ORC_LOTE == 0:
                 st["pausa"]=True; st["retoma_em"]=ORC_DESCANSO
                 for _s in range(ORC_DESCANSO):
+                    if st.get("cancelar"): break
                     _t.sleep(1); st["retoma_em"]=ORC_DESCANSO-_s-1
                 st["pausa"]=False
+                if st.get("cancelar"): break
             ext=os.path.splitext(nome)[1] or ".pdf"; is_pdf=nome.lower().endswith(".pdf")
             fst["pct"]=8; fst["status"]="lendo"
             fb=dropbox_rateio.baixar(access,f"{ORC_NOTAS}/{nome}")
@@ -3067,8 +3081,14 @@ def _orc_job_run(job, previa, uid, papel):
             fst["pct"]=100; fst["status"]="Pronto"
             st["feitas"]=_idx+1
         ok=sum(1 for r in res if r.get("status")=="ok")
-        if not previa: log_frotahub(uid,papel,"GERAR_ORCAMENTOS","GEROU",f"{ok}/{len(res)}")
-        st["gerados"]=ok; st["estado"]="pronto"
+        if st.get("cancelar"):
+            for f in st["itens"]:                 # marca as que não chegaram a rodar
+                if f.get("status") in (None,"aguardando"): f["status"]="interrompido"; f["pct"]=100
+            if not previa: log_frotahub(uid,papel,"GERAR_ORCAMENTOS","INTERROMPEU",f"{ok}/{st['feitas']} de {len(_lista)}")
+            st["gerados"]=ok; st["estado"]="cancelado"
+        else:
+            if not previa: log_frotahub(uid,papel,"GERAR_ORCAMENTOS","GEROU",f"{ok}/{len(res)}")
+            st["gerados"]=ok; st["estado"]="pronto"
     except Exception as e:
         st["estado"]="erro"; st["erro"]=str(e)[:300]
 
@@ -3090,6 +3110,20 @@ async def orc_gerar(request: Request):
                     "res":[],"itens":[],"pausa":False,"retoma_em":0,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
     t=threading.Thread(target=_orc_job_run,args=(job,previa,u["id"],p["papel"]),daemon=True); t.start()
     return {"job":job,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
+
+@app.post("/orc/gerar_cancelar")
+async def orc_gerar_cancelar(request: Request):
+    """Interrompe manualmente um job em andamento. Ele para após terminar a nota atual."""
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS")
+    b={}
+    try: b=await request.json()
+    except Exception: pass
+    job=str(b.get("job") or "")
+    j=_ORC_JOBS.get(job)
+    if not j: raise HTTPException(404,"job não encontrado")
+    j["cancelar"]=True
+    return {"ok":True,"estado":j.get("estado")}
 
 @app.get("/orc/gerar_status")
 def orc_gerar_status(request: Request, job: str=""):
