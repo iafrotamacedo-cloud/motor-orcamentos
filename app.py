@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 96
+#  CONTADOR DE REVISÕES DESTE app.py: 97
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 96}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 97}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -3413,57 +3413,65 @@ def _rateio_info(access, pasta3, arquivo):
         for k in list(_RAT_INFO)[:30]: _RAT_INFO.pop(k,None)
     return info
 
-def _groq_casa_itens(linhas, rec):
-    """Groq casa cada item ao chamado cujo problema mais combina. Devolve {idx_item: numero_ticket|None}."""
-    itens_txt="\n".join(f"{i}: {l['descricao']}" for i,l in enumerate(linhas))
+def _linha_valor(a): return _num_br(a.get("quant"))*_num_br(a.get("valor_unit"))
+
+def _groq_casa_materiais(materiais, rec):
+    """Para cada MATERIAL, o Groq lista os chamados cujo PROBLEMA realmente usa aquele material.
+       Devolve {idx_material: [numeros_ticket]}."""
+    it_txt="\n".join(f"{i}: {m.get('descricao')}" for i,m in enumerate(materiais))
     tk_txt="\n".join(f"{t['numero']}: {t.get('descricao') or '(sem descrição)'}" for t in rec)
-    prompt=("Você distribui os ITENS de uma nota de material entre CHAMADOS de manutenção. "
-      "Para cada item, escolha o número do chamado cujo PROBLEMA tem mais a ver com aquele material. "
-      'Responda só JSON: {"atribuicoes":[{"item":0,"ticket":"126486"}]}. '
-      "Se um item não casar com nenhum, use ticket:null.\n\nITENS:\n"+itens_txt+"\n\nCHAMADOS:\n"+tk_txt)
+    prompt=("Você relaciona MATERIAIS de uma nota com CHAMADOS de manutenção. "
+      "Para CADA material, liste os números dos chamados cujo PROBLEMA realmente USA aquele material "
+      "(ex.: 'lâmpada/lamp' casa com chamado de TROCA DE LÂMPADA; 'refletor' NÃO casa com troca de lâmpada; "
+      "'painel'/'tampão' que não aparecem em nenhuma descrição -> lista vazia). "
+      "Seja rigoroso: só inclua o chamado se o material faz sentido para aquele problema. "
+      'Responda só JSON: {"relacoes":[{"material":0,"tickets":["126460","126465"]}]}.'
+      "\n\nMATERIAIS:\n"+it_txt+"\n\nCHAMADOS:\n"+tk_txt)
     c=_groq_chat([{"role":"user","content":prompt}], GROQ_TEXT_FALLBACK)
     d=_parse_json(c); out={}
-    for a in (d.get("atribuicoes") or []):
-        try: out[int(a.get("item"))]=(str(a.get("ticket")) if a.get("ticket") else None)
+    for a in (d.get("relacoes") or []):
+        try: out[int(a.get("material"))]=[str(x) for x in (a.get("tickets") or [])]
         except Exception: pass
     return out
 
-def _linha_valor(a): return _num_br(a.get("quant"))*_num_br(a.get("valor_unit"))
-def _ratear_itens(itens, rec, nao):
-    """Distribui os itens: casa com os reconhecidos (Groq), joga a sobra nos não associados,
-       e garante >=1 item por ticket fatiando quando preciso. Conserva 100% do valor."""
-    linhas=[{"descricao":it.get("descricao"),"unid":(it.get("unid") or "UN"),
-             "quant":_num_br(it.get("quant")),"valor_unit":_num_br(it.get("valor_unit"))} for it in itens]
-    aloc={t["numero"]:[] for t in rec}
-    for t in nao: aloc.setdefault(t,[])
+def _distribui(total, tickets):
+    """Distribui uma quantidade entre tickets. Inteiro -> unidades inteiras (resto nos primeiros)."""
+    n=len(tickets)
+    if n==0: return {}
+    if abs(total-round(total))<1e-9:
+        tot=int(round(total)); base=tot//n; resto=tot-base*n
+        return {t:(base+(1 if i<resto else 0)) for i,t in enumerate(tickets)}
+    q=round(total/n,4); d={t:q for t in tickets}
+    d[tickets[-1]]=round(total-q*(n-1),4)
+    return d
+
+def _ratear_matriz(itens, rec, nao):
+    """Monta a matriz material × ticket. Casa cada material com os chamados que o usam (Groq),
+       divide entre eles; material que não casa com ninguém é dividido entre TODOS.
+       Garante >=1 item por ticket. Devolve (materiais, todos_tickets)."""
+    rec_nums=[t["numero"] for t in rec]; todos=rec_nums+[t for t in nao if t not in rec_nums]
     mapa={}
-    if rec and linhas:
-        try: mapa=_groq_casa_itens(linhas, rec)
+    if rec and itens:
+        try: mapa=_groq_casa_materiais(itens, rec)
         except Exception: mapa={}
-    sobra=[]
-    for i,ln in enumerate(linhas):
-        tk=mapa.get(i)
-        if tk and tk in aloc: aloc[tk].append(dict(ln))
-        else: sobra.append(dict(ln))
-    destinos = nao if nao else [t["numero"] for t in rec]
-    for ln in sorted(sobra, key=lambda x:-_linha_valor(x)):
-        if not destinos: aloc[list(aloc)[0]].append(ln); continue
-        alvo=min(destinos, key=lambda d: sum(_linha_valor(a) for a in aloc[d]))
-        aloc[alvo].append(ln)
-    # garante >=1 item por ticket (fatia a maior linha de quem tem mais)
-    for _ in range(len(aloc)+2):
-        vazios=[d for d in aloc if not aloc[d]]
-        if not vazios: break
-        for d in vazios:
-            origem=max(aloc, key=lambda k: sum(_linha_valor(a) for a in aloc[k]))
-            if not aloc[origem] or origem==d: continue
-            aloc[origem].sort(key=lambda a:-_linha_valor(a))
-            ln=aloc[origem][0]; q=_num_br(ln["quant"])
-            qa=round(q/2,4) if q>0 else 0
-            if qa<=0: aloc[d].append(aloc[origem].pop(0)); continue
-            nova=dict(ln); nova["quant"]=qa; ln["quant"]=round(q-qa,4)
-            aloc[d].append(nova)
-    return aloc
+    materiais=[]
+    for i,it in enumerate(itens):
+        q=_num_br(it.get("quant")); vu=_num_br(it.get("valor_unit"))
+        matched=[t for t in (mapa.get(i) or []) if t in rec_nums]
+        destinos = matched if matched else todos
+        alloc=_distribui(q, destinos)
+        full={t:round(alloc.get(t,0),4) for t in todos}
+        materiais.append({"descricao":it.get("descricao"),"unid":it.get("unid") or "UN",
+                          "valor_unit":vu,"quant_total":q,"alloc":full})
+    # garante >=1 item por ticket (transfere metade da maior alocação de algum material)
+    def _tem(t): return any(m["alloc"].get(t,0)>0 for m in materiais)
+    for t in todos:
+        if _tem(t) or not materiais: continue
+        best=max(materiais, key=lambda m: m["quant_total"]*m["valor_unit"])
+        doador=max(best["alloc"], key=lambda k: best["alloc"][k])
+        mov=round(best["alloc"][doador]/2,4) or best["alloc"][doador]
+        best["alloc"][doador]=round(best["alloc"][doador]-mov,4); best["alloc"][t]=round(best["alloc"].get(t,0)+mov,4)
+    return materiais, todos
 
 @app.get("/rateio/notas")
 def rateio_notas(request: Request):
@@ -3526,18 +3534,15 @@ async def rateio_preparar(request: Request):
         else: nao.append(tk)
     if loja is None: raise HTTPException(400,"nenhum chamado reconhecido no banco — não sei a loja da nota")
     if len(lojas)>1: raise HTTPException(400,"os chamados são de lojas diferentes (o rateio exige a mesma loja)")
-    aloc=_ratear_itens(itens, rec, nao)
+    materiais, todos=_ratear_matriz(itens, rec, nao)
     abas={t["numero"]:t.get("aba") for t in rec}
-    saida=[]
-    for tk,lst in aloc.items():
-        saida.append({"ticket":tk,"reconhecido":tk in abas,"aba":abas.get(tk) or aba_pad,
-                      "descricao":next((t.get("descricao") for t in rec if t["numero"]==tk),None),
-                      "itens":lst,"total":round(sum(_linha_valor(a) for a in lst),2)})
+    tks=[{"numero":t,"reconhecido":t in abas,"aba":abas.get(t) or aba_pad,
+          "descricao":next((x.get("descricao") for x in rec if x["numero"]==t),None)} for t in todos]
     return {"ok":True,"arquivo":arquivo,"fornecedor":info.get("fornecedor"),"nota_numero":info.get("nota_numero"),
             "data_nota":info.get("data"),"total_nota":info.get("valor"),
             "loja":{"numero":loja.get("numero"),"nome":loja.get("nome"),"cnpj":loja.get("cnpj"),
                     "endereco":loja.get("endereco"),"cidade":loja.get("cidade")},
-            "alocacao":saida}
+            "tickets":tks,"materiais":materiais}
 
 _RAT_JOBS={}; _RAT_SEQ=[0]
 def _rat_job_run(job, dados_job, uid, papel):
