@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 79
+#  CONTADOR DE REVISÕES DESTE app.py: 81
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 79}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 81}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2212,7 +2212,7 @@ def orc_listar(request: Request):
     if not arqs: out["diag"]=_orc_diag(access)   # ajuda a achar a estrutura quando vem vazio
     return out
 
-_ST_MAP={"1":"Aberto","5":"Vistoriado","6":"Em execução","7":"Executado"}
+_ST_MAP={"1":"Aberto","3":"Arquivado","5":"Vistoriado","6":"Em execução","7":"Executado"}
 def _chamados_query(q="", aba="", status="", desde="", ate=""):
     parts=["select=numero,aba,loja,status,tipo_predial,prioridade,solicitante,responsavel,data_criacao,prazo",
            "order=data_criacao.desc","limit=3000"]
@@ -2386,19 +2386,31 @@ def _numf(x):
     except Exception: return 0.0
 def _reais(v): return "R$ "+f"{_numf(v):,.2f}".replace(",","·").replace(".",",").replace("·",".")
 
+_MESES_CURTO=["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"]
+def _mes_label(ym):   # 'YYYY-MM' -> 'jul/2026'
+    try: y,m=ym.split("-"); return f"{_MESES_CURTO[int(m)-1]}/{y}"
+    except Exception: return ym
 def _stat_chamados(q="",aba="",desde="",ate=""):
-    # só chamados ATENDIDOS (Executado/Vistoriado) entram nas estatísticas
-    rows=[r for r in _chamados_query(q,aba,"",desde,ate) if (r.get("status") in _ATENDIDOS)]
-    por_status={"Executado":0,"Vistoriado":0}; por_aba={"Civil":0,"Instalações":0}; por_loja={}; por_tipo={}
+    # "atendidos" = chamados que atingiram o MARCO do vistoriado (atendido=true),
+    # no período pela DATA DA VISTORIA (atendido_em) — mesmo que hoje estejam fechados/arquivados.
+    parts=["select=numero,aba,loja,tipo_predial,atendido_em","atendido=is.true","limit=10000"]
+    if aba:   parts.append(f"aba=eq.{urllib.parse.quote(aba)}")
+    if desde: parts.append(f"atendido_em=gte.{desde}")
+    if ate:   parts.append(f"atendido_em=lte.{ate}")
+    if q and len(q)>=3: parts.append("or="+urllib.parse.quote(f"(numero.ilike.*{q}*,loja.ilike.*{q}*)"))
+    rows=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(parts),SB_KEY) or []
+    por_aba={"Civil":0,"Instalações":0}; por_loja={}; por_tipo={}; por_mes={}
     for r in rows:
-        s=r.get("status") or "—"; por_status[s]=por_status.get(s,0)+1
         ab=_abacurta(r.get("aba"))
         if ab in por_aba: por_aba[ab]+=1
         lj=r.get("loja") or "—"; por_loja[lj]=por_loja.get(lj,0)+1
         tp=r.get("tipo_predial") or "—"; por_tipo[tp]=por_tipo.get(tp,0)+1
+        ym=(r.get("atendido_em") or "")[:7]
+        if ym: por_mes[ym]=por_mes.get(ym,0)+1
     lojas=sorted(({"loja":k,"total":v} for k,v in por_loja.items()),key=lambda x:-x["total"])
     tipos=sorted(({"tipo":k,"total":v} for k,v in por_tipo.items()),key=lambda x:-x["total"])
-    return {"total":len(rows),"atendidos":len(rows),"por_status":por_status,"por_aba":por_aba,"por_loja":lojas,"por_tipo":tipos}
+    meses=[{"mes":_mes_label(k),"total":v} for k,v in sorted(por_mes.items())]
+    return {"total":len(rows),"atendidos":len(rows),"por_aba":por_aba,"por_loja":lojas,"por_tipo":tipos,"por_mes":meses}
 
 @app.get("/orc/stat_chamados")
 def orc_stat_chamados(request: Request, q: str="", aba: str="", desde: str="", ate: str=""):
@@ -2414,9 +2426,9 @@ def orc_stat_chamados_pdf(request: Request, q: str="", aba: str="", desde: str="
     d=_stat_chamados(q,aba,desde,ate)
     linhas=[[l["loja"][:34], str(l["total"])] for l in d["por_loja"]]
     sub=(f"{_abacurta(aba)} · " if aba else "")+(f"{desde}→{ate}" if (desde or ate) else "")
-    resumo=(f"Atendidos {d['atendidos']} · "
-            f"Executado {d['por_status'].get('Executado',0)} · Vistoriado {d['por_status'].get('Vistoriado',0)}")
-    pdf=_lista_pdf("Estatística — Chamados atendidos", ["Loja","Chamados"], linhas,
+    civ=d["por_aba"].get("Civil",0); ins=d["por_aba"].get("Instalações",0)
+    resumo=f"Atendidos (vistoriados) {d['atendidos']} · Civil {civ} · Instalações {ins}"
+    pdf=_lista_pdf("Estatística — Chamados atendidos", ["Loja","Atendidos"], linhas,
                    subtitulo=resumo+(f"  |  {sub}" if sub else ""), aligns={1:'RIGHT'})
     return Response(content=pdf, media_type="application/pdf",
         headers={"Content-Disposition":'attachment; filename="estatistica_chamados.pdf"'})
@@ -2439,9 +2451,13 @@ def _stat_financeiro(aba="",desde="",ate="",mes="",loja=""):
         ab=_abacurta(r.get("aba"))
         if ab in por_aba: por_aba[ab]["orc"]+=vo; por_aba[ab]["n"]+=1
         mr=r.get("mes_ref") or "—"; mm=por_mes.setdefault(mr,{"n":0,"orc":0.0}); mm["n"]+=1; mm["orc"]+=vo
-    try: ch=_chamados_query("",aba,"",desde,ate)
-    except Exception: ch=[]
-    n_atend=sum(1 for c in ch if (c.get("status") in _ATENDIDOS))
+    # denominador: chamados ATENDIDOS (marco vistoriado) no período, pela data da vistoria
+    ap=["select=numero","atendido=is.true","limit=10000"]
+    if aba:   ap.append(f"aba=eq.{urllib.parse.quote(aba)}")
+    if desde: ap.append(f"atendido_em=gte.{desde}")
+    if ate:   ap.append(f"atendido_em=lte.{ate}")
+    try: n_atend=len(_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or [])
+    except Exception: n_atend=0
     com_mat=len(tickets)
     lojas=sorted(({"loja":k,**v} for k,v in por_loja.items()),key=lambda x:-x["orc"])
     meses=[{"mes":k,**v} for k,v in por_mes.items()]
