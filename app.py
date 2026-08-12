@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 85
+#  CONTADOR DE REVISÕES DESTE app.py: 86
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 85}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 86}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2139,7 +2139,10 @@ def _groq_post(messages, model, json_mode=True):
     if json_mode: payload["response_format"]={"type":"json_object"}
     req=urllib.request.Request("https://api.groq.com/openai/v1/chat/completions",
         data=json.dumps(payload).encode(),
-        headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json","Accept":"application/json"})
+        headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json","Accept":"application/json",
+                 # Cloudflare barra sem UA de navegador (erro 1010 browser_signature_banned)
+                 "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
     try:
         raw=urllib.request.urlopen(req,timeout=90).read().decode()
     except urllib.error.HTTPError as e:
