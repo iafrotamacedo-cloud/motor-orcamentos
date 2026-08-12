@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 92
+#  CONTADOR DE REVISÕES DESTE app.py: 93
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 92}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 93}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2425,6 +2425,7 @@ def _ler_notas_rota(fb, mime, nome, it, st):
     if texto and len(texto)>=30:
         notas=_parse_nota_local(texto)
         if notas and _leitura_ok(notas, texto):
+            _formato_registra(texto, _qual_formato(texto), notas[0].get("nota_numero"))   # aprende o layout
             return notas, ("pdf" if origem=="digital" else "ocr-pdf")
         if notas and not _notas_seguras(notas):
             it["diag"]="leitor local: itens incompletos"
@@ -2436,7 +2437,9 @@ def _ler_notas_rota(fb, mime, nome, it, st):
             it["etapa"]="groq"; it["status"]=("lendo com Groq (OCR)" if origem=="ocr" else "lendo com Groq")
             try:
                 g=_groq_notas_texto(texto)
-                if g and _leitura_ok(g, texto): return g, ("groq-ocr" if origem=="ocr" else "groq")
+                if g and _leitura_ok(g, texto):
+                    _formato_registra(texto, "groq", g[0].get("nota_numero"))
+                    return g, ("groq-ocr" if origem=="ocr" else "groq")
                 it["diag"]="Groq leu incompleto / total não bateu"
             except Exception as e: it["diag"]=f"Groq: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
 
@@ -3255,6 +3258,322 @@ def orc_notas_pasta(request: Request):
     except Exception as e:
         raise HTTPException(500,f"lista: {str(e)[:160]}")
 
+# ==================================================================
+#  MEMÓRIA DE FORMATOS POR FORNECEDOR (aprende o layout por CNPJ)
+# ==================================================================
+_FROTA_CNPJ = re.sub(r"\D","",FAT_CNPJ)
+def _cnpjs(texto):
+    return [re.sub(r"\D","",m) for m in re.findall(r"\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}", texto or "")]
+def _cnpj_emitente(texto):
+    """CNPJ de quem EMITIU a nota (ignora o CNPJ da Frota, que é o destinatário)."""
+    for c in _cnpjs(texto):
+        if len(c)==14 and c!=_FROTA_CNPJ: return c
+    return None
+def _nome_emitente(texto):
+    m=(re.search(r"RECEBEMOS DE\s+(.+?)\s+OS PRODUTOS", texto or "", re.I)
+       or re.search(r"Raz[ãa]o Social\s*:?\s*(.+)", texto or "", re.I)
+       or re.search(r"EMITENTE\s*:?\s*(.+)", texto or "", re.I))
+    return (re.sub(r"\s{2,}"," ",m.group(1)).strip()[:80] if m else None)
+def _qual_formato(texto):
+    up=(texto or "").upper()
+    if "DADOS DO PRODUTO" in up or "DOCUMENTO AUXILIAR DA" in up: return "danfe"
+    return "dav"
+def _formato_registra(texto, formato, nota):
+    """Grava/incrementa o formato aprendido para o CNPJ do emitente. Best-effort."""
+    try:
+        cnpj=_cnpj_emitente(texto)
+        if not cnpj: return
+        _sb_json(f"{SB_URL}/rest/v1/rpc/formato_inc", SB_KEY, data={
+            "p_cnpj":cnpj,"p_nome":_nome_emitente(texto),"p_formato":formato,"p_nota":str(nota or "")}, method="POST")
+    except Exception: pass
+
+@app.get("/config/formatos")
+def config_formatos(request: Request):
+    """Lista os formatos já aprendidos por fornecedor (memória que cresce com o uso)."""
+    exige(request,"GERAR_ORCAMENTOS")
+    try:
+        rows=_sb_json(f"{SB_URL}/rest/v1/formatos_fornecedor?select=cnpj,nome,formato,acertos,ultima_em&order=acertos.desc&limit=500",SB_KEY) or []
+    except Exception: rows=[]
+    return {"formatos":rows}
+
+# ==================================================================
+#  RATEIO DE NOTAS (1 nota dividida entre vários chamados)
+# ==================================================================
+def _mime_de(nome):
+    nl=(nome or "").lower()
+    return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
+
+def _rateio_base(access):
+    mb=_manut_base(access); ob=_orc_base(access,mb); return ob
+
+def _rateio_pasta3(access, ob=None):
+    ob=ob or _rateio_base(access)
+    return _pasta_manut(access,3,ob) or (ob + "/3 - NOTAS PARA RATEIO")
+
+def _rateio_leitura(fb, mime, nome):
+    """Lê a nota do rateio pela mesma cascata (sem Gemini): texto/OCR -> parser local -> Groq.
+       Devolve (notas, texto)."""
+    is_pdf=(nome or "").lower().endswith(".pdf") or mime=="application/pdf"
+    texto=""
+    if is_pdf: texto=_pdf_texto(fb)
+    if len(texto)<40:
+        try: texto=_ocr_texto(fb, mime, nome)
+        except Exception: texto=""
+    notas=_parse_nota_local(texto)
+    if notas and _leitura_ok(notas, texto):
+        _formato_registra(texto,_qual_formato(texto),notas[0].get("nota_numero")); return notas, texto
+    if GROQ_KEY and texto:
+        try:
+            g=_groq_notas_texto(texto)
+            if g and _leitura_ok(g, texto):
+                _formato_registra(texto,"groq",g[0].get("nota_numero")); return g, texto
+        except Exception: pass
+    return (notas or []), texto
+
+_RAT_INFO={}   # cache de leitura por arquivo
+def _rateio_info(access, pasta3, arquivo):
+    if arquivo in _RAT_INFO: return _RAT_INFO[arquivo]
+    fb=dropbox_rateio.baixar(access,f"{pasta3}/{arquivo}")
+    if not fb: return {"ok":False,"erro":"não baixou o arquivo"}
+    notas,texto=_rateio_leitura(fb,_mime_de(arquivo),arquivo)
+    if not notas:
+        info={"ok":False,"erro":"não consegui ler a nota (formato novo?)"}
+    else:
+        nt=notas[0]
+        info={"ok":True,"arquivo":arquivo,"fornecedor":_nome_emitente(texto) or "—",
+              "data":nt.get("data_nota"),"valor":_soma_itens(notas),
+              "nota_numero":nt.get("nota_numero"),"cnpj":_cnpj_emitente(texto),
+              "itens":nt.get("itens") or []}
+    _RAT_INFO[arquivo]=info
+    if len(_RAT_INFO)>60:
+        for k in list(_RAT_INFO)[:30]: _RAT_INFO.pop(k,None)
+    return info
+
+def _groq_casa_itens(linhas, rec):
+    """Groq casa cada item ao chamado cujo problema mais combina. Devolve {idx_item: numero_ticket|None}."""
+    itens_txt="\n".join(f"{i}: {l['descricao']}" for i,l in enumerate(linhas))
+    tk_txt="\n".join(f"{t['numero']}: {t.get('descricao') or '(sem descrição)'}" for t in rec)
+    prompt=("Você distribui os ITENS de uma nota de material entre CHAMADOS de manutenção. "
+      "Para cada item, escolha o número do chamado cujo PROBLEMA tem mais a ver com aquele material. "
+      'Responda só JSON: {"atribuicoes":[{"item":0,"ticket":"126486"}]}. '
+      "Se um item não casar com nenhum, use ticket:null.\n\nITENS:\n"+itens_txt+"\n\nCHAMADOS:\n"+tk_txt)
+    c=_groq_chat([{"role":"user","content":prompt}], GROQ_TEXT_FALLBACK)
+    d=_parse_json(c); out={}
+    for a in (d.get("atribuicoes") or []):
+        try: out[int(a.get("item"))]=(str(a.get("ticket")) if a.get("ticket") else None)
+        except Exception: pass
+    return out
+
+def _linha_valor(a): return _num_br(a.get("quant"))*_num_br(a.get("valor_unit"))
+def _ratear_itens(itens, rec, nao):
+    """Distribui os itens: casa com os reconhecidos (Groq), joga a sobra nos não associados,
+       e garante >=1 item por ticket fatiando quando preciso. Conserva 100% do valor."""
+    linhas=[{"descricao":it.get("descricao"),"unid":(it.get("unid") or "UN"),
+             "quant":_num_br(it.get("quant")),"valor_unit":_num_br(it.get("valor_unit"))} for it in itens]
+    aloc={t["numero"]:[] for t in rec}
+    for t in nao: aloc.setdefault(t,[])
+    mapa={}
+    if rec and linhas:
+        try: mapa=_groq_casa_itens(linhas, rec)
+        except Exception: mapa={}
+    sobra=[]
+    for i,ln in enumerate(linhas):
+        tk=mapa.get(i)
+        if tk and tk in aloc: aloc[tk].append(dict(ln))
+        else: sobra.append(dict(ln))
+    destinos = nao if nao else [t["numero"] for t in rec]
+    for ln in sorted(sobra, key=lambda x:-_linha_valor(x)):
+        if not destinos: aloc[list(aloc)[0]].append(ln); continue
+        alvo=min(destinos, key=lambda d: sum(_linha_valor(a) for a in aloc[d]))
+        aloc[alvo].append(ln)
+    # garante >=1 item por ticket (fatia a maior linha de quem tem mais)
+    for _ in range(len(aloc)+2):
+        vazios=[d for d in aloc if not aloc[d]]
+        if not vazios: break
+        for d in vazios:
+            origem=max(aloc, key=lambda k: sum(_linha_valor(a) for a in aloc[k]))
+            if not aloc[origem] or origem==d: continue
+            aloc[origem].sort(key=lambda a:-_linha_valor(a))
+            ln=aloc[origem][0]; q=_num_br(ln["quant"])
+            qa=round(q/2,4) if q>0 else 0
+            if qa<=0: aloc[d].append(aloc[origem].pop(0)); continue
+            nova=dict(ln); nova["quant"]=qa; ln["quant"]=round(q-qa,4)
+            aloc[d].append(nova)
+    return aloc
+
+@app.get("/rateio/notas")
+def rateio_notas(request: Request):
+    from fastapi import HTTPException
+    exige(request,"RATEIO_NOTAS")
+    try:
+        access=dropbox_rateio.obter_token(); p3=_rateio_pasta3(access)
+        arqs=sorted([a for a in dropbox_rateio.listar(access,p3) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))])
+        return {"arquivos":arqs,"total":len(arqs)}
+    except Exception as e: raise HTTPException(500,f"lista: {str(e)[:160]}")
+
+@app.get("/rateio/nota_info")
+def rateio_nota_info(request: Request, arquivo: str=""):
+    from fastapi import HTTPException
+    exige(request,"RATEIO_NOTAS")
+    try:
+        access=dropbox_rateio.obter_token(); p3=_rateio_pasta3(access)
+        return _rateio_info(access,p3,arquivo)
+    except Exception as e: raise HTTPException(500,f"info: {str(e)[:160]}")
+
+@app.get("/rateio/pdf")
+def rateio_pdf(request: Request, arquivo: str=""):
+    from fastapi import HTTPException
+    exige(request,"RATEIO_NOTAS")
+    try:
+        access=dropbox_rateio.obter_token(); p3=_rateio_pasta3(access)
+        fb=dropbox_rateio.baixar(access,f"{p3}/{arquivo}")
+        if not fb: raise HTTPException(404,"arquivo não encontrado")
+        return Response(content=fb, media_type=_mime_de(arquivo))
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500,f"pdf: {str(e)[:160]}")
+
+def _ticket_info(tk):
+    """Dados do chamado p/ o rateio: descrição, aba e a loja (do cadastro)."""
+    ch=_sb_json(f"{SB_URL}/rest/v1/chamados?numero=eq.{urllib.parse.quote(tk)}&select=loja,aba,descricao&limit=1",SB_KEY) or []
+    if not ch: return {"numero":tk,"reconhecido":False,"descricao":None,"aba":None,"loja":None}
+    lj=_loja_do_ticket(tk) or {}
+    return {"numero":tk,"reconhecido":True,"descricao":ch[0].get("descricao"),
+            "aba":ch[0].get("aba"),"loja":lj.get("loja")}
+
+@app.post("/rateio/preparar")
+async def rateio_preparar(request: Request):
+    from fastapi import HTTPException
+    exige(request,"RATEIO_NOTAS")
+    b=await request.json()
+    arquivo=b.get("arquivo"); tickets=[re.sub(r"\D","",str(t))[:6] for t in (b.get("tickets") or []) if re.sub(r"\D","",str(t))]
+    tickets=[t for i,t in enumerate(tickets) if t and t not in tickets[:i]]   # únicos, ordem preservada
+    if len(tickets)<2: raise HTTPException(400,"informe pelo menos 2 chamados")
+    access=dropbox_rateio.obter_token(); p3=_rateio_pasta3(access)
+    info=_rateio_info(access,p3,arquivo)
+    if not info.get("ok"): raise HTTPException(400, info.get("erro") or "não consegui ler a nota")
+    itens=info["itens"]
+    rec=[]; nao=[]; loja=None; aba_pad=None; lojas=set()
+    for tk in tickets:
+        ti=_ticket_info(tk)
+        if ti["reconhecido"]:
+            rec.append(ti)
+            if ti.get("loja"): lojas.add(ti["loja"].get("numero"))
+            if loja is None and ti.get("loja"): loja=ti["loja"]; aba_pad=ti.get("aba")
+        else: nao.append(tk)
+    if loja is None: raise HTTPException(400,"nenhum chamado reconhecido no banco — não sei a loja da nota")
+    if len(lojas)>1: raise HTTPException(400,"os chamados são de lojas diferentes (o rateio exige a mesma loja)")
+    aloc=_ratear_itens(itens, rec, nao)
+    abas={t["numero"]:t.get("aba") for t in rec}
+    saida=[]
+    for tk,lst in aloc.items():
+        saida.append({"ticket":tk,"reconhecido":tk in abas,"aba":abas.get(tk) or aba_pad,
+                      "descricao":next((t.get("descricao") for t in rec if t["numero"]==tk),None),
+                      "itens":lst,"total":round(sum(_linha_valor(a) for a in lst),2)})
+    return {"ok":True,"arquivo":arquivo,"fornecedor":info.get("fornecedor"),"nota_numero":info.get("nota_numero"),
+            "data_nota":info.get("data"),"total_nota":info.get("valor"),
+            "loja":{"numero":loja.get("numero"),"nome":loja.get("nome"),"cnpj":loja.get("cnpj"),
+                    "endereco":loja.get("endereco"),"cidade":loja.get("cidade")},
+            "alocacao":saida}
+
+_RAT_JOBS={}; _RAT_SEQ=[0]
+def _rat_job_run(job, dados_job, uid, papel):
+    st=_RAT_JOBS[job]
+    try:
+        access=dropbox_rateio.obter_token(); ob=_rateio_base(access)
+        P4=_pasta_manut(access,4,ob); P11=_pasta_manut(access,11,ob)
+        P8=_pasta_manut(access,8,ob); P9=_pasta_manut(access,9,ob); p3=_rateio_pasta3(access,ob)
+        arquivo=dados_job["arquivo"]; nota_num=_num_limpo(dados_job.get("nota_numero")) or "SN"
+        loja=dados_job["loja"]; alocacao=dados_job["alocacao"]; ext=os.path.splitext(arquivo)[1] or ".pdf"
+        loja_nome=loja.get("nome") or "—"; slug=_slug_loja(loja,"")
+        mes=_mes_atual(); hoje=datetime.date.today().strftime("%d/%m/%Y")
+        st["total"]=len(alocacao); res=st["res"]
+        for _i,al in enumerate(alocacao):
+            tk=str(al.get("ticket")); aba=al.get("aba")
+            itens_orc=[{"descricao":x.get("descricao"),"quant":_num_br(x.get("quant")),
+                        "unid":x.get("unid") or "UN","valor_unit":_num_br(x.get("valor_unit"))} for x in (al.get("itens") or [])]
+            valor_nota=round(sum(i["valor_unit"]*i["quant"] for i in itens_orc),2)
+            valor_orc=round(valor_nota*1.20,2)
+            r={"ticket":tk,"itens":len(itens_orc),"valor_nota":valor_nota,"valor_orcamento":valor_orc}
+            if not itens_orc: r["status"]="pulado"; r["motivo"]="sem itens"; res.append(r); st["feitas"]=_i+1; continue
+            if _nota_ja_gerada(tk, nota_num):
+                r["status"]="duplicada"; r["motivo"]="orçamento já existe para este ticket/nota"; res.append(r); st["feitas"]=_i+1; continue
+            extrap=valor_nota>ORC_EXTRAPOLA
+            dados={"num":tk,"revisao":1,"data":hoje,"loja_nome":loja_nome,
+                "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
+                "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":loja.get("cnpj"),
+                           "endereco":loja.get("endereco"),
+                           "cidade":((loja.get("cidade") or ""))+(" - CE" if loja.get("cidade") else "")},
+                "itens":itens_orc}
+            base_nome=f"{slug}_{tk}_NOTA_{nota_num}_RATEIO"; arq_pdf=arq_doc=None
+            try:
+                doc_bytes=gera_orcamento_docx(dados)
+                if extrap:
+                    if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                else:
+                    pdf_bytes=gera_orcamento_pdf(dados)
+                    if P4: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P4}/{base_nome}.pdf",overwrite=True); arq_pdf=f"4/{base_nome}.pdf"
+                    if P11:
+                        dropbox_rateio.criar_pasta(access,f"{P11}/{mes}"); dropbox_rateio.criar_pasta(access,f"{P11}/{mes}/{slug}")
+                        dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P11}/{mes}/{slug}/{base_nome}.pdf",overwrite=True)
+                        dropbox_rateio.subir_bytes(access,doc_bytes,f"{P11}/{mes}/{slug}/{base_nome}.docx",overwrite=True)
+                        arq_pdf=f"11/{mes}/{slug}/{base_nome}.pdf"; arq_doc=f"11/{mes}/{slug}/{base_nome}.docx"
+            except Exception as e: r["motivo"]=f"salvar: {str(e)[:90]}"
+            _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":tk,
+                "loja_numero":loja.get("numero"),"loja_nome":loja_nome,"aba":aba,
+                "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
+                "rateio":True,"itens":itens_orc,"data_nota":_data_iso(dados_job.get("data_nota")),"mes_ref":mes,
+                "arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc,"criado_por":uid})
+            r["status"]="ok"; r["loja"]=loja_nome; res.append(r); st["feitas"]=_i+1
+        # move a nota para a pasta 8 (uma vez, no fim)
+        sub="INSTALACOES" if (alocacao and (alocacao[0].get("aba") or "").upper().startswith("INST")) else ("CIVIL" if (alocacao and (alocacao[0].get("aba") or "").upper().startswith("CIV")) else "SEM CLASSIFICACAO")
+        if P8:
+            try:
+                dropbox_rateio.criar_pasta(access,f"{P8}/{sub}")
+                dropbox_rateio.mover(access,f"{p3}/{arquivo}",f"{P8}/{sub}/RATEIO_{nota_num}_{os.path.splitext(arquivo)[0]}{ext}")
+            except Exception: pass
+        _RAT_INFO.pop(arquivo,None)
+        ok=sum(1 for x in res if x.get("status")=="ok")
+        log_frotahub(uid,papel,"RATEIO_NOTAS","RATEOU",f"{ok}/{len(alocacao)} · nota {nota_num}")
+        st["gerados"]=ok; st["estado"]="pronto"
+    except Exception as e:
+        st["estado"]="erro"; st["erro"]=str(e)[:300]
+
+@app.post("/rateio/gerar")
+async def rateio_gerar(request: Request):
+    from fastapi import HTTPException
+    import threading
+    u,p=exige(request,"RATEIO_NOTAS")
+    b=await request.json()
+    arquivo=b.get("arquivo"); alocacao=b.get("alocacao") or []; loja_numero=b.get("loja_numero")
+    total_nota=_num_br(b.get("total_nota"))
+    if not arquivo or not alocacao: raise HTTPException(400,"faltam dados do rateio")
+    # confere conservação (a soma dos rateios tem que fechar o valor da nota)
+    soma=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for al in alocacao for x in (al.get("itens") or [])),2)
+    if total_nota>0 and abs(soma-total_nota)>max(0.05,0.01*total_nota):
+        raise HTTPException(400,f"a soma dos rateios (R$ {soma}) não fecha o total da nota (R$ {total_nota})")
+    if any(not (al.get("itens")) for al in alocacao):
+        raise HTTPException(400,"todo chamado precisa de pelo menos 1 item")
+    # loja oficial (do cadastro), nunca do cliente
+    lj=(_sb_json(f"{SB_URL}/rest/v1/lojas?numero=eq.{int(loja_numero)}&limit=1",SB_KEY) or [None])[0] if loja_numero is not None else None
+    if not lj: raise HTTPException(400,"loja não encontrada no cadastro")
+    _RAT_SEQ[0]+=1; job=str(_RAT_SEQ[0])
+    if len(_RAT_JOBS)>20:
+        for k in list(_RAT_JOBS)[:-10]: _RAT_JOBS.pop(k,None)
+    _RAT_JOBS[job]={"estado":"rodando","total":0,"feitas":0,"gerados":0,"res":[]}
+    dados_job={"arquivo":arquivo,"nota_numero":b.get("nota_numero"),"data_nota":b.get("data_nota"),
+               "loja":lj,"alocacao":alocacao}
+    threading.Thread(target=_rat_job_run,args=(job,dados_job,u["id"],p["papel"]),daemon=True).start()
+    return {"job":job}
+
+@app.get("/rateio/gerar_status")
+def rateio_gerar_status(request: Request, job: str=""):
+    from fastapi import HTTPException
+    exige(request,"RATEIO_NOTAS")
+    j=_RAT_JOBS.get(job)
+    if not j: raise HTTPException(404,"job não encontrado")
+    return {"estado":j["estado"],"total":j["total"],"feitas":j["feitas"],"gerados":j["gerados"],
+            "erro":j.get("erro"),"resultados":j["res"]}
+
 # ================= USUÁRIOS / LOGINS / CATEGORIAS / PIN =================
 import hashlib
 PIN_PEPPER  = os.environ.get("PIN_PEPPER", "frotahub-pin-v1")
@@ -3534,6 +3853,7 @@ def _basic_auth(app, user, pw):
         if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
                                         or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
                                         or _path.startswith("/desfazer") or _path.startswith("/usuarios") or _path.startswith("/config")
+                                        or _path.startswith("/rateio")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
