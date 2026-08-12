@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 78
+#  CONTADOR DE REVISÕES DESTE app.py: 79
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 78}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 79}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2192,6 +2192,13 @@ def _orc_registra(row):
     try: urllib.request.urlopen(req,timeout=30)
     except urllib.error.HTTPError as e: print("notas_orcamento erro:",e.read().decode()[:200],flush=True)
 
+def _nota_ja_gerada(ticket, nota_num):
+    """True se já existe orçamento gerado para (ticket, nota) — evita reprocessar a MESMA nota."""
+    if not nota_num or str(nota_num)=="SN": return False
+    q=urllib.parse.urlencode({"ticket":f"eq.{ticket}","nota_numero":f"eq.{nota_num}","status":"eq.gerado","select":"ticket","limit":"1"})
+    try: return bool(_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY))
+    except Exception: return False
+
 @app.post("/orc/listar")
 def orc_listar(request: Request):
     from fastapi import HTTPException
@@ -2677,6 +2684,10 @@ def _orc_job_run(job, previa, uid, papel):
                 slug=_slug_loja(loja,lj.get("unidade"))
                 mes=_mes_atual()   # roteia pelo mês em que o orçamento é GERADO (não pela data da nota/DAV)
                 info.update(status="ok",loja=loja_nome,loja_numero=(loja.get("numero") if loja else None),extrapolado=extrap,mes=mes)
+                if _nota_ja_gerada(ticket, nota_num):
+                    # nota já processada antes -> não gera, não grava, não move (fica na pasta 0 sinalizada)
+                    info.update(status="duplicada",motivo="nota já processada — orçamento já existe",destino="—")
+                    res.append(info); continue
                 if not previa:
                     # dados do orçamento
                     hoje=datetime.date.today().strftime("%d/%m/%Y")
