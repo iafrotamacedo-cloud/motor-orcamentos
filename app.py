@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 81
+#  CONTADOR DE REVISÕES DESTE app.py: 83
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 81}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 83}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1902,6 +1902,9 @@ MANUT_BASE   = os.environ.get("MANUT_BASE", "/FROTAHUB/2 - MANUTENCAO").rstrip("
 ORC_NOTAS    = MANUT_BASE + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_RPD     = int(os.environ.get("GEMINI_RPD", "500"))   # cota diária do plano grátis (requisições/dia)
+GROQ_TEXT_MODEL= os.environ.get("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")   # leitor de PDF (texto) — gratuito
+GROQ_VIS_MODEL = os.environ.get("GROQ_VIS_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")  # PDF escaneado (visão)
 _ORC_GEMINI_OK = None   # memoriza o 1º modelo que funcionar no leitor de notas
 ORC_EXTRAPOLA  = float(os.environ.get("ORC_EXTRAPOLA", "500"))   # nota (antes do +20%) acima disso -> extrapolado
 _LOGO_ORC_B64  = "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"
@@ -2081,6 +2084,7 @@ def _ler_notas_gemini(file_bytes, mime="application/pdf"):
             r=model.generate_content([{"mime_type":mime,"data":file_bytes},_ORC_PROMPT],
                 generation_config={"response_mime_type":"application/json","temperature":0})
             _ORC_GEMINI_OK=nome
+            _gemini_conta_inc()   # contabiliza 1 requisição na cota do dia
             try: return (json.loads(r.text) or {}).get("notas") or []
             except Exception: return []
         except Exception as e:
@@ -2091,6 +2095,117 @@ def _ler_notas_gemini(file_bytes, mime="application/pdf"):
                 continue           # cota nesse modelo → tenta o próximo (cotas separadas)
             raise                  # chave/rede/outro → propaga
     raise RuntimeError(f"Gemini indisponível: {ultimo}")
+
+# ---------- CONTADOR DE COTA DO GEMINI (por dia) ----------
+def _hoje_iso():
+    return datetime.date.today().isoformat()
+
+def _gemini_conta_inc():
+    """Soma +1 na cota do dia (atômico via RPC gemini_inc). Best-effort."""
+    try:
+        _sb_json(f"{SB_URL}/rest/v1/rpc/gemini_inc", SB_KEY, data={"p_dia":_hoje_iso()}, method="POST")
+    except Exception: pass
+
+def _gemini_cota():
+    """Devolve {'dia','limite','usados','restantes'} da cota do dia."""
+    usados=0
+    try:
+        r=_sb_json(f"{SB_URL}/rest/v1/gemini_uso?dia=eq.{_hoje_iso()}&select=usados&limit=1", SB_KEY) or []
+        if r: usados=int(r[0].get("usados") or 0)
+    except Exception: pass
+    return {"dia":_hoje_iso(), "limite":GEMINI_RPD, "usados":usados,
+            "restantes":max(0, GEMINI_RPD-usados)}
+
+# ---------- LEITURA DE NOTAS: Gemini (imagem) + Groq (PDF) ----------
+def _pdf_texto(fb):
+    """Extrai o texto de um PDF (camada de texto). Vazio => PDF escaneado/imagem."""
+    import tempfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(fb); pth=f.name
+        out=subprocess.run(["pdftotext","-layout",pth,"-"],capture_output=True,text=True,timeout=60)
+        try: os.unlink(pth)
+        except Exception: pass
+        return (out.stdout or "").strip()
+    except Exception:
+        return ""
+
+def _groq_chat(messages, model):
+    payload={"model":model,"temperature":0,"messages":messages,
+             "response_format":{"type":"json_object"}}
+    req=urllib.request.Request("https://api.groq.com/openai/v1/chat/completions",
+        data=json.dumps(payload).encode(),
+        headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json","Accept":"application/json"})
+    try:
+        raw=urllib.request.urlopen(req,timeout=90).read().decode()
+    except urllib.error.HTTPError as e:
+        body=""
+        try: body=e.read().decode("utf-8","ignore")
+        except Exception: pass
+        raise RuntimeError(f"Groq {e.code}: {body[:300]}") from None
+    c=json.loads(raw)["choices"][0]["message"]["content"]
+    try: return (json.loads(c) or {}).get("notas") or []
+    except Exception: return []
+
+def _groq_notas_texto(texto):
+    """Lê as notas a partir do TEXTO do PDF (gratuito, sem gastar cota do Gemini)."""
+    msgs=[{"role":"system","content":_ORC_PROMPT},
+          {"role":"user","content":"TEXTO EXTRAÍDO DO PDF (pode conter mais de uma nota):\n\n"+texto[:24000]}]
+    return _groq_chat(msgs, GROQ_TEXT_MODEL)
+
+def _groq_notas_img_bytes(fb, mime):
+    """PDF escaneado (sem texto): manda a 1ª página como imagem para o Groq (visão)."""
+    import base64
+    b64=base64.b64encode(fb).decode()
+    msgs=[{"role":"user","content":[
+        {"type":"text","text":_ORC_PROMPT},
+        {"type":"image_url","image_url":{"url":f"data:{mime};base64,{b64}"}}]}]
+    return _groq_chat(msgs, GROQ_VIS_MODEL)
+
+def _ler_notas(fb, mime, nome):
+    """Roteia a leitura: IMAGEM -> Gemini (visão); PDF -> Groq (texto; escaneado -> visão).
+       Trava o Gemini para NÃO ler PDF quando o Groq estiver configurado (economiza cota).
+       Sem chave Groq, cai no Gemini para não travar a operação."""
+    is_pdf = (nome or "").lower().endswith(".pdf") or mime=="application/pdf"
+    if not is_pdf:
+        return _ler_notas_gemini(fb, mime)          # imagem -> Gemini
+    if GROQ_KEY:
+        txt=_pdf_texto(fb)
+        if len(txt) >= 40:                          # tem camada de texto -> leitor local + Groq
+            try: return _groq_notas_texto(txt)
+            except Exception: pass
+        # PDF escaneado (sem texto) -> tenta Groq visão; só então recorre ao Gemini
+        try: return _groq_notas_img_bytes(fb, mime)
+        except Exception:
+            return _ler_notas_gemini(fb, mime)
+    return _ler_notas_gemini(fb, mime)              # sem Groq: mantém o Gemini
+
+# ---------- PADRONIZAÇÃO DO NOME DA LOJA (item: "LOJA NN - NOME"; CD -> Centro de Distribuição) ----------
+_LOJA_NOME_FULL = {20:"RUI BARBOSA", 101:"CENTRO DE DISTRIBUIÇÃO"}   # nomes por extenso/oficiais
+def _cad_por_numero(n):
+    return CAD.get(str(int(n)).zfill(2)) or CAD.get(str(int(n)))
+def _loja_padrao(raw):
+    """Normaliza o nome da loja para 'LOJA NN - NOME'. CD vira 'Centro de Distribuição'."""
+    s=(raw or "").strip()
+    if not s: return "—"
+    num=None
+    m=re.search(r"LOJA\s*0*(\d{1,3})", s, re.I) or re.search(r"^\s*0*(\d{1,3})\b", s)
+    if m: num=int(m.group(1))
+    if num is None:                                  # sem número: casa por nome/apelido do cadastro
+        alvo=norm(s)
+        for e in CAD.values():
+            cands=[e.get("nome")]+list(e.get("apelidos") or [])
+            for c in cands:
+                cn=norm(c)
+                if cn and re.search(rf"\b{re.escape(cn)}\b", alvo):
+                    num=int(e.get("numero")); break
+            if num is not None: break
+    if num is None: return s                          # desconhecida: devolve o original
+    if num==101: return "CENTRO DE DISTRIBUIÇÃO"       # CD não é loja
+    e=_cad_por_numero(num) or {}
+    nome=_LOJA_NOME_FULL.get(num) or e.get("nome") or ""
+    rot=f"LOJA {num:02d}" if num<100 else f"LOJA {num}"
+    return f"{rot} - {nome}".strip() if nome else rot
 
 FROTAHUB_ROOT = os.environ.get("FROTAHUB_ROOT", "/FROTAHUB")
 def _find_dir(access, base, pattern):
@@ -2225,6 +2340,7 @@ def _chamados_query(q="", aba="", status="", desde="", ate=""):
     for r in rows:                       # normaliza status numérico legado -> texto
         s=str(r.get("status") or "")
         if s in _ST_MAP: r["status"]=_ST_MAP[s]
+        r["loja"]=_loja_padrao(r.get("loja"))   # padroniza 'LOJA NN - NOME' / CD -> Centro de Distribuição
     if status:                           # filtra por status já normalizado (pega legado e novo)
         alvo=status.strip().lower()
         rows=[r for r in rows if (r.get("status") or "").strip().lower()==alvo]
@@ -2250,6 +2366,7 @@ def orc_chamado_det(request: Request, numero: str="", aba: str=""):
     if not rows: raise HTTPException(404,"chamado não encontrado")
     r=rows[0]; s=str(r.get("status") or "")
     if s in _ST_MAP: r["status"]=_ST_MAP[s]
+    r["loja"]=_loja_padrao(r.get("loja"))
     return r
 
 @app.get("/orc/chamados_pdf")
@@ -2403,7 +2520,7 @@ def _stat_chamados(q="",aba="",desde="",ate=""):
     for r in rows:
         ab=_abacurta(r.get("aba"))
         if ab in por_aba: por_aba[ab]+=1
-        lj=r.get("loja") or "—"; por_loja[lj]=por_loja.get(lj,0)+1
+        lj=_loja_padrao(r.get("loja")); por_loja[lj]=por_loja.get(lj,0)+1
         tp=r.get("tipo_predial") or "—"; por_tipo[tp]=por_tipo.get(tp,0)+1
         ym=(r.get("atendido_em") or "")[:7]
         if ym: por_mes[ym]=por_mes.get(ym,0)+1
@@ -2447,7 +2564,7 @@ def _stat_financeiro(aba="",desde="",ate="",mes="",loja=""):
         t=r.get("ticket")
         if t: tickets.add(str(t))
         vo=_numf(r.get("valor_orcamento")); vn=_numf(r.get("valor_nota")); v_orc+=vo; v_nota+=vn
-        lj=r.get("loja_nome") or "—"; dd=por_loja.setdefault(lj,{"n":0,"orc":0.0,"nota":0.0}); dd["n"]+=1; dd["orc"]+=vo; dd["nota"]+=vn
+        lj=_loja_padrao(r.get("loja_nome")); dd=por_loja.setdefault(lj,{"n":0,"orc":0.0,"nota":0.0}); dd["n"]+=1; dd["orc"]+=vo; dd["nota"]+=vn
         ab=_abacurta(r.get("aba"))
         if ab in por_aba: por_aba[ab]["orc"]+=vo; por_aba[ab]["n"]+=1
         mr=r.get("mes_ref") or "—"; mm=por_mes.setdefault(mr,{"n":0,"orc":0.0}); mm["n"]+=1; mm["orc"]+=vo
@@ -2512,7 +2629,7 @@ def _planilha_orc_rows(desde="",ate="",faixa=""):
     for i,n in enumerate(notas,1):
         tk=str(n.get("ticket") or ""); cm=lojamap.get(tk,{})
         aba=cm.get("aba") or n.get("aba") or ""
-        rows.append({"n":i,"ticket":tk,"loja":cm.get("loja") or n.get("loja_nome") or "—",
+        rows.append({"n":i,"ticket":tk,"loja":_loja_padrao(cm.get("loja") or n.get("loja_nome")),
             "valor":round(val(n),2),"data":(n.get("criado_em") or "")[:10],"conta":_conta_da_aba(aba)})
     return rows
 
@@ -2651,13 +2768,13 @@ def _orc_job_run(job, previa, uid, papel):
             ext=os.path.splitext(nome)[1] or ".pdf"; is_pdf=nome.lower().endswith(".pdf")
             fb=dropbox_rateio.baixar(access,f"{ORC_NOTAS}/{nome}")
             if not fb: res.append({"arquivo":nome,"status":"erro","motivo":"não baixou"}); st["feitas"]=_idx+1; continue
-            try: notas=_ler_notas_gemini(fb,_mime(nome))
+            try: notas=_ler_notas(fb,_mime(nome),nome)
             except Exception as e:
-                msg=str(e); res.append({"arquivo":nome,"status":"erro","motivo":f"gemini: {msg[:120]}"})
+                msg=str(e); res.append({"arquivo":nome,"status":"erro","motivo":f"leitor: {msg[:120]}"})
                 if any(s in msg.lower() for s in ("429","quota","exceeded","resource_exhausted","rate limit")):
-                    # cota do Gemini esgotada: as demais notas falhariam igual → aborta o lote já
+                    # cota do leitor esgotada: as demais notas falhariam igual → aborta o lote já
                     for resto in _lista[_idx+1:]:
-                        res.append({"arquivo":resto,"status":"pulado","motivo":"cota Gemini esgotada — ative o faturamento e rode de novo"})
+                        res.append({"arquivo":resto,"status":"pulado","motivo":"cota do leitor de IA esgotada — tente mais tarde ou configure o Groq"})
                     st["feitas"]=len(_lista); break
                 st["feitas"]=_idx+1; continue
             if not notas:
@@ -2762,7 +2879,7 @@ async def orc_gerar(request: Request):
     try: body=await request.json()
     except Exception: pass
     previa=bool(body.get("previa"))
-    if not GEMINI_API_KEY: raise HTTPException(500,"GEMINI_API_KEY não configurada no Render")
+    if not (GEMINI_API_KEY or GROQ_KEY): raise HTTPException(500,"Configure GEMINI_API_KEY (imagens) e/ou GROQ_API_KEY (PDFs) no Render")
     # limpa jobs antigos (evita crescer sem fim)
     if len(_ORC_JOBS)>20:
         for k in list(_ORC_JOBS)[:-10]: _ORC_JOBS.pop(k,None)
@@ -2782,6 +2899,11 @@ def orc_gerar_status(request: Request, job: str=""):
             "gerados":j["gerados"],"pausa":j["pausa"],"retoma_em":j["retoma_em"],
             "lote":j["lote"],"descanso":j["descanso"],"erro":j.get("erro"),
             "resultados":j["res"] if j["estado"]!="rodando" else j["res"][-1:]}
+
+@app.get("/orc/gemini_cota")
+def orc_gemini_cota(request: Request):
+    exige(request,"GERAR_ORCAMENTOS")
+    return _gemini_cota()
 
 # ================= USUÁRIOS / LOGINS / CATEGORIAS / PIN =================
 import hashlib
@@ -2912,6 +3034,10 @@ async def usuarios_excluir(request: Request):
     niv=(alvo[0].get("categorias") or {}).get("nivel")
     if niv=="builder": raise HTTPException(403,"o login builder não pode ser excluído")
     if niv=="gerente" and p.get("nivel")!="builder": raise HTTPException(403,"apenas o builder exclui gerentes")
+    # desvincula os logs do usuário (o FK log_atividades.user_id -> auth.users bloqueia o delete).
+    # preserva o histórico com user_id nulo em vez de apagá-lo.
+    try: _sb_write(f"log_atividades?user_id=eq.{uid}", {"user_id":None}, "PATCH")
+    except Exception: pass
     try: _sb_admin(f"/admin/users/{uid}", method="DELETE")   # perfil cai por cascade (FK on delete cascade)
     except urllib.error.HTTPError as e: raise HTTPException(400,f"excluir: {e.read().decode()[:160]}")
     log_frotahub(u["id"],p.get("papel"),"CONFIG_USUARIOS","EXCLUIU_LOGIN",alvo[0].get("usuario") or str(uid))
