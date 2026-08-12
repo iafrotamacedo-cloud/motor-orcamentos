@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 86
+#  CONTADOR DE REVISÕES DESTE app.py: 87
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 86}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 87}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2152,6 +2152,15 @@ def _groq_post(messages, model, json_mode=True):
         raise RuntimeError(f"Groq {e.code}: {body[:400]}") from None
     return json.loads(raw)["choices"][0]["message"]["content"]
 
+def _groq_models():
+    """Lista os modelos que a conta Groq tem acesso (GET /models)."""
+    req=urllib.request.Request("https://api.groq.com/openai/v1/models",
+        headers={"Authorization":f"Bearer {GROQ_KEY}","Accept":"application/json",
+                 "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+    raw=urllib.request.urlopen(req,timeout=30).read().decode()
+    return [m.get("id") for m in (json.loads(raw).get("data") or []) if m.get("id")]
+
 def _groq_chat(messages, modelos):
     """Tenta uma lista de modelos; no 1º que responder, devolve o texto. Guarda o último erro."""
     ultimo=None
@@ -3086,6 +3095,14 @@ def orc_groq_teste(request: Request):
         out["visao"]={"ok":True,"amostra":(c or "")[:200]}
     except Exception as e:
         out["visao"]={"ok":False,"erro":str(e)[:400]}
+    # 3) modelos disponíveis na conta (destaca os candidatos a visão)
+    try:
+        ids=sorted(_groq_models())
+        vis=[m for m in ids if any(k in m.lower() for k in ("scout","maverick","vision","llama-4","qwen"))]
+        out["modelos_disponiveis"]=ids
+        out["modelos_visao_candidatos"]=vis
+    except Exception as e:
+        out["modelos_disponiveis"]={"erro":str(e)[:300]}
     return out
 
 @app.get("/orc/notas_pasta")
