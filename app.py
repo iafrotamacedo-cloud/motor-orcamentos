@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 83
+#  CONTADOR DE REVISÕES DESTE app.py: 84
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 83}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 84}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2162,43 +2162,131 @@ def _groq_notas_img_bytes(fb, mime):
         {"type":"image_url","image_url":{"url":f"data:{mime};base64,{b64}"}}]}]
     return _groq_chat(msgs, GROQ_VIS_MODEL)
 
-def _ler_notas(fb, mime, nome):
-    """Roteia a leitura: IMAGEM -> Gemini (visão); PDF -> Groq (texto; escaneado -> visão).
-       Trava o Gemini para NÃO ler PDF quando o Groq estiver configurado (economiza cota).
-       Sem chave Groq, cai no Gemini para não travar a operação."""
+class _CotaExcedida(Exception):
+    """Gemini indisponível por limite diário — pula a nota e avisa."""
+    pass
+
+def _num_br(s):
+    s=re.sub(r"[^\d,.\-]","",str(s or "").strip())
+    if not s: return 0.0
+    if "," in s: s=s.replace(".","").replace(",",".")   # vírgula = decimal
+    try: return float(s)
+    except Exception: return 0.0
+
+def _notas_seguras(notas):
+    """Leitura 'segura' = pelo menos 1 nota, com itens, e todo item com quant>0 e valor_unit>0."""
+    if not notas: return False
+    for nt in notas:
+        itens=nt.get("itens") or []
+        if not itens: return False
+        for it in itens:
+            if _num_br(it.get("quant"))<=0 or _num_br(it.get("valor_unit"))<=0: return False
+    return True
+
+def _parse_dav_texto(txt):
+    """LEITOR DE PDF (sem IA) para o 'DOCUMENTO AUXILIAR DE VENDA - PEDIDO'.
+       Provisório: só devolve resultado quando reconhece o layout com segurança;
+       caso contrário devolve [] e a rota escala para Groq/Gemini."""
+    if not txt or "PRE" not in txt.upper() and "UNIT" not in txt.upper():
+        return []
+    notas=[]
+    for chunk in re.split(r"\f", txt):               # 1 página por nota
+        if not chunk.strip(): continue
+        mt=re.search(r"(?:TICK\w*|#)\s*[:\-]?\s*(\d{4,})", chunk, re.I)
+        mn=re.search(r"N[ºo°\.]*\s*d[eo]?\s*Documento\s*[:\-]?\s*(\d+)", chunk, re.I)
+        md=re.search(r"(?:Dt\.?\s*Emis\S*|Emiss\S*)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})", chunk, re.I)
+        itens=[]
+        for ln in chunk.splitlines():
+            nums=re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2,3}|\d+,\d{2,3}", ln)
+            if len(nums)>=2 and re.search(r"[A-Za-zÀ-ÿ]{4,}", ln):
+                unid_m=re.search(r"\b(KG|UN|MT?|M2|M3|CX|PC|PÇ|L|LT|SC|BR|RL)\b", ln, re.I)
+                desc=re.sub(r"^\s*\d+\s*[-–]\s*","",ln)
+                desc=re.split(r"\s{2,}", desc.strip())[0]
+                q=_num_br(nums[-3]) if len(nums)>=3 else _num_br(nums[0])
+                vu=_num_br(nums[-2])
+                if q>0 and vu>0 and len(desc)>=3:
+                    itens.append({"descricao":desc[:120],"quant":q,
+                                  "unid":(unid_m.group(1).upper() if unid_m else "UN"),"valor_unit":vu})
+        if itens:
+            notas.append({"ticket":(mt.group(1) if mt else None),
+                          "nota_numero":(mn.group(1) if mn else None),
+                          "data_nota":(md.group(1) if md else None),"itens":itens})
+    return notas if _notas_seguras(notas) else []
+
+def _via_gemini(fb, mime, it, st):
+    """Gemini como ÚLTIMO recurso, respeitando a cota diária."""
+    if st.get("gemini_bloqueado"): raise _CotaExcedida()
+    if _gemini_cota()["restantes"]<=0:
+        st["gemini_bloqueado"]=True; raise _CotaExcedida()
+    it["etapa"]="gemini"; it["status"]="lendo com Gemini"
+    try:
+        return _ler_notas_gemini(fb, mime)
+    except Exception as e:
+        if any(s in str(e).lower() for s in ("429","quota","exceeded","resource_exhausted","rate limit")):
+            st["gemini_bloqueado"]=True; raise _CotaExcedida()
+        raise
+
+def _ler_notas_rota(fb, mime, nome, it, st):
+    """Modelo de leitura:
+       1) PDF digital  -> leitor de PDF (sem IA). Se não ler seguro, escala.
+       2) PDF escaneado/imagem -> Groq. Se não ler seguro, escala.
+       3) Gemini só como último recurso; se a cota diária acabou, levanta _CotaExcedida.
+       Devolve (notas, reader)."""
     is_pdf = (nome or "").lower().endswith(".pdf") or mime=="application/pdf"
-    if not is_pdf:
-        return _ler_notas_gemini(fb, mime)          # imagem -> Gemini
-    if GROQ_KEY:
+    # 1) PDF DIGITAL -> leitor de PDF, sem IA
+    if is_pdf:
+        it["etapa"]="pdf"; it["status"]="lendo com pdf reader"
         txt=_pdf_texto(fb)
-        if len(txt) >= 40:                          # tem camada de texto -> leitor local + Groq
-            try: return _groq_notas_texto(txt)
+        digital = len(txt) >= 40
+        if digital:
+            notas=_parse_dav_texto(txt)
+            if _notas_seguras(notas): return notas, "pdf"
+            # digital mas o leitor não fechou tudo -> Groq no TEXTO (grátis, sem Gemini)
+            if GROQ_KEY:
+                it["etapa"]="groq"; it["status"]="lendo com Groq"
+                try:
+                    g=_groq_notas_texto(txt)
+                    if _notas_seguras(g): return g, "groq"
+                except Exception: pass
+            return _via_gemini(fb, mime, it, st), "gemini"
+        # PDF escaneado -> Groq (visão)
+        if GROQ_KEY:
+            it["etapa"]="groq"; it["status"]="lendo com Groq"
+            try:
+                g=_groq_notas_img_bytes(fb, mime)
+                if _notas_seguras(g): return g, "groq"
             except Exception: pass
-        # PDF escaneado (sem texto) -> tenta Groq visão; só então recorre ao Gemini
-        try: return _groq_notas_img_bytes(fb, mime)
-        except Exception:
-            return _ler_notas_gemini(fb, mime)
-    return _ler_notas_gemini(fb, mime)              # sem Groq: mantém o Gemini
+        return _via_gemini(fb, mime, it, st), "gemini"
+    # 2) IMAGEM -> Groq (visão)
+    if GROQ_KEY:
+        it["etapa"]="groq"; it["status"]="lendo com Groq"
+        try:
+            g=_groq_notas_img_bytes(fb, mime)
+            if _notas_seguras(g): return g, "groq"
+        except Exception: pass
+    return _via_gemini(fb, mime, it, st), "gemini"
 
 # ---------- PADRONIZAÇÃO DO NOME DA LOJA (item: "LOJA NN - NOME"; CD -> Centro de Distribuição) ----------
-_LOJA_NOME_FULL = {20:"RUI BARBOSA", 101:"CENTRO DE DISTRIBUIÇÃO"}   # nomes por extenso/oficiais
+_LOJA_NOME_FULL = {20:"RUI BARBOSA", 23:"JÚLIO VENTURA", 101:"CENTRO DE DISTRIBUIÇÃO"}   # nomes por extenso/oficiais
 def _cad_por_numero(n):
     return CAD.get(str(int(n)).zfill(2)) or CAD.get(str(int(n)))
 def _loja_padrao(raw):
-    """Normaliza o nome da loja para 'LOJA NN - NOME'. CD vira 'Centro de Distribuição'."""
+    """Normaliza o nome da loja para 'LOJA NN - NOME' (consolida grafias diferentes da mesma loja).
+       CD vira 'Centro de Distribuição'."""
     s=(raw or "").strip()
     if not s: return "—"
     num=None
     m=re.search(r"LOJA\s*0*(\d{1,3})", s, re.I) or re.search(r"^\s*0*(\d{1,3})\b", s)
     if m: num=int(m.group(1))
-    if num is None:                                  # sem número: casa por nome/apelido do cadastro
+    if num is None:                                  # sem número: casa por nome/apelido/nome-completo
         alvo=norm(s)
         for e in CAD.values():
-            cands=[e.get("nome")]+list(e.get("apelidos") or [])
+            n_e=int(e.get("numero"))
+            cands=[e.get("nome"), _LOJA_NOME_FULL.get(n_e)]+list(e.get("apelidos") or [])
             for c in cands:
                 cn=norm(c)
                 if cn and re.search(rf"\b{re.escape(cn)}\b", alvo):
-                    num=int(e.get("numero")); break
+                    num=n_e; break
             if num is not None: break
     if num is None: return s                          # desconhecida: devolve o original
     if num==101: return "CENTRO DE DISTRIBUIÇÃO"       # CD não é loja
@@ -2756,9 +2844,11 @@ def _orc_job_run(job, previa, uid, papel):
         def _mime(nm):
             nl=nm.lower(); return "application/pdf" if nl.endswith(".pdf") else ("image/png" if nl.endswith(".png") else "image/jpeg")
         res=st["res"]; _lista=sorted(arqs); st["total"]=len(_lista)
+        st["itens"]=[{"nome":n,"idx":k+1,"pct":0,"status":"aguardando","reader":None,"motivo":None} for k,n in enumerate(_lista)]
         if not _lista:                     # pasta vazia -> não é erro, só não processa nada
             st["estado"]="pronto"; st["gerados"]=0; st["vazio"]=True; return
         for _idx,nome in enumerate(_lista):
+            fst=st["itens"][_idx]
             # lotes: a cada ORC_LOTE notas lidas, descansa ORC_DESCANSO segundos (respeita o limite/min)
             if _idx and _idx % ORC_LOTE == 0:
                 st["pausa"]=True; st["retoma_em"]=ORC_DESCANSO
@@ -2766,21 +2856,27 @@ def _orc_job_run(job, previa, uid, papel):
                     _t.sleep(1); st["retoma_em"]=ORC_DESCANSO-_s-1
                 st["pausa"]=False
             ext=os.path.splitext(nome)[1] or ".pdf"; is_pdf=nome.lower().endswith(".pdf")
+            fst["pct"]=8; fst["status"]="lendo"
             fb=dropbox_rateio.baixar(access,f"{ORC_NOTAS}/{nome}")
-            if not fb: res.append({"arquivo":nome,"status":"erro","motivo":"não baixou"}); st["feitas"]=_idx+1; continue
-            try: notas=_ler_notas(fb,_mime(nome),nome)
-            except Exception as e:
-                msg=str(e); res.append({"arquivo":nome,"status":"erro","motivo":f"leitor: {msg[:120]}"})
-                if any(s in msg.lower() for s in ("429","quota","exceeded","resource_exhausted","rate limit")):
-                    # cota do leitor esgotada: as demais notas falhariam igual → aborta o lote já
-                    for resto in _lista[_idx+1:]:
-                        res.append({"arquivo":resto,"status":"pulado","motivo":"cota do leitor de IA esgotada — tente mais tarde ou configure o Groq"})
-                    st["feitas"]=len(_lista); break
+            if not fb:
+                fst["pct"]=100; fst["status"]="erro"; fst["motivo"]="não baixou"
+                res.append({"arquivo":nome,"status":"erro","motivo":"não baixou"}); st["feitas"]=_idx+1; continue
+            try:
+                notas,reader=_ler_notas_rota(fb,_mime(nome),nome,fst,st)
+                fst["reader"]=reader
+            except _CotaExcedida:
+                fst["pct"]=100; fst["status"]="Não executado por cota diária excedida"; fst["cota"]=True
+                res.append({"arquivo":nome,"status":"cota","motivo":"cota diária de leitura (Gemini) excedida — rode de novo mais tarde"})
                 st["feitas"]=_idx+1; continue
+            except Exception as e:
+                fst["pct"]=100; fst["status"]="erro"; fst["motivo"]=str(e)[:120]
+                res.append({"arquivo":nome,"status":"erro","motivo":f"leitor: {str(e)[:120]}"}); st["feitas"]=_idx+1; continue
             if not notas:
+                fst["pct"]=100; fst["status"]="pendente"; fst["motivo"]="não identifiquei nota"
                 info={"arquivo":nome,"status":"pendente","motivo":"não identifiquei nota","destino":"6"}
                 if not previa and P6: dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{P6}/{nome}")
                 res.append(info); st["feitas"]=_idx+1; continue
+            fst["pct"]=65; fst["status"]="Confeccionando orçamento"
             pages=_split_pdf(fb) if (is_pdf and len(notas)>1) else None
             usou_source=False
             for i,nt in enumerate(notas):
@@ -2863,6 +2959,7 @@ def _orc_job_run(job, previa, uid, papel):
             if not previa and pages is not None and not usou_source:
                 try: dropbox_rateio.apagar(access,f"{ORC_NOTAS}/{nome}")
                 except Exception: pass
+            fst["pct"]=100; fst["status"]="Pronto"
             st["feitas"]=_idx+1
         ok=sum(1 for r in res if r.get("status")=="ok")
         if not previa: log_frotahub(uid,papel,"GERAR_ORCAMENTOS","GEROU",f"{ok}/{len(res)}")
@@ -2885,7 +2982,7 @@ async def orc_gerar(request: Request):
         for k in list(_ORC_JOBS)[:-10]: _ORC_JOBS.pop(k,None)
     _ORC_JOB_SEQ[0]+=1; job=str(_ORC_JOB_SEQ[0])
     _ORC_JOBS[job]={"estado":"rodando","previa":previa,"total":0,"feitas":0,"gerados":0,
-                    "res":[],"pausa":False,"retoma_em":0,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
+                    "res":[],"itens":[],"pausa":False,"retoma_em":0,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
     t=threading.Thread(target=_orc_job_run,args=(job,previa,u["id"],p["papel"]),daemon=True); t.start()
     return {"job":job,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
 
@@ -2898,12 +2995,28 @@ def orc_gerar_status(request: Request, job: str=""):
     return {"estado":j["estado"],"previa":j["previa"],"total":j["total"],"feitas":j["feitas"],
             "gerados":j["gerados"],"pausa":j["pausa"],"retoma_em":j["retoma_em"],
             "lote":j["lote"],"descanso":j["descanso"],"erro":j.get("erro"),
+            "itens":j.get("itens",[]),
             "resultados":j["res"] if j["estado"]!="rodando" else j["res"][-1:]}
 
 @app.get("/orc/gemini_cota")
 def orc_gemini_cota(request: Request):
     exige(request,"GERAR_ORCAMENTOS")
     return _gemini_cota()
+
+@app.get("/orc/notas_pasta")
+def orc_notas_pasta(request: Request):
+    """Lista os arquivos da pasta 0 (nome + contagem) para a tela de gerar orçamentos."""
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS")
+    try:
+        access=dropbox_rateio.obter_token()
+        _mb=_manut_base(access); _ob=_orc_base(access,_mb)
+        ORC_NOTAS=_pasta_manut(access,0,_ob) or (_ob + "/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
+        arqs=[a for a in dropbox_rateio.listar(access,ORC_NOTAS) if a.lower().endswith((".pdf",".jpg",".jpeg",".png"))]
+        arqs=sorted(arqs)
+        return {"total":len(arqs),"arquivos":arqs}
+    except Exception as e:
+        raise HTTPException(500,f"lista: {str(e)[:160]}")
 
 # ================= USUÁRIOS / LOGINS / CATEGORIAS / PIN =================
 import hashlib
