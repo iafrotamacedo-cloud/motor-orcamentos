@@ -2,6 +2,7 @@ FROM python:3.11-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils fonts-dejavu ca-certificates \
+    tesseract-ocr tesseract-ocr-por \
  && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 user
 USER user
