@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 77
+#  CONTADOR DE REVISÕES DESTE app.py: 78
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 77}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 78}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2463,6 +2463,140 @@ def orc_stat_financeiro_pdf(request: Request, aba: str="", desde: str="", ate: s
                    subtitulo=resumo+(f"  |  {sub}" if sub else ""), aligns={1:'RIGHT',2:'RIGHT',3:'RIGHT'})
     return Response(content=pdf, media_type="application/pdf",
         headers={"Content-Disposition":'attachment; filename="estatistica_financeiro.pdf"'})
+
+# ================= PLANILHA GERAL DE ORÇAMENTOS (controle) =================
+_MAROM="7A1517"
+def _conta_da_aba(aba):
+    a=_abacurta(aba)
+    if a=="Civil": return "PREDIAL CIVIL - MANUENÇÃO CORRETIVA"
+    if a=="Instalações": return "PREDIAL INSTALAÇÕES - MANUENÇÃO CORRETIVA"
+    return ""
+def _planilha_orc_rows(desde="",ate="",faixa=""):
+    parts=["select=ticket,loja_nome,aba,valor_orcamento,criado_em","status=eq.gerado","order=criado_em.asc","limit=8000"]
+    if desde: parts.append(f"criado_em=gte.{desde}")
+    if ate:   parts.append(f"criado_em=lte.{ate}T23:59:59")
+    notas=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(parts),SB_KEY) or []
+    val=lambda n: _numf(n.get("valor_orcamento"))
+    if faixa=="ate600":   notas=[n for n in notas if val(n)<=600]
+    elif faixa=="acima600": notas=[n for n in notas if val(n)>600]
+    tickets=list({str(n.get("ticket")) for n in notas if n.get("ticket")})
+    lojamap={}
+    if tickets:
+        inlist=",".join(urllib.parse.quote(t) for t in tickets[:1500])
+        ch=_sb_json(f"{SB_URL}/rest/v1/chamados?numero=in.({inlist})&select=numero,loja,aba",SB_KEY) or []
+        for c in ch: lojamap[str(c.get("numero"))]={"loja":c.get("loja"),"aba":c.get("aba")}
+    rows=[]
+    for i,n in enumerate(notas,1):
+        tk=str(n.get("ticket") or ""); cm=lojamap.get(tk,{})
+        aba=cm.get("aba") or n.get("aba") or ""
+        rows.append({"n":i,"ticket":tk,"loja":cm.get("loja") or n.get("loja_nome") or "—",
+            "valor":round(val(n),2),"data":(n.get("criado_em") or "")[:10],"conta":_conta_da_aba(aba)})
+    return rows
+
+def _planilha_header(desde,ate,faixa,resp,total,qtd):
+    per = (f"{_data_br(desde)} a {_data_br(ate)}" if (desde or ate) else "Todos os períodos")
+    fx  = {"ate600":"Orçamentos ≤ R$ 600","acima600":"Orçamentos > R$ 600"}.get(faixa,"Todas as faixas")
+    hoje=datetime.date.today().strftime("%d/%m/%Y")
+    return {"periodo":per,"faixa":fx,"gerado":hoje,"responsavel":resp or "—",
+            "total":_reais(total),"qtd":qtd,
+            "titulo":"CUSTOS DE MATERIAIS DOS CHAMADOS DE MANUTENÇÃO"}
+
+@app.get("/orc/planilha_orcamentos")
+def orc_planilha(request: Request, desde: str="", ate: str="", faixa: str=""):
+    from fastapi import HTTPException
+    u,p=exige(request,"ORCAMENTOS_GERADOS")
+    rows=_planilha_orc_rows(desde,ate,faixa); total=round(sum(r["valor"] for r in rows),2)
+    h=_planilha_header(desde,ate,faixa,(p.get("nome_completo") or p.get("nome")),total,len(rows))
+    return {"itens":rows,"total":total,"header":h}
+
+@app.get("/orc/planilha_orcamentos_xlsx")
+def orc_planilha_xlsx(request: Request, desde: str="", ate: str="", faixa: str=""):
+    from fastapi import HTTPException
+    u,p=exige(request,"ORCAMENTOS_GERADOS")
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.drawing.image import Image as XLImage
+    rows=_planilha_orc_rows(desde,ate,faixa); total=round(sum(r["valor"] for r in rows),2)
+    h=_planilha_header(desde,ate,faixa,(p.get("nome_completo") or p.get("nome")),total,len(rows))
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title="Orçamentos"
+    larg=[8,7.5,37.75,13.13,14,13,42.25,23.45]
+    for i,w in enumerate(larg,1): ws.column_dimensions[get_column_letter(i)].width=w
+    # ---- cabeçalho (logo + textos) ----
+    try:
+        tmp=tempfile.NamedTemporaryFile(suffix=".png",delete=False); tmp.write(_b64.b64decode(_LOGO_ORC_B64)); tmp.close()
+        img=XLImage(tmp.name); img.width=150; img.height=64; ws.add_image(img,"A1")
+    except Exception: pass
+    ws.merge_cells("C1:H1"); ws["C1"]=h["titulo"]; ws["C1"].font=Font(bold=True,size=14,color=_MAROM); ws["C1"].alignment=Alignment(horizontal="left",vertical="center")
+    ws.merge_cells("C2:H2"); ws["C2"]=f"Período: {h['periodo']}  ·  {h['faixa']}"; ws["C2"].font=Font(size=10,color="555555")
+    ws.merge_cells("C3:H3"); ws["C3"]=f"Gerado em {h['gerado']} por {h['responsavel']}  ·  {h['qtd']} orçamento(s)  ·  Total {h['total']}"; ws["C3"].font=Font(size=10,color="555555")
+    ws.row_dimensions[1].height=22; ws.row_dimensions[2].height=16; ws.row_dimensions[3].height=16
+    # ---- tabela ----
+    H0=6   # linha do cabeçalho da tabela
+    heads=["Nº","TICKET","LOJA","VALOR","DATA","ORÇAMENTO","CONTA","PCO"]
+    borda=Border(*(Side(style="thin",color=_MAROM),)*4)
+    for c,txt in enumerate(heads,1):
+        cell=ws.cell(H0,c,txt); cell.font=Font(bold=True,size=10,color="FFFFFF")
+        cell.fill=PatternFill("solid",fgColor=_MAROM); cell.alignment=Alignment(horizontal="center",vertical="center"); cell.border=borda
+    aligns={1:"center",2:"center",3:"left",4:"right",5:"center",6:"center",7:"left",8:"center"}
+    fmtD='"R$"\\ #,##0.00'; fmtF='"R$"\\ #,##0.00_);[Red]\\("R$"\\ #,##0.00\\)'
+    for k,r in enumerate(rows):
+        rr=H0+1+k
+        vals=[r["n"],r["ticket"],r["loja"],r["valor"],None,None,r["conta"],None]
+        for c in range(1,9):
+            cell=ws.cell(rr,c,vals[c-1]); cell.font=Font(size=10); cell.alignment=Alignment(horizontal=aligns[c]); cell.border=borda
+        # DATA (E) como data real
+        try:
+            y,mo,d=r["data"].split("-"); ws.cell(rr,5).value=datetime.date(int(y),int(mo),int(d)); ws.cell(rr,5).number_format="dd/mm/yyyy"
+        except Exception: ws.cell(rr,5).value=r["data"]
+        ws.cell(rr,4).number_format=fmtD
+        ws.cell(rr,6).value=f"=D{rr}"; ws.cell(rr,6).number_format=fmtF   # ORÇAMENTO = VALOR (igual ao modelo)
+    ws.freeze_panes=f"A{H0+1}"; ws.auto_filter.ref=f"A{H0}:H{H0+len(rows)}"
+    buf=io.BytesIO(); wb.save(buf)
+    return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":'attachment; filename="orcamentos_materiais_frota.xlsx"'})
+
+@app.get("/orc/planilha_orcamentos_pdf")
+def orc_planilha_pdf(request: Request, desde: str="", ate: str="", faixa: str=""):
+    from fastapi import HTTPException
+    u,p=exige(request,"ORCAMENTOS_GERADOS")
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm, mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    rows=_planilha_orc_rows(desde,ate,faixa); total=round(sum(r["valor"] for r in rows),2)
+    h=_planilha_header(desde,ate,faixa,(p.get("nome_completo") or p.get("nome")),total,len(rows))
+    buf=io.BytesIO()
+    doc=SimpleDocTemplate(buf,pagesize=landscape(A4),leftMargin=1.0*cm,rightMargin=1.0*cm,topMargin=0.9*cm,bottomMargin=0.9*cm,title=h["titulo"])
+    ss=getSampleStyleSheet()
+    tit=ParagraphStyle('t',parent=ss['Title'],textColor=colors.HexColor('#'+_MAROM),fontSize=15,alignment=0,spaceAfter=1)
+    sub=ParagraphStyle('s',parent=ss['Normal'],textColor=colors.HexColor('#555555'),fontSize=9,leading=12)
+    el=[]
+    try:
+        tmp=tempfile.NamedTemporaryFile(suffix=".png",delete=False); tmp.write(_b64.b64decode(_LOGO_ORC_B64)); tmp.close()
+        logo=RLImage(tmp.name,width=26*mm,height=11*mm)
+        cab=Table([[logo, Paragraph(h["titulo"],tit)]],colWidths=[30*mm,None])
+        cab.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),0)]))
+        el.append(cab)
+    except Exception: el.append(Paragraph(h["titulo"],tit))
+    el.append(Paragraph(f"Período: {h['periodo']} &nbsp;·&nbsp; {h['faixa']}",sub))
+    el.append(Paragraph(f"Gerado em {h['gerado']} por {h['responsavel']} &nbsp;·&nbsp; {h['qtd']} orçamento(s) &nbsp;·&nbsp; Total {h['total']}",sub))
+    el.append(Spacer(1,7))
+    heads=["Nº","TICKET","LOJA","VALOR","DATA","ORÇAMENTO","CONTA","PCO"]
+    data=[heads]+[[str(r["n"]),r["ticket"],r["loja"][:44],_reais(r["valor"]),_data_br(r["data"]),_reais(r["valor"]),r["conta"][:40],""] for r in rows]
+    t=Table(data,repeatRows=1,colWidths=[1.0*cm,1.7*cm,6.2*cm,2.2*cm,2.0*cm,2.3*cm,6.6*cm,2.2*cm])
+    t.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#'+_MAROM)),('TEXTCOLOR',(0,0),(-1,0),colors.white),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('FONTSIZE',(0,0),(-1,-1),8),
+        ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#'+_MAROM)),('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ('ALIGN',(0,1),(1,-1),'CENTER'),('ALIGN',(3,1),(5,-1),'RIGHT'),('ALIGN',(4,1),(4,-1),'CENTER'),
+        ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f6f2f2')]),
+        ('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+    el.append(t)
+    doc.build(el)
+    return Response(content=buf.getvalue(), media_type="application/pdf",
+        headers={"Content-Disposition":'attachment; filename="orcamentos_materiais_frota.pdf"'})
 
 ORC_LOTE     = int(os.environ.get("ORC_LOTE", "10"))     # lê N notas
 ORC_DESCANSO = int(os.environ.get("ORC_DESCANSO", "60"))  # descansa M segundos entre lotes
