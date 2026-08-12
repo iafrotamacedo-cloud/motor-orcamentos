@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 91
+#  CONTADOR DE REVISÕES DESTE app.py: 92
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 91}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 92}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2226,7 +2226,7 @@ def _groq_notas_img_bytes(fb, mime, nome=""):
     return _notas_de_conteudo(_groq_chat(msgs, GROQ_VIS_FALLBACK))
 
 OCR_MAX_PAG = int(os.environ.get("OCR_MAX_PAG", "3"))   # nº de páginas por nota que passam pelo OCR
-OCR_DPI     = os.environ.get("OCR_DPI", "150")          # 150 dpi já é suficiente e MUITO mais rápido
+OCR_DPI     = os.environ.get("OCR_DPI", "200")          # 200 dpi (limitado a poucas páginas -> continua rápido)
 def _ocr_texto(fb, mime, nome, max_pag=None):
     """OCR local (tesseract) da nota escaneada/imagem -> texto. Sem IA e sem cota.
        Leve e limitado (poucas páginas, dpi baixo) para não travar o lote."""
@@ -2252,6 +2252,7 @@ def _ocr_texto(fb, mime, nome, max_pag=None):
     env=dict(os.environ, OMP_THREAD_LIMIT="1")      # tesseract 1 thread -> previsível, não engasga a CPU
     textos=[]
     for pg in pngs:
+        _prep_ocr(pg)                               # pré-processa a imagem (melhora o OCR do scan)
         txt=""
         for lang in ("por","eng"):                  # tenta português; cai p/ inglês se faltar o pacote
             try:
@@ -2261,6 +2262,18 @@ def _ocr_texto(fb, mime, nome, max_pag=None):
             except Exception: pass
         if txt: textos.append(txt)
     return "\f".join(textos).strip()
+
+def _prep_ocr(path):
+    """Limpa a imagem antes do OCR: tons de cinza, contraste e upscale. Melhora scans/fotos."""
+    try:
+        from PIL import Image, ImageOps, ImageFilter
+        im=Image.open(path).convert("L")            # tons de cinza
+        im=ImageOps.autocontrast(im, cutoff=1)      # estica o contraste
+        if im.width<1800:                           # amplia imagens pequenas (mais nitidez p/ o OCR)
+            f=1800/im.width; im=im.resize((1800,int(im.height*f)))
+        im=im.filter(ImageFilter.SHARPEN)
+        im.save(path)
+    except Exception: pass
 
 class _CotaExcedida(Exception):
     """Gemini indisponível por limite diário — pula a nota e avisa."""
@@ -2365,59 +2378,70 @@ def _via_gemini(fb, mime, it, st):
             st["gemini_bloqueado"]=True; raise _CotaExcedida()
         raise
 
+# ---------- CONFERÊNCIA POR TOTAL (garante que a leitura fechou) ----------
+def _soma_itens(notas):
+    s=0.0
+    for nt in (notas or []):
+        for it in (nt.get("itens") or []):
+            s += _num_br(it.get("valor_unit"))*_num_br(it.get("quant"))
+    return round(s,2)
+
+def _bate_total(notas, texto):
+    """Confere a soma dos itens contra os valores 'total' impressos na nota.
+       True = bate (confiável) · False = há total mas NÃO bate (suspeito) · None = sem total p/ conferir."""
+    soma=_soma_itens(notas)
+    if soma<=0: return False
+    toks=[_num_br(x) for x in re.findall(r"\d{1,3}(?:\.\d{3})*,\d{2}\b", texto or "")]
+    toks=[t for t in toks if t>0]
+    if not toks: return None
+    tol=max(0.02, 0.01*soma)
+    return any(abs(t-soma)<=tol for t in toks)
+
+def _leitura_ok(notas, texto):
+    """Aceita a leitura se ela é segura E a soma bate com um total impresso (ou não há total p/ conferir)."""
+    if not _notas_seguras(notas): return False
+    return _bate_total(notas, texto) is not False
+
 def _ler_notas_rota(fb, mime, nome, it, st):
-    """Modelo de leitura:
-       1) PDF digital  -> leitor de PDF (sem IA). Se não ler seguro, escala.
-       2) PDF escaneado/imagem -> Groq. Se não ler seguro, escala.
-       3) Gemini só como último recurso; se a cota diária acabou, levanta _CotaExcedida.
+    """CASCATA DE LEITURA (barata/confiável -> cara/último caso):
+       Camada 0: vira TEXTO — PDF digital (pdftotext) ou OCR (scan/imagem, com pré-processamento).
+       Camada 1: parsers locais DANFE/DAV (sem IA), conferidos pelo total da nota.
+       Camada 2: Groq no texto (grátis, sem cota diária), também conferido pelo total.
+       Camada 3: Gemini na imagem (último recurso; respeita a cota diária).
        Devolve (notas, reader)."""
     is_pdf = (nome or "").lower().endswith(".pdf") or mime=="application/pdf"
-    # 1) PDF DIGITAL -> leitor de PDF, sem IA
+
+    # ---- Camada 0: obter o texto ----
+    texto=""; origem="digital"
     if is_pdf:
         it["etapa"]="pdf"; it["status"]="lendo com pdf reader"
-        txt=_pdf_texto(fb)
-        digital = len(txt) >= 40
-        if digital:
-            notas=_parse_nota_local(txt)               # DANFE (NF-e) ou DAV (pedido), sem IA
-            if _notas_seguras(notas): return notas, "pdf"
-            # digital mas o leitor não fechou tudo -> Groq no TEXTO (grátis, sem Gemini)
-            if GROQ_KEY:
-                it["etapa"]="groq"; it["status"]="lendo com Groq"
-                try:
-                    g=_groq_notas_texto(txt)
-                    if _notas_seguras(g): return g, "groq"
-                    it["diag"]="Groq(texto) leu incompleto"
-                except Exception as e: it["diag"]=f"Groq(texto): {str(e)[:180]}"; st["groq_erro"]=it["diag"]
-            return _via_gemini(fb, mime, it, st), "gemini"
-        # PDF escaneado
-        return _ler_escaneado(fb, mime, nome, it, st)
-    # 2) IMAGEM
-    return _ler_escaneado(fb, mime, nome, it, st)
+        texto=_pdf_texto(fb)
+    if len(texto) < 40:                               # imagem, ou PDF sem camada de texto -> OCR
+        it["etapa"]="ocr"; it["status"]="extraindo texto (OCR)"
+        try: texto=_ocr_texto(fb, mime, nome); origem="ocr"
+        except Exception as e: it["diag"]=f"OCR: {str(e)[:150]}"; texto=""
 
-def _ler_escaneado(fb, mime, nome, it, st):
-    """Nota escaneada/imagem: 1) Groq visão SE a conta tiver modelo de visão;
-       2) OCR local (tesseract) -> Groq texto (grátis, sem cota); 3) Gemini por último."""
-    if GROQ_KEY and GROQ_VIS_MODEL:                 # só tenta visão se houver modelo configurado
-        it["etapa"]="groq"; it["status"]="lendo com Groq"
-        try:
-            g=_groq_notas_img_bytes(fb, mime, nome)
-            if _notas_seguras(g): return g, "groq"
-        except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:160]}"; st["groq_erro"]=it["diag"]
-    it["etapa"]="ocr"; it["status"]="extraindo texto (OCR)"
-    try:
-        ocr=_ocr_texto(fb, mime, nome)               # OCR local roda sempre (grátis)
-        if len(ocr) >= 30:
-            notas=_parse_nota_local(ocr)             # 1) leitor DANFE/DAV no texto do OCR — sem IA
-            if _notas_seguras(notas): return notas, "ocr-pdf"
-            if GROQ_KEY:                             # 2) Groq no texto do OCR
-                it["etapa"]="groq"; it["status"]="lendo com Groq (OCR)"
-                g=_groq_notas_texto(ocr)
-                if _notas_seguras(g): return g, "groq-ocr"
-                it["diag"]="OCR+Groq leu incompleto"
-        else:
-            it["diag"]="OCR não extraiu texto (imagem ruim?)"
-    except Exception as e: it["diag"]=f"OCR: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
-    return _via_gemini(fb, mime, it, st), "gemini"    # 3) Gemini por último
+    # ---- Camada 1: parsers locais (sem IA) ----
+    if texto and len(texto)>=30:
+        notas=_parse_nota_local(texto)
+        if notas and _leitura_ok(notas, texto):
+            return notas, ("pdf" if origem=="digital" else "ocr-pdf")
+        if notas and not _notas_seguras(notas):
+            it["diag"]="leitor local: itens incompletos"
+        elif notas:
+            it["diag"]="leitor local: soma não bateu com o total"
+
+        # ---- Camada 2: Groq no texto (grátis) ----
+        if GROQ_KEY:
+            it["etapa"]="groq"; it["status"]=("lendo com Groq (OCR)" if origem=="ocr" else "lendo com Groq")
+            try:
+                g=_groq_notas_texto(texto)
+                if g and _leitura_ok(g, texto): return g, ("groq-ocr" if origem=="ocr" else "groq")
+                it["diag"]="Groq leu incompleto / total não bateu"
+            except Exception as e: it["diag"]=f"Groq: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
+
+    # ---- Camada 3: Gemini na imagem (último recurso) ----
+    return _via_gemini(fb, mime, it, st), "gemini"
 
 # ---------- PADRONIZAÇÃO DO NOME DA LOJA (item: "LOJA NN - NOME"; CD -> Centro de Distribuição) ----------
 _LOJA_NOME_FULL = {20:"RUI BARBOSA", 23:"JÚLIO VENTURA", 101:"CENTRO DE DISTRIBUIÇÃO"}   # nomes por extenso/oficiais
