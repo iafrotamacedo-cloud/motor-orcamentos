@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 87
+#  CONTADOR DE REVISÕES DESTE app.py: 88
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 87}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 88}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1904,7 +1904,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_RPD     = int(os.environ.get("GEMINI_RPD", "500"))   # cota diária do plano grátis (requisições/dia)
 GROQ_TEXT_MODEL= os.environ.get("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")   # leitor de PDF (texto) — gratuito
-GROQ_VIS_MODEL = os.environ.get("GROQ_VIS_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")  # PDF escaneado (visão)
+GROQ_VIS_MODEL = os.environ.get("GROQ_VIS_MODEL", "")  # visão do Groq (vazio = conta sem modelo de visão -> usa OCR)
 _ORC_GEMINI_OK = None   # memoriza o 1º modelo que funcionar no leitor de notas
 ORC_EXTRAPOLA  = float(os.environ.get("ORC_EXTRAPOLA", "500"))   # nota (antes do +20%) acima disso -> extrapolado
 _LOGO_ORC_B64  = "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"
@@ -2225,6 +2225,33 @@ def _groq_notas_img_bytes(fb, mime, nome=""):
         {"type":"image_url","image_url":{"url":f"data:image/png;base64,{b64}"}}]}]
     return _notas_de_conteudo(_groq_chat(msgs, GROQ_VIS_FALLBACK))
 
+def _ocr_texto(fb, mime, nome, max_pag=8):
+    """OCR local (tesseract) da nota escaneada/imagem -> texto. Sem IA e sem cota.
+       Usado quando a conta Groq não tem modelo de visão."""
+    import tempfile, glob, io as _io
+    d=tempfile.mkdtemp(); pngs=[]
+    is_pdf=(nome or "").lower().endswith(".pdf") or mime=="application/pdf"
+    if is_pdf:
+        pth=os.path.join(d,"n.pdf"); open(pth,"wb").write(fb)
+        pref=os.path.join(d,"pg")
+        subprocess.run(["pdftoppm","-r","200","-png","-f","1","-l",str(max_pag),pth,pref],capture_output=True,timeout=180)
+        pngs=sorted(glob.glob(pref+"*.png"))
+    else:
+        try:
+            from PIL import Image
+            p=os.path.join(d,"img.png"); Image.open(_io.BytesIO(fb)).convert("RGB").save(p,"PNG"); pngs=[p]
+        except Exception: pngs=[]
+    textos=[]
+    for pg in pngs:
+        txt=""
+        for lang in ("por","eng"):                 # tenta português; cai p/ inglês se faltar o pacote
+            try:
+                r=subprocess.run(["tesseract",pg,"stdout","-l",lang],capture_output=True,text=True,timeout=120)
+                if r.returncode==0 and (r.stdout or "").strip(): txt=r.stdout; break
+            except Exception: pass
+        if txt: textos.append(txt)
+    return "\f".join(textos).strip()
+
 class _CotaExcedida(Exception):
     """Gemini indisponível por limite diário — pula a nota e avisa."""
     pass
@@ -2313,23 +2340,31 @@ def _ler_notas_rota(fb, mime, nome, it, st):
                     it["diag"]="Groq(texto) leu incompleto"
                 except Exception as e: it["diag"]=f"Groq(texto): {str(e)[:180]}"; st["groq_erro"]=it["diag"]
             return _via_gemini(fb, mime, it, st), "gemini"
-        # PDF escaneado -> Groq (visão)
-        if GROQ_KEY:
-            it["etapa"]="groq"; it["status"]="lendo com Groq"
-            try:
-                g=_groq_notas_img_bytes(fb, mime, nome)
-                if _notas_seguras(g): return g, "groq"
-                it["diag"]="Groq(visão) leu incompleto"
-            except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:180]}"; st["groq_erro"]=it["diag"]
-        return _via_gemini(fb, mime, it, st), "gemini"
-    # 2) IMAGEM -> Groq (visão)
-    if GROQ_KEY:
+        # PDF escaneado
+        return _ler_escaneado(fb, mime, nome, it, st)
+    # 2) IMAGEM
+    return _ler_escaneado(fb, mime, nome, it, st)
+
+def _ler_escaneado(fb, mime, nome, it, st):
+    """Nota escaneada/imagem: 1) Groq visão SE a conta tiver modelo de visão;
+       2) OCR local (tesseract) -> Groq texto (grátis, sem cota); 3) Gemini por último."""
+    if GROQ_KEY and GROQ_VIS_MODEL:                 # só tenta visão se houver modelo configurado
         it["etapa"]="groq"; it["status"]="lendo com Groq"
         try:
             g=_groq_notas_img_bytes(fb, mime, nome)
             if _notas_seguras(g): return g, "groq"
-            it["diag"]="Groq(visão) leu incompleto"
-        except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:180]}"; st["groq_erro"]=it["diag"]
+        except Exception as e: it["diag"]=f"Groq(visão): {str(e)[:160]}"; st["groq_erro"]=it["diag"]
+    if GROQ_KEY:                                     # OCR local -> Groq texto
+        it["etapa"]="groq"; it["status"]="lendo com Groq (OCR)"
+        try:
+            ocr=_ocr_texto(fb, mime, nome)
+            if len(ocr) >= 30:
+                g=_groq_notas_texto(ocr)
+                if _notas_seguras(g): return g, "groq-ocr"
+                it["diag"]="OCR+Groq leu incompleto"
+            else:
+                it["diag"]="OCR não extraiu texto (imagem ruim?)"
+        except Exception as e: it["diag"]=f"OCR/Groq: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
     return _via_gemini(fb, mime, it, st), "gemini"
 
 # ---------- PADRONIZAÇÃO DO NOME DA LOJA (item: "LOJA NN - NOME"; CD -> Centro de Distribuição) ----------
@@ -3098,9 +3133,10 @@ def orc_groq_teste(request: Request):
     # 3) modelos disponíveis na conta (destaca os candidatos a visão)
     try:
         ids=sorted(_groq_models())
-        vis=[m for m in ids if any(k in m.lower() for k in ("scout","maverick","vision","llama-4","qwen"))]
+        vis=[m for m in ids if any(k in m.lower() for k in ("scout","maverick","vision","llama-4"))]
         out["modelos_disponiveis"]=ids
         out["modelos_visao_candidatos"]=vis
+        out["modo_escaneado"]=("Groq visão" if (GROQ_VIS_MODEL and vis) else "OCR local (tesseract) + Groq texto")
     except Exception as e:
         out["modelos_disponiveis"]={"erro":str(e)[:300]}
     return out
