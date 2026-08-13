@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 102
+#  CONTADOR DE REVISÕES DESTE app.py: 105
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 102}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 105}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -3978,7 +3978,7 @@ def orc_txt_gerar_status(request: Request, job: str=""):
 #  DASHBOARD (métricas gerais desde 01/07/2026)
 # ==================================================================
 DASH_INICIO = os.environ.get("DASH_INICIO","2026-07-01")
-META_MATERIAL_MES = float(os.environ.get("META_MATERIAL_MES","40000"))
+META_MATERIAL_MES = float(os.environ.get("META_MATERIAL_MES","80000"))  # 40% do contrato = R$ 80.000/mês
 def _seg_semana(iso):
     """Devolve a segunda-feira (YYYY-MM-DD) da semana da data iso YYYY-MM-DD."""
     try:
@@ -4060,10 +4060,162 @@ def orc_dashboard(request: Request):
     }
 
 # ==================================================================
+#  ESTATÍSTICA CONSOLIDADA (3 escopos + por loja + tempos)
+# ==================================================================
+def _pd(s):
+    try: return datetime.date.fromisoformat(str(s)[:10])
+    except Exception: return None
+def _pdt(s):
+    """Data OU timestamp -> datetime naive (sem tz)."""
+    if not s: return None
+    s=str(s)
+    try:
+        d=datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
+        return d.replace(tzinfo=None)
+    except Exception:
+        d=_pd(s); return datetime.datetime.combine(d,datetime.time()) if d else None
+def _tendencia(serie):
+    """serie: lista de {x,y} ordenada. Compara 1ª metade x 2ª metade."""
+    ys=[float(p.get("y") or 0) for p in serie]; n=len(ys)
+    if n<2: return {"direcao":"estavel","variacao_pct":0}
+    h=n//2; a=sum(ys[:h])/max(1,h); b=sum(ys[h:])/max(1,n-h)
+    if a==0: return {"direcao":("alta" if b>0 else "estavel"),"variacao_pct":(100.0 if b>0 else 0)}
+    var=(b-a)*100.0/a
+    return {"direcao":("alta" if var>5 else ("baixa" if var<-5 else "estavel")),"variacao_pct":round(var,1)}
+def _serie_periodo(datas_val, gran):
+    """datas_val: lista de (date, valor). gran: 'dia'|'semana'|'mes'. Soma por bucket."""
+    ac={}
+    for d,v in datas_val:
+        if not d: continue
+        if gran=="mes": k=d.isoformat()[:7]
+        elif gran=="semana": k=_seg_semana(d.isoformat())
+        else: k=d.isoformat()
+        if k: ac[k]=ac.get(k,0)+v
+    return [{"x":k,"y":round(av,2)} for k,av in sorted(ac.items())]
+
+@app.get("/orc/estat")
+def orc_estat(request: Request, modo: str="inicio", de: str="", ate: str="", mes: str="", loja: str=""):
+    from fastapi import HTTPException
+    exige(request,"DASHBOARD")
+    hoje=datetime.date.today()
+    ini=_pd(DASH_INICIO) or datetime.date(2026,7,1)
+    if modo=="periodo":
+        d0=_pd(de) or ini; d1=_pd(ate) or hoje
+    elif modo=="mensal":
+        mm=(mes or hoje.isoformat())[:7]
+        try:
+            y,m=int(mm[:4]),int(mm[5:7]); d0=datetime.date(y,m,1)
+            d1=datetime.date(y+(1 if m==12 else 0),(1 if m==12 else m+1),1)-datetime.timedelta(days=1)
+        except Exception: d0,d1=ini,hoje; modo="inicio"
+    else:
+        modo="inicio"; d0,d1=ini,hoje
+    if d1<d0: d0,d1=d1,d0
+    alvo=_loja_padrao(loja) if loja else None
+    try:
+        ap=["select=numero,aba,loja,tipo_predial,atendido_em","atendido=is.true",
+            f"atendido_em=gte.{DASH_INICIO}","limit=50000"]
+        at=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
+        op=["select=ticket,loja_nome,aba,valor_nota,valor_orcamento,criado_em","status=eq.gerado","limit=50000"]
+        orc=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(op),SB_KEY) or []
+        mu=_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?select=numero,categoria,tem_mau_uso,loja,data_criacao&limit=50000",SB_KEY) or []
+    except Exception as e:
+        raise HTTPException(500,f"estat: {str(e)[:160]}")
+    # granularidade da tendência conforme o span
+    span=(d1-d0).days
+    gran = "dia" if span<=92 else ("semana" if span<=400 else "mes")
+    # ---- chamados atendidos no escopo ----
+    at_set=set(); por_tipo={}; por_loja={}; at_datas=[]
+    for r in at:
+        d=_pd(r.get("atendido_em"))
+        if not d or not (d0<=d<=d1): continue
+        if alvo and _loja_padrao(r.get("loja"))!=alvo: continue
+        num=str(r.get("numero") or ""); at_set.add(num); at_datas.append((d,1))
+        tp=(r.get("tipo_predial") or "—").strip() or "—"; por_tipo[tp]=por_tipo.get(tp,0)+1
+        lj=_loja_padrao(r.get("loja")); por_loja[lj]=por_loja.get(lj,0)+1
+    # ---- custo de material no escopo ----
+    custo_set=set(); custo_datas=[]; v_orc=0.0; v_nota=0.0
+    for o in orc:
+        d=_pd(o.get("criado_em"))
+        if not d or not (d0<=d<=d1): continue
+        if alvo and _loja_padrao(o.get("loja_nome"))!=alvo: continue
+        tk=str(o.get("ticket") or "")
+        if tk: custo_set.add(tk)
+        vo=_numf(o.get("valor_orcamento")); vn=_numf(o.get("valor_nota"))
+        v_orc+=vo; v_nota+=vn; custo_datas.append((d,vo))
+    total_at=len(at_set); com=len(at_set & custo_set); sem=max(0,total_at-com)
+    # meta do período (proporcional aos dias; mensal = 1 mês cheio)
+    meses = 1.0 if modo=="mensal" else max(0.03,(span+1)/30.44)
+    meta_periodo = META_MATERIAL_MES*meses
+    serie_ch=_serie_periodo(at_datas,gran)
+    serie_cst=_serie_periodo(custo_datas,gran)
+    # ---- mau uso no escopo ----
+    mu_com=0; mu_tot=0; mu_cat={}; mu_loja={}
+    for m in mu:
+        d=_pd(m.get("data_criacao"))
+        if d and not (d0<=d<=d1): continue
+        if alvo and _loja_padrao(m.get("loja"))!=alvo: continue
+        mu_tot+=1
+        cat=m.get("categoria") or "INDETERMINADO"
+        if cat in MAU_USO_SEM: continue
+        mu_com+=1; mu_cat[cat]=mu_cat.get(cat,0)+1
+        lj=_loja_padrao(m.get("loja")); mu_loja[lj]=mu_loja.get(lj,0)+1
+    def _rank(d,n=12):
+        return sorted(({"nome":k,"total":v} for k,v in d.items()),key=lambda x:-x["total"])[:n]
+    mu_cats=sorted(({"categoria":k,"nome":MAU_USO_MAP.get(k,k),"total":v} for k,v in mu_cat.items()),key=lambda x:-x["total"])
+    return {
+        "modo":modo,"de":d0.isoformat(),"ate":d1.isoformat(),"loja":(alvo or ""),
+        "meta_mes":META_MATERIAL_MES,"meta_periodo":round(meta_periodo,2),
+        "custo_material":round(v_orc,2),"valor_notas":round(v_nota,2),
+        "meta_pct":(round(v_orc*100.0/meta_periodo,1) if meta_periodo else None),
+        "meta_saldo":round(meta_periodo-v_orc,2),
+        "total_atendidos":total_at,"com_custo":com,"sem_custo":sem,
+        "pct_com_custo":(round(com*100.0/total_at,1) if total_at else 0),
+        "serie_chamados":serie_ch,"tend_chamados":_tendencia(serie_ch),
+        "serie_custo":serie_cst,"tend_custo":_tendencia(serie_cst),"gran":gran,
+        "por_tipo":_rank(por_tipo),"por_loja":_rank(por_loja),
+        "mau_uso":{"total":mu_tot,"com_mau_uso":mu_com,
+                   "pct":(round(mu_com*100.0/mu_tot,1) if mu_tot else 0),
+                   "por_categoria":mu_cats[:12],"por_loja":_rank(mu_loja)},
+        "lojas": sorted({_loja_padrao(r.get("loja")) for r in at if r.get("loja")}),
+    }
+
+@app.get("/orc/estat_tempos")
+def orc_estat_tempos(request: Request, lojas: str=""):
+    from fastapi import HTTPException
+    exige(request,"DASHBOARD")
+    try:
+        ap=["select=numero,aba,loja,data_criacao,em_execucao_em,executado_em,atendido_em",
+            f"data_criacao=gte.{DASH_INICIO}","limit=50000"]
+        ch=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
+    except Exception as e:
+        raise HTTPException(500,f"tempos: {str(e)[:160]}")
+    disp=sorted({_loja_padrao(c.get("loja")) for c in ch if c.get("loja")})
+    sel=[_loja_padrao(x) for x in (lojas or "").split("||") if x.strip()]
+    base=[c for c in ch if (not sel or _loja_padrao(c.get("loja")) in sel)]
+    esperas=[]; reparos=[]; totais=[]; aberturas=[]
+    for c in base:
+        dc=_pdt(c.get("data_criacao")); ex=_pdt(c.get("em_execucao_em"))
+        fx=_pdt(c.get("executado_em")) or _pdt(c.get("atendido_em"))
+        if dc: aberturas.append(dc)
+        if dc and ex and ex>=dc: esperas.append((ex-dc).total_seconds())
+        if ex and fx and fx>=ex: reparos.append((fx-ex).total_seconds())
+        if dc and fx and fx>=dc: totais.append((fx-dc).total_seconds())
+    aberturas.sort()
+    gaps=[(aberturas[i]-aberturas[i-1]).total_seconds() for i in range(1,len(aberturas))]
+    def med(lst): return (round(sum(lst)/len(lst)/86400.0,1) if lst else None)
+    return {
+        "lojas_disponiveis":disp,"selecionadas":sel,"n_chamados":len(base),
+        "espera":{"dias":med(esperas),"n":len(esperas)},
+        "reparo":{"dias":med(reparos),"n":len(reparos)},
+        "total":{"dias":med(totais),"n":len(totais)},
+        "entre":{"dias":med(gaps),"n":len(gaps)},
+    }
+
+# ==================================================================
 #  ANÁLISE DE MAU USO (más condutas prováveis por trás do chamado)
 # ==================================================================
-# Taxonomia recalibrada a partir da análise dos 4.210 chamados reais (ver ANALISE_MAU_USO.md).
-# Distingue MAU USO (comportamento/operação) de ESTRUTURAL/DESGASTE (não é mau uso).
+# Taxonomia com distinção MAU USO (comportamento/operação) x ESTRUTURAL/DESGASTE.
+# Prompt em modo LIBERAL: o Groq aponta a provável má conduta com liberdade (ver _groq_mau_uso).
 MAU_USO_CATS = [
  # --- MAU USO real ---
  ("ENTUPIMENTO_DESCARTE","Entupimento por descarte (gordura/resíduo em ralo/caixa de gordura)"),
@@ -4087,23 +4239,28 @@ def _groq_mau_uso(descricoes):
     """Classifica um LOTE de descrições. Devolve {idx: (categoria, explicacao)}."""
     cats=" | ".join(f"{c}={n}" for c,n in MAU_USO_CATS)
     corpo="\n".join(f"{i}: {d}" for i,d in enumerate(descricoes))
-    prompt=("Você é engenheiro de manutenção predial de uma rede de supermercados, analisando chamados. "
-      "IMPORTANTE: a MAIORIA dos chamados é infraestrutura/desgaste (teto, telhado, piso, cerâmica, pintura, "
-      "tubulação velha) e NÃO é mau uso — não invente mau uso quando não houver comportamento claro por trás. "
-      "Só classifique como mau uso quando a descrição indicar uma OPERAÇÃO/COMPORTAMENTO que causou o dano.\n"
-      "Regras e exemplos reais:\n"
-      "- 'caixa de gordura transbordando/entupida', 'cano entupido na sala de preparo/food service', 'ralo sem tela' -> ENTUPIMENTO_DESCARTE\n"
-      "- 'carrinho/empilhadeira bateu na porta/gôndola/parede', 'quina amassada' -> IMPACTO_OPERACAO\n"
-      "- 'fechadura/maçaneta/trinco quebrou (de novo)' -> FERRAGEM_FORCA\n"
-      "- 'tomada da fritadeira queimou', 'disjuntor cai com equipamentos ligados', 'gambiarra' -> SOBRECARGA_ELETRICA\n"
-      "- 'goteira/infiltração no teto/telhado na chuva', 'forro molhado/caindo por infiltração' -> INFILTRACAO_ESTRUTURAL (NÃO é mau uso)\n"
-      "- 'cerâmica solta/quebrada', 'rejunte', 'repintura', 'piso desnivelado', 'forro desgastado' -> DESGASTE_ACABAMENTO (NÃO é mau uso)\n"
-      "- 'vazamento em registro/torneira/vaso/cano por desgaste' -> HIDRAULICA_DESGASTE (NÃO é mau uso)\n"
-      "- reparo predial comum sem indício -> OUTRO_ESTRUTURAL ; descrição vaga -> INDETERMINADO\n"
-      "Obs.: água que atinge tomada/quadro POR CAUSA de infiltração de telhado é INFILTRACAO_ESTRUTURAL, não elétrica.\n"
+    prompt=("Você é engenheiro de manutenção predial de uma rede de supermercados. Para CADA chamado, "
+      "identifique a PROVÁVEL MÁ CONDUTA / uso inadequado do lojista que pode ter contribuído para o problema. "
+      "Seja criterioso, mas NÃO seja tímido: sempre que houver um indício plausível de que operação, descuido, "
+      "descarte errado, sobrecarga ou impacto contribuíram, aponte a categoria de MAU USO correspondente. "
+      "Use as categorias estruturais/desgaste apenas quando NÃO houver qualquer contribuição plausível de comportamento.\n"
+      "Guia (aponte mau uso quando fizer sentido):\n"
+      "- entupimento de ralo/caixa de gordura/esgoto em food service, padaria, açougue, manipulação -> ENTUPIMENTO_DESCARTE\n"
+      "- porta/gôndola/parede/quina batida, amassada ou danificada por carrinho/empilhadeira/paleteira/manobra -> IMPACTO_OPERACAO\n"
+      "- fechadura/maçaneta/trinco/dobradiça/puxador quebrado, forçado ou 'quebrou de novo' -> FERRAGEM_FORCA\n"
+      "- tomada/disjuntor que cai ou queima com equipamento, sobrecarga, gambiarra, extensão -> SOBRECARGA_ELETRICA\n"
+      "- água/umidade por lavagem, mangueira, descuido em área imprópria (NÃO telhado) -> AGUA_AREA_IMPROPRIA\n"
+      "- equipamento operado errado (câmara, fritadeira, balança, motor) -> OPERACAO_EQUIPAMENTO\n"
+      "- sujeira/gordura/falta de limpeza que causou o dano ou entupimento -> FALTA_LIMPEZA\n"
+      "Estrutural/desgaste (só quando o uso claramente não contribuiu):\n"
+      "- goteira/infiltração de teto/telhado/laje na chuva -> INFILTRACAO_ESTRUTURAL\n"
+      "- cerâmica/rejunte/pintura/piso/forro por tempo e tráfego -> DESGASTE_ACABAMENTO\n"
+      "- vazamento de tubulação/registro/louça por desgaste natural -> HIDRAULICA_DESGASTE\n"
+      "- reparo predial comum sem indício -> OUTRO_ESTRUTURAL ; descrição vaga demais -> INDETERMINADO\n"
+      "Obs.: água que atinge tomada/quadro POR infiltração de telhado é INFILTRACAO_ESTRUTURAL.\n"
       "CATEGORIAS (use o CÓDIGO): "+cats+"\n\n"
       "Para cada item responda: i, categoria (código), explicacao (frase curta em pt-BR até 120 caracteres com a "
-      "provável causa). Responda só JSON: "
+      "provável má conduta/causa). Responda só JSON: "
       '{"itens":[{"i":0,"categoria":"ENTUPIMENTO_DESCARTE","explicacao":"..."}]}\n\nCHAMADOS:\n'+corpo)
     c=_groq_chat([{"role":"user","content":prompt}], GROQ_TEXT_FALLBACK)
     d=_parse_json(c); out={}
@@ -4119,16 +4276,18 @@ _MU_JOBS={}; _MU_SEQ=[0]
 def _mau_uso_job(job, uid, papel, reset=False):
     st=_MU_JOBS[job]
     try:
-        if reset:   # taxonomia mudou -> reanálise total: limpa a tabela antes
+        if reset:   # taxonomia mudou -> reanálise total: limpa SÓ o que a IA classificou (preserva manual)
             try:
-                rq=urllib.request.Request(f"{SB_URL}/rest/v1/chamado_mau_uso?numero=neq.__nada__",method="DELETE",
+                rq=urllib.request.Request(f"{SB_URL}/rest/v1/chamado_mau_uso?manual=is.false",method="DELETE",
                     headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","prefer":"return=minimal"})
                 urllib.request.urlopen(rq,timeout=60)
             except Exception as e: st["erro"]=f"reset: {str(e)[:120]}"
         # chamados desde o início, com descrição
         ap=["select=numero,aba,loja,tipo_predial,descricao,data_criacao",f"data_criacao=gte.{DASH_INICIO}","limit=50000"]
         ch=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
-        ja=[] if reset else (_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?select=numero,aba&limit=50000",SB_KEY) or [])
+        # não reanalisa quem já foi classificado; no reset, mantém as classificações MANUAIS
+        _q="chamado_mau_uso?select=numero,aba&"+("manual=is.true&" if reset else "")+"limit=50000"
+        ja=_sb_json(f"{SB_URL}/rest/v1/{_q}",SB_KEY) or []
         feitos={(str(x.get("numero")),str(x.get("aba") or "")) for x in ja}
         pend=[c for c in ch if (str(c.get("numero")),str(c.get("aba") or "")) not in feitos and (c.get("descricao") or "").strip()]
         st["total"]=len(pend); st["feitas"]=0
@@ -4213,6 +4372,62 @@ def orc_mau_uso_stats(request: Request):
     return {"total":total,"com_mau_uso":com,"sem_mau_uso":total-com,
             "pct":(round(com*100.0/total,1) if total else 0),
             "por_categoria":cats,"por_loja":lojas,"ranking":ranking}
+
+@app.get("/orc/mau_uso_pendentes")
+def orc_mau_uso_pendentes(request: Request, filtro: str="", limite: int=100):
+    """Lista os chamados que a IA NÃO classificou (não analisados ou marcados INDETERMINADO),
+    para classificação manual. Devolve a DESCRIÇÃO de cada chamado + as categorias disponíveis."""
+    exige(request,"MAU_USO")
+    ap=["select=numero,aba,loja,tipo_predial,descricao,data_criacao",f"data_criacao=gte.{DASH_INICIO}","limit=50000"]
+    ch=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
+    cls=_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?select=numero,aba,categoria,manual&limit=50000",SB_KEY) or []
+    mp={(str(x.get("numero")),str(x.get("aba") or "")):x for x in cls}
+    f=(filtro or "").strip().lower()
+    pend=[]
+    for c in ch:
+        d=(c.get("descricao") or "").strip()
+        if not d: continue
+        cur=mp.get((str(c.get("numero")),str(c.get("aba") or "")))
+        # pendente = sem classificação OU classificado como INDETERMINADO pela IA (e não travado por humano)
+        if cur and (cur.get("manual") or cur.get("categoria")!="INDETERMINADO"): continue
+        if f and (f not in d.lower()) and (f not in str(c.get("numero") or "")): continue
+        pend.append({"numero":str(c.get("numero")),"aba":str(c.get("aba") or ""),
+            "loja":_loja_padrao(c.get("loja")),"loja_raw":c.get("loja"),
+            "tipo_predial":c.get("tipo_predial"),"descricao":d,"data_criacao":c.get("data_criacao"),
+            "categoria_atual":(cur.get("categoria") if cur else None)})
+    total=len(pend)
+    try: lim=max(1,min(int(limite or 100),500))
+    except Exception: lim=100
+    cats=[{"codigo":c,"nome":n,"mau_uso":(c not in MAU_USO_SEM)} for c,n in MAU_USO_CATS]
+    return {"total":total,"mostrando":min(total,lim),"itens":pend[:lim],"categorias":cats}
+
+@app.post("/orc/mau_uso_manual")
+async def orc_mau_uso_manual(request: Request):
+    """Salva classificações MANUAIS (uma ou várias). Ficam com manual=true e o
+    'Reanalisar tudo' não as sobrescreve."""
+    from fastapi import HTTPException
+    u,p=exige(request,"MAU_USO")
+    b=await request.json()
+    itens=b.get("itens") if isinstance(b.get("itens"),list) else ([b] if b.get("numero") else [])
+    linhas=[]
+    for it in itens:
+        num=re.sub(r"\D","",str(it.get("numero") or ""))
+        cat=str(it.get("categoria") or "").strip().upper()
+        if not num or cat not in MAU_USO_MAP: continue
+        linhas.append({"numero":num,"aba":str(it.get("aba") or ""),
+            "categoria":cat,"tem_mau_uso":(cat not in MAU_USO_SEM),
+            "explicacao":"classificação manual","manual":True,
+            "loja":it.get("loja") or it.get("loja_raw"),"tipo_predial":it.get("tipo_predial"),
+            "data_criacao":it.get("data_criacao")})
+    if not linhas: raise HTTPException(400,"nada para salvar (informe número e categoria válida)")
+    try:
+        body=json.dumps(linhas,ensure_ascii=False).encode()
+        rq=urllib.request.Request(f"{SB_URL}/rest/v1/chamado_mau_uso?on_conflict=numero,aba",data=body,method="POST",
+            headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","content-type":"application/json","prefer":"resolution=merge-duplicates,return=minimal"})
+        urllib.request.urlopen(rq,timeout=40)
+    except Exception as e: raise HTTPException(500,f"falha ao salvar: {str(e)[:150]}")
+    log_frotahub(u["id"],p.get("papel"),"MAU_USO","MANUAL",f"{len(linhas)} chamados")
+    return {"ok":True,"salvos":len(linhas)}
 
 # ================= USUÁRIOS / LOGINS / CATEGORIAS / PIN =================
 import hashlib
