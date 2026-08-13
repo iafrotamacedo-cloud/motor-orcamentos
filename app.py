@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 105
+#  CONTADOR DE REVISÕES DESTE app.py: 107
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -32,6 +32,12 @@ Segredos no Render (Environment):
 import os, re, io, json, subprocess, tempfile, datetime, unicodedata, urllib.parse, urllib.request, urllib.error
 import google.generativeai as genai
 import dropbox_rateio
+
+# Fuso de Fortaleza/Brasília (UTC-3, sem horário de verão). O Render roda em UTC;
+# sem isto, o sistema datava/classificava com a hora do servidor (até 3h à frente).
+TZ_OFFSET_H = int(os.environ.get("TZ_OFFSET_H", "-3"))
+def _agora(): return datetime.datetime.utcnow() + datetime.timedelta(hours=TZ_OFFSET_H)
+def _hoje():  return _agora().date()
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.join(BASE, "scripts")
@@ -307,7 +313,7 @@ def processar(arquivos, planilha_controle=None):
         return None, f"⚠️ Falha ao autenticar no Dropbox: {e}"
 
     work = tempfile.mkdtemp(prefix="orc_")
-    hoje = datetime.date.today()
+    hoje = _hoje()
     mes = f"{MESES[hoje.month-1]} {hoje.year}"
     data_str = hoje.strftime("%d/%m/%Y")
     B = dropbox_rateio.BASE
@@ -484,7 +490,7 @@ def processar_corrigidos(subpasta="TICKET NAO ASSOCIADO", arq_xlsx="NOTAS - TICK
     access = dropbox_rateio.obter_token()
     B = dropbox_rateio.BASE
     work = tempfile.mkdtemp(prefix="corr_")
-    hoje = datetime.date.today()
+    hoje = _hoje()
     mes = f"{MESES[hoje.month-1]} {hoje.year}"
     data_str = hoje.strftime("%d/%m/%Y")
     dbx_mes = f"{B}/{dropbox_rateio.ORCAMENTOS}/{mes}"
@@ -864,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 105}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 107}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1316,7 +1322,7 @@ async def notas_receber(request: Request):
     venc    = (b.get("vencimento") or "").strip() or None
     if not nota_id: raise HTTPException(400, "nota_id?")
     if not forma:   raise HTTPException(400, "Informe a forma de pagamento.")
-    patch = {"entregue": True, "entregue_em": datetime.datetime.now().isoformat(),
+    patch = {"entregue": True, "entregue_em": _agora().isoformat(),
              "entregue_por": u["id"], "forma_pagamento": forma, "vencimento": venc}
     req = urllib.request.Request(f"{SB_URL}/rest/v1/notas?id=eq.{urllib.parse.quote(nota_id)}",
         data=json.dumps(patch, ensure_ascii=False).encode(), method="PATCH",
@@ -1441,7 +1447,7 @@ def notas_pendencias_pdf(request: Request, q: str = "", cats: str = ""):
 def _vencimentos_calc(q="", filtro="todas"):
     rows = _sb_json(f"{SB_URL}/rest/v1/v_notas_app?vencimento=not.is.null"
                     f"&select=numero_nota,valor,vencimento,forma_pagamento,tem_boleto,oc_numero,fornecedor,centro_custo&order=vencimento", SB_KEY) or []
-    hoje = datetime.date.today(); ql = (q or "").strip().lower(); out = []
+    hoje = _hoje(); ql = (q or "").strip().lower(); out = []
     for r in rows:
         try: dias = (datetime.date.fromisoformat(str(r["vencimento"])[:10]) - hoje).days
         except Exception: dias = None
@@ -1506,7 +1512,7 @@ async def notas_protocolar(request: Request):
     if not oc_id: raise HTTPException(400, "oc_id?")
     oc = _sb_json(f"{SB_URL}/rest/v1/ocs?id=eq.{urllib.parse.quote(oc_id)}&select=numero,centro_custo&limit=1", SB_KEY) or []
     if not oc: raise HTTPException(404, "O.C. não encontrada")
-    prot = {"data": datetime.date.today().isoformat(), "centro_custo": oc[0].get("centro_custo"),
+    prot = {"data": _hoje().isoformat(), "centro_custo": oc[0].get("centro_custo"),
             "numero": numero_prot or oc[0].get("numero"), "criado_por": u["id"]}
     req = urllib.request.Request(f"{SB_URL}/rest/v1/protocolos",
         data=json.dumps(prot, ensure_ascii=False).encode(), method="POST",
@@ -1514,7 +1520,7 @@ async def notas_protocolar(request: Request):
                  "prefer": "return=representation"})
     try: pid = (json.loads(urllib.request.urlopen(req, timeout=30).read().decode()) or [{}])[0].get("id")
     except urllib.error.HTTPError as e: raise HTTPException(500, "criar protocolo: " + e.read().decode()[:200])
-    patch = {"protocolo": True, "protocolado_em": datetime.datetime.now().isoformat(), "protocolo_id": pid}
+    patch = {"protocolo": True, "protocolado_em": _agora().isoformat(), "protocolo_id": pid}
     req2 = urllib.request.Request(f"{SB_URL}/rest/v1/ocs?id=eq.{urllib.parse.quote(oc_id)}",
         data=json.dumps(patch, ensure_ascii=False).encode(), method="PATCH",
         headers={"apikey": SB_KEY, "authorization": f"Bearer {SB_KEY}", "content-type": "application/json",
@@ -1605,7 +1611,7 @@ def _oc_row(d, status, path, motivo=None):
            "centro_custo": d.get("centro_custo"), "cnpj_centro_custo": d.get("cnpj_centro_custo"),
            "fornecedor": d.get("fornecedor"), "cnpj_fornecedor": d.get("cnpj_fornecedor"),
            "valor": d.get("valor"), "pco_status": status, "arquivo_oc_path": path}
-    if status == "enviado": row["pco_enviado_em"] = datetime.datetime.now().isoformat()
+    if status == "enviado": row["pco_enviado_em"] = _agora().isoformat()
     if motivo: row["bloqueio_motivo"] = motivo
     return row
 
@@ -1677,7 +1683,7 @@ def pco_enviar(request: Request):
     if not (BREVO_API_KEY or (SMTP_USER and SMTP_PASS)):
         raise HTTPException(500, "Envio não configurado — defina BREVO_API_KEY (recomendado) no Render.")
     access = dropbox_rateio.obter_token()
-    hoje = datetime.date.today().strftime("%d/%m/%Y")
+    hoje = _hoje().strftime("%d/%m/%Y")
     aprov, bloq = _pco_coleta(access)
     if not aprov and not bloq:
         return {"ok": True, "enviados": 0, "bloqueados": 0, "msg": "Nada novo para enviar."}
@@ -1688,7 +1694,7 @@ def pco_enviar(request: Request):
         for d in aprov: z.writestr(d["arquivo"], d["_pdf"])
         z.close(); zipbytes = buf.getvalue()
         # nome do zip com data+hora -> nunca sobrescreve um envio anterior do mesmo dia
-        zipnome = f"Pedidos_PCO_{datetime.datetime.now().strftime('%d-%m-%Y_%H%M%S')}.zip"
+        zipnome = f"Pedidos_PCO_{_agora().strftime('%d-%m-%Y_%H%M%S')}.zip"
         try:
             enviar_email(f"Ordens de Compra (PCO) - {hoje} - Frota Macedo Engenharia",
                          _pco_email_html(aprov, hoje), PCO_TO, PCO_CC,
@@ -1907,6 +1913,7 @@ GROQ_TEXT_MODEL= os.environ.get("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")   
 GROQ_VIS_MODEL = os.environ.get("GROQ_VIS_MODEL", "")  # visão do Groq (vazio = conta sem modelo de visão -> usa OCR)
 _ORC_GEMINI_OK = None   # memoriza o 1º modelo que funcionar no leitor de notas
 ORC_EXTRAPOLA  = float(os.environ.get("ORC_EXTRAPOLA", "500"))   # nota (antes do +20%) acima disso -> extrapolado
+RATEIO_TETO    = float(os.environ.get("RATEIO_TETO", "600"))     # NENHUM orçamento de rateio (JÁ com +20%) pode passar disto
 _LOGO_ORC_B64  = "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"
 _MODELO_DOCX_B64 = "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"
 
@@ -1924,9 +1931,9 @@ def _mes_da_data(s):
     iso=_data_iso(s)
     if iso:
         y,mo,_=iso.split("-"); return f"{_MESES[int(mo)-1]} {y}"
-    h=datetime.date.today(); return f"{_MESES[h.month-1]} {h.year}"
+    h=_hoje(); return f"{_MESES[h.month-1]} {h.year}"
 def _mes_atual():
-    h=datetime.date.today(); return f"{_MESES[h.month-1]} {h.year}"
+    h=_hoje(); return f"{_MESES[h.month-1]} {h.year}"
 
 _EU=["zero","um","dois","três","quatro","cinco","seis","sete","oito","nove","dez","onze","doze","treze","quatorze","quinze","dezesseis","dezessete","dezoito","dezenove"]
 _ED=["","","vinte","trinta","quarenta","cinquenta","sessenta","setenta","oitenta","noventa"]
@@ -2098,7 +2105,7 @@ def _ler_notas_gemini(file_bytes, mime="application/pdf"):
 
 # ---------- CONTADOR DE COTA DO GEMINI (por dia) ----------
 def _hoje_iso():
-    return datetime.date.today().isoformat()
+    return _hoje().isoformat()
 
 def _gemini_conta_inc():
     """Soma +1 na cota do dia (atômico via RPC gemini_inc). Best-effort."""
@@ -2628,12 +2635,24 @@ def _orc_registra(row):
     try: urllib.request.urlopen(req,timeout=30)
     except urllib.error.HTTPError as e: print("notas_orcamento erro:",e.read().decode()[:200],flush=True)
 
-def _nota_ja_gerada(ticket, nota_num):
-    """True se já existe orçamento gerado para (ticket, nota) — evita reprocessar a MESMA nota."""
-    if not nota_num or str(nota_num)=="SN": return False
-    q=urllib.parse.urlencode({"ticket":f"eq.{ticket}","nota_numero":f"eq.{nota_num}","status":"eq.gerado","select":"ticket","limit":"1"})
-    try: return bool(_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY))
-    except Exception: return False
+def _nota_ja_gerada(ticket, nota_num, base_nome=None):
+    """True se já existe orçamento gerado para este ticket/nota — evita reprocessar a MESMA nota.
+    Cobre também nota SEM número (SN): nesse caso usa o nome-base do arquivo (determinístico por
+    ticket+loja+nota), fechando o furo que deixava notas sem número serem rateadas várias vezes."""
+    # 1) por ticket + número da nota (quando há número)
+    if nota_num and str(nota_num)!="SN":
+        q=urllib.parse.urlencode({"ticket":f"eq.{ticket}","nota_numero":f"eq.{nota_num}","status":"eq.gerado","select":"ticket","limit":"1"})
+        try:
+            if _sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY): return True
+        except Exception: pass
+    # 2) por nome-base do arquivo gerado (cobre SN e reprocessamento do mesmo arquivo)
+    if base_nome:
+        like=urllib.parse.quote(f"*{base_nome}*")
+        q2=f"status=eq.gerado&or=(arquivo_pdf.ilike.{like},arquivo_doc.ilike.{like})&select=ticket&limit=1"
+        try:
+            if _sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q2}",SB_KEY): return True
+        except Exception: pass
+    return False
 
 @app.post("/orc/listar")
 def orc_listar(request: Request):
@@ -2957,7 +2976,7 @@ def _planilha_orc_rows(desde="",ate="",faixa=""):
 def _planilha_header(desde,ate,faixa,resp,total,qtd):
     per = (f"{_data_br(desde)} a {_data_br(ate)}" if (desde or ate) else "Todos os períodos")
     fx  = {"ate600":"Orçamentos ≤ R$ 600","acima600":"Orçamentos > R$ 600"}.get(faixa,"Todas as faixas")
-    hoje=datetime.date.today().strftime("%d/%m/%Y")
+    hoje=_hoje().strftime("%d/%m/%Y")
     return {"periodo":per,"faixa":fx,"gerado":hoje,"responsavel":resp or "—",
             "total":_reais(total),"qtd":qtd,
             "titulo":"CUSTOS DE MATERIAIS DOS CHAMADOS DE MANUTENÇÃO"}
@@ -3206,7 +3225,7 @@ def _orc_job_run(job, previa, uid, papel):
                     res.append(info); continue
                 if not previa:
                     # dados do orçamento
-                    hoje=datetime.date.today().strftime("%d/%m/%Y")
+                    hoje=_hoje().strftime("%d/%m/%Y")
                     itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
                     dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
                         "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
@@ -3589,7 +3608,7 @@ async def rateio_preparar(request: Request):
                     "endereco":loja.get("endereco"),"cidade":loja.get("cidade")},
             "tickets":tks,"materiais":materiais}
 
-_RAT_JOBS={}; _RAT_SEQ=[0]
+_RAT_JOBS={}; _RAT_SEQ=[0]; _RAT_LOCK=set()   # notas em processamento AGORA (trava duplo-clique / rodar 2x)
 def _rat_job_run(job, dados_job, uid, papel):
     st=_RAT_JOBS[job]
     try:
@@ -3599,7 +3618,7 @@ def _rat_job_run(job, dados_job, uid, papel):
         arquivo=dados_job["arquivo"]; nota_num=_num_limpo(dados_job.get("nota_numero")) or "SN"
         loja=dados_job["loja"]; alocacao=dados_job["alocacao"]; ext=os.path.splitext(arquivo)[1] or ".pdf"
         loja_nome=loja.get("nome") or "—"; slug=_slug_loja(loja,"")
-        mes=_mes_atual(); hoje=datetime.date.today().strftime("%d/%m/%Y")
+        mes=_mes_atual(); hoje=_hoje().strftime("%d/%m/%Y")
         st["total"]=len(alocacao); res=st["res"]
         for _i,al in enumerate(alocacao):
             tk=str(al.get("ticket")); aba=al.get("aba")
@@ -3608,9 +3627,15 @@ def _rat_job_run(job, dados_job, uid, papel):
             valor_nota=round(sum(i["valor_unit"]*i["quant"] for i in itens_orc),2)
             valor_orc=round(valor_nota*1.20,2)
             r={"ticket":tk,"itens":len(itens_orc),"valor_nota":valor_nota,"valor_orcamento":valor_orc}
+            base_nome=f"{slug}_{tk}_NOTA_{nota_num}_RATEIO"; arq_pdf=arq_doc=None
             if not itens_orc: r["status"]="pulado"; r["motivo"]="sem itens"; res.append(r); st["feitas"]=_i+1; continue
-            if _nota_ja_gerada(tk, nota_num):
-                r["status"]="duplicada"; r["motivo"]="orçamento já existe para este ticket/nota"; res.append(r); st["feitas"]=_i+1; continue
+            # TRAVA DE DUPLICIDADE (cobre nota SEM número pelo nome-base do arquivo)
+            if _nota_ja_gerada(tk, nota_num, base_nome):
+                r["status"]="duplicada"; r["motivo"]="orçamento já existe para este ticket/nota — não gerado de novo"; res.append(r); st["feitas"]=_i+1; continue
+            # TETO: nenhum orçamento de rateio (JÁ com +20%) pode passar de RATEIO_TETO
+            if valor_orc>RATEIO_TETO:
+                r["status"]="acima_limite"; r["motivo"]=f"orçamento {_rs(valor_orc)} acima do teto de {_rs(RATEIO_TETO)} — rateie em mais tickets ou faça manual"
+                res.append(r); st["feitas"]=_i+1; continue
             extrap=valor_nota>ORC_EXTRAPOLA
             dados={"num":tk,"revisao":1,"data":hoje,"loja_nome":loja_nome,
                 "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
@@ -3618,7 +3643,6 @@ def _rat_job_run(job, dados_job, uid, papel):
                            "endereco":loja.get("endereco"),
                            "cidade":((loja.get("cidade") or ""))+(" - CE" if loja.get("cidade") else "")},
                 "itens":itens_orc}
-            base_nome=f"{slug}_{tk}_NOTA_{nota_num}_RATEIO"; arq_pdf=arq_doc=None
             try:
                 doc_bytes=gera_orcamento_docx(dados)
                 if extrap:
@@ -3651,6 +3675,8 @@ def _rat_job_run(job, dados_job, uid, papel):
         st["gerados"]=ok; st["estado"]="pronto"
     except Exception as e:
         st["estado"]="erro"; st["erro"]=str(e)[:300]
+    finally:
+        _RAT_LOCK.discard(dados_job.get("arquivo"))
 
 @app.post("/rateio/gerar")
 async def rateio_gerar(request: Request):
@@ -3670,6 +3696,9 @@ async def rateio_gerar(request: Request):
     # loja oficial (do cadastro), nunca do cliente
     lj=(_sb_json(f"{SB_URL}/rest/v1/lojas?numero=eq.{int(loja_numero)}&limit=1",SB_KEY) or [None])[0] if loja_numero is not None else None
     if not lj: raise HTTPException(400,"loja não encontrada no cadastro")
+    # TRAVA de concorrência: mesma nota não pode ser rateada 2x ao mesmo tempo (duplo clique / 2 abas)
+    if arquivo in _RAT_LOCK: raise HTTPException(409,"esta nota já está sendo rateada agora — aguarde terminar")
+    _RAT_LOCK.add(arquivo)
     _RAT_SEQ[0]+=1; job=str(_RAT_SEQ[0])
     if len(_RAT_JOBS)>20:
         for k in list(_RAT_JOBS)[:-10]: _RAT_JOBS.pop(k,None)
@@ -3729,7 +3758,7 @@ def _corr_job_run(job, uid, papel):
         P1=_pasta_manut(access,1,ob); P8=_pasta_manut(access,8,ob); P9=_pasta_manut(access,9,ob)
         P10=_pasta_manut(access,10,ob); P6=_pasta_manut(access,6,ob); P7=_pasta_manut(access,7,ob)
         recs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?select=id,nota_numero,ticket,itens,aba,loja_numero,loja_nome,arquivo_nota&status=eq.corrigido&limit=1000",SB_KEY) or []
-        st["total"]=len(recs); res=st["res"]; mes=_mes_atual(); hoje=datetime.date.today().strftime("%d/%m/%Y")
+        st["total"]=len(recs); res=st["res"]; mes=_mes_atual(); hoje=_hoje().strftime("%d/%m/%Y")
         for _i,rec in enumerate(recs):
             tk=str(rec.get("ticket") or ""); nota_num=_num_limpo(rec.get("nota_numero")) or "SN"
             itens=rec.get("itens") or []
@@ -3890,7 +3919,7 @@ def _txt_job_run(job, notas, uid, papel):
     try:
         access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
         P1=_pasta_manut(access,1,ob); P9=_pasta_manut(access,9,ob); P10=_pasta_manut(access,10,ob)
-        st["total"]=len(notas); res=st["res"]; mes=_mes_atual(); hoje=datetime.date.today().strftime("%d/%m/%Y")
+        st["total"]=len(notas); res=st["res"]; mes=_mes_atual(); hoje=_hoje().strftime("%d/%m/%Y")
         for _i,nt in enumerate(notas):
             tk=_num_limpo(nt.get("ticket")); nota_num=_num_limpo(nt.get("nota_numero")) or "SN"
             itens=nt.get("itens") or []
@@ -4097,7 +4126,7 @@ def _serie_periodo(datas_val, gran):
 def orc_estat(request: Request, modo: str="inicio", de: str="", ate: str="", mes: str="", loja: str=""):
     from fastapi import HTTPException
     exige(request,"DASHBOARD")
-    hoje=datetime.date.today()
+    hoje=_hoje()
     ini=_pd(DASH_INICIO) or datetime.date(2026,7,1)
     if modo=="periodo":
         d0=_pd(de) or ini; d1=_pd(ate) or hoje
@@ -4183,12 +4212,17 @@ def orc_estat(request: Request, modo: str="inicio", de: str="", ate: str="", mes
 def orc_estat_tempos(request: Request, lojas: str=""):
     from fastapi import HTTPException
     exige(request,"DASHBOARD")
-    try:
-        ap=["select=numero,aba,loja,data_criacao,em_execucao_em,executado_em,atendido_em",
-            f"data_criacao=gte.{DASH_INICIO}","limit=50000"]
-        ch=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
-    except Exception as e:
-        raise HTTPException(500,f"tempos: {str(e)[:160]}")
+    # tolerante: se as colunas de transição ainda não existem (SQL não rodado), carrega sem elas
+    ch=None
+    for cols in ("numero,aba,loja,data_criacao,em_execucao_em,executado_em,atendido_em",
+                 "numero,aba,loja,data_criacao,atendido_em"):
+        try:
+            ch=_sb_json(f"{SB_URL}/rest/v1/chamados?select={cols}&data_criacao=gte.{DASH_INICIO}&limit=50000",SB_KEY) or []
+            break
+        except Exception as e:
+            last=str(e)[:160]; ch=None
+    if ch is None:
+        raise HTTPException(500,f"tempos: {last}")
     disp=sorted({_loja_padrao(c.get("loja")) for c in ch if c.get("loja")})
     sel=[_loja_padrao(x) for x in (lojas or "").split("||") if x.strip()]
     base=[c for c in ch if (not sel or _loja_padrao(c.get("loja")) in sel)]
