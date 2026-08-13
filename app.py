@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 107
+#  CONTADOR DE REVISÕES DESTE app.py: 108
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 107}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 108}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2990,6 +2990,138 @@ def orc_planilha(request: Request, desde: str="", ate: str="", faixa: str=""):
     # quem pode remover orçamentos (builder/gerente) — o front usa isso para mostrar a opção
     return {"itens":rows,"total":total,"header":h,"pode_remover":(p.get("nivel") in ("builder","gerente"))}
 
+# ================= GERENCIADOR DE ARQUIVOS (fluxo pelas pastas, sem Dropbox direto) =================
+_ARQ_EXTS_DOC={".pdf",".jpg",".jpeg",".png"}
+_ARQ_TREE_NUMS=[1,2,4,5,9]
+def _seg_ok(nome): return bool(nome) and ("/" not in nome) and ("\\" not in nome) and (".." not in nome)
+def _ctype(nome):
+    e=os.path.splitext(nome)[1].lower()
+    return {".pdf":"application/pdf",".jpg":"image/jpeg",".jpeg":"image/jpeg",".png":"image/png"}.get(e,"application/octet-stream")
+def _arq_area(access, area):
+    if area=="pco_oc":
+        return {"base":PCO_ENVIAR,"perm":"ENVIAR_PCO","exts":{".pdf"},"rotulo":"Ordens de compra (PCO)"}
+    if area=="notas_orc":
+        ob=_orc_base(access,_manut_base(access))
+        base=_pasta_manut(access,0,ob) or (ob+"/0 - NOTAS PARA ORCAMENTO (COLOCAR AQUI)")
+        return {"base":base,"perm":"GERAR_ORCAMENTOS","exts":_ARQ_EXTS_DOC,"rotulo":"Notas e DAVs"}
+    return None
+
+@app.get("/arq/listar")
+def arq_listar(request: Request, area: str=""):
+    from fastapi import HTTPException
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    access=dropbox_rateio.obter_token(); a=_arq_area(access,area)
+    if not a: raise HTTPException(400,"área inválida")
+    exige(request,a["perm"])
+    ents=dropbox_rateio.listar_entradas(access,a["base"])
+    itens=[{"nome":e["name"],"tamanho":e.get("size")} for e in ents
+           if not e["dir"] and os.path.splitext(e["name"])[1].lower() in a["exts"]]
+    itens.sort(key=lambda x:x["nome"].lower())
+    return {"area":area,"rotulo":a["rotulo"],"total":len(itens),"itens":itens}
+
+@app.post("/arq/upar")
+async def arq_upar(request: Request):
+    from fastapi import HTTPException
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    access=dropbox_rateio.obter_token()
+    form=await request.form(); area=form.get("area"); a=_arq_area(access,area)
+    if not a: raise HTTPException(400,"área inválida")
+    u,p=exige(request,a["perm"])
+    files=form.getlist("arquivos")
+    if not files: raise HTTPException(400,"nenhum arquivo enviado")
+    salvos=[]; erros=[]
+    for f in files:
+        nome=os.path.basename(getattr(f,"filename","") or "")
+        if not nome: continue
+        ext=os.path.splitext(nome)[1].lower()
+        if ext not in a["exts"]: erros.append(f"{nome}: tipo não aceito"); continue
+        try:
+            data=await f.read()
+            if len(data)>30*1024*1024: erros.append(f"{nome}: acima de 30 MB"); continue
+            dropbox_rateio.subir_bytes(access,data,f"{a['base']}/{nome}",overwrite=False)  # autorename evita clobber
+            salvos.append(nome)
+        except Exception as e: erros.append(f"{nome}: {str(e)[:80]}")
+    log_frotahub(u["id"],p.get("papel"),a["perm"],"UPAR",f"{len(salvos)} arquivo(s) em {area}")
+    return {"salvos":salvos,"erros":erros}
+
+@app.get("/arq/ver")
+def arq_ver(request: Request, area: str="", nome: str=""):
+    from fastapi import HTTPException
+    access=dropbox_rateio.obter_token(); a=_arq_area(access,area)
+    if not a: raise HTTPException(400,"área inválida")
+    exige(request,a["perm"])
+    if not _seg_ok(nome): raise HTTPException(400,"nome inválido")
+    data=dropbox_rateio.baixar(access,f"{a['base']}/{nome}")
+    if data is None: raise HTTPException(404,"arquivo não encontrado")
+    return Response(content=data,media_type=_ctype(nome),
+                    headers={"Content-Disposition":f'inline; filename="{urllib.parse.quote(nome)}"'})
+
+@app.post("/arq/excluir")
+async def arq_excluir(request: Request):
+    from fastapi import HTTPException
+    access=dropbox_rateio.obter_token(); b=await request.json(); area=b.get("area")
+    a=_arq_area(access,area)
+    if not a: raise HTTPException(400,"área inválida")
+    u,p=exige(request,a["perm"]); nome=b.get("nome")
+    if not _seg_ok(nome): raise HTTPException(400,"nome inválido")
+    try: dropbox_rateio.apagar(access,f"{a['base']}/{nome}")   # lixeira do Dropbox (recuperável ~30d)
+    except Exception as e: raise HTTPException(500,f"excluir: {str(e)[:120]}")
+    log_frotahub(u["id"],p.get("papel"),a["perm"],"EXCLUIR",f"{nome} ({area})")
+    return {"ok":True}
+
+# ---- Árvore do Dropbox (pastas 1,2,4,5,9 da manutenção) ----
+def _arvore_roots(access, ob):
+    out={}
+    for n in _ARQ_TREE_NUMS:
+        pth=_pasta_manut(access,n,ob)
+        if pth: out[os.path.basename(pth)]=pth
+    return out
+def _arvore_valida(path, roots):
+    path=(path or "").strip().strip("/")
+    if not path: return ""
+    if ".." in path or "\\" in path: return None
+    if path.split("/")[0] not in roots: return None
+    return path
+
+@app.get("/arq/arvore")
+def arq_arvore(request: Request, path: str=""):
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    roots=_arvore_roots(access,ob); path=_arvore_valida(path,roots)
+    if path is None: raise HTTPException(403,"caminho fora do escopo")
+    if path=="":
+        return {"path":"","entradas":[{"nome":k,"dir":True} for k in sorted(roots)]}
+    raw=dropbox_rateio.listar_entradas(access,f"{ob}/{path}")
+    ents=[{"nome":e["name"],"dir":e["dir"],"tamanho":e.get("size")} for e in raw]
+    ents.sort(key=lambda x:(not x["dir"],x["nome"].lower()))
+    return {"path":path,"entradas":ents}
+
+@app.get("/arq/arvore_ver")
+def arq_arvore_ver(request: Request, path: str=""):
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    roots=_arvore_roots(access,ob); path=_arvore_valida(path,roots)
+    if not path: raise HTTPException(403,"caminho inválido")
+    data=dropbox_rateio.baixar(access,f"{ob}/{path}")
+    if data is None: raise HTTPException(404,"arquivo não encontrado")
+    nome=os.path.basename(path)
+    return Response(content=data,media_type=_ctype(nome),
+                    headers={"Content-Disposition":f'inline; filename="{urllib.parse.quote(nome)}"'})
+
+@app.post("/arq/arvore_excluir")
+async def arq_arvore_excluir(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    roots=_arvore_roots(access,ob); b=await request.json(); path=_arvore_valida(b.get("path"),roots)
+    if not path or "/" not in path: raise HTTPException(403,"só é possível excluir itens DENTRO das pastas")
+    try: dropbox_rateio.apagar(access,f"{ob}/{path}")
+    except Exception as e: raise HTTPException(500,f"excluir: {str(e)[:120]}")
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","EXCLUIR_ARVORE",path)
+    return {"ok":True}
+
 def _resolve_arq(access, ob, rel):
     """Converte 'NN/sub/arquivo' (guardado no banco) no caminho real do Dropbox."""
     if not rel or "/" not in rel: return None
@@ -4742,7 +4874,7 @@ def _basic_auth(app, user, pw):
         if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
                                         or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
                                         or _path.startswith("/desfazer") or _path.startswith("/usuarios") or _path.startswith("/config")
-                                        or _path.startswith("/rateio")
+                                        or _path.startswith("/rateio") or _path.startswith("/arq")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
