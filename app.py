@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 99
+#  CONTADOR DE REVISÕES DESTE app.py: 100
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 99}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 100}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2933,7 +2933,7 @@ def _conta_da_aba(aba):
     if a=="Instalações": return "PREDIAL INSTALAÇÕES - MANUENÇÃO CORRETIVA"
     return ""
 def _planilha_orc_rows(desde="",ate="",faixa=""):
-    parts=["select=ticket,loja_nome,aba,valor_orcamento,criado_em","status=eq.gerado","order=criado_em.asc","limit=8000"]
+    parts=["select=id,ticket,nota_numero,loja_nome,aba,valor_orcamento,criado_em,rateio","status=eq.gerado","order=criado_em.asc","limit=8000"]
     if desde: parts.append(f"criado_em=gte.{desde}")
     if ate:   parts.append(f"criado_em=lte.{ate}T23:59:59")
     notas=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(parts),SB_KEY) or []
@@ -2950,8 +2950,8 @@ def _planilha_orc_rows(desde="",ate="",faixa=""):
     for i,n in enumerate(notas,1):
         tk=str(n.get("ticket") or ""); cm=lojamap.get(tk,{})
         aba=cm.get("aba") or n.get("aba") or ""
-        rows.append({"n":i,"ticket":tk,"loja":_loja_padrao(cm.get("loja") or n.get("loja_nome")),
-            "valor":round(val(n),2),"data":(n.get("criado_em") or "")[:10],"conta":_conta_da_aba(aba)})
+        rows.append({"n":i,"id":n.get("id"),"ticket":tk,"nota":n.get("nota_numero"),"loja":_loja_padrao(cm.get("loja") or n.get("loja_nome")),
+            "valor":round(val(n),2),"data":(n.get("criado_em") or "")[:10],"conta":_conta_da_aba(aba),"rateio":bool(n.get("rateio"))})
     return rows
 
 def _planilha_header(desde,ate,faixa,resp,total,qtd):
@@ -2968,7 +2968,52 @@ def orc_planilha(request: Request, desde: str="", ate: str="", faixa: str=""):
     u,p=exige(request,"ORCAMENTOS_GERADOS")
     rows=_planilha_orc_rows(desde,ate,faixa); total=round(sum(r["valor"] for r in rows),2)
     h=_planilha_header(desde,ate,faixa,(p.get("nome_completo") or p.get("nome")),total,len(rows))
-    return {"itens":rows,"total":total,"header":h}
+    # quem pode remover orçamentos (builder/gerente) — o front usa isso para mostrar a opção
+    return {"itens":rows,"total":total,"header":h,"pode_remover":(p.get("nivel") in ("builder","gerente"))}
+
+def _resolve_arq(access, ob, rel):
+    """Converte 'NN/sub/arquivo' (guardado no banco) no caminho real do Dropbox."""
+    if not rel or "/" not in rel: return None
+    num,_,sub=rel.partition("/")
+    try: base=_pasta_manut(access, int(num), ob)
+    except Exception: base=None
+    return f"{base}/{sub}" if base else None
+
+@app.post("/orc/planilha_remover")
+async def orc_planilha_remover(request: Request):
+    """Remove orçamentos gerados (builder/gerente + PIN): marca como 'removido' (sai da planilha,
+       das estatísticas e libera a nota para ser refeita) e manda os arquivos para a lixeira do Dropbox."""
+    from fastapi import HTTPException
+    u,p=_exige_gestor(request)
+    b=await request.json()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    ids=[str(x) for x in (b.get("ids") or []) if x]
+    if not ids: raise HTTPException(400,"nenhum orçamento selecionado")
+    inlist=",".join(urllib.parse.quote(i) for i in ids[:500])
+    recs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=in.({inlist})&select=id,ticket,nota_numero,arquivo_pdf,arquivo_doc,rateio,status",SB_KEY) or []
+    removidos=0
+    try: access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    except Exception: access=None; ob=None
+    for r in recs:
+        if r.get("status")!="gerado": continue
+        # lixeira: montado (10/11) + não lançado (1/4) pelo nome-base
+        if access:
+            for rel in (r.get("arquivo_pdf"), r.get("arquivo_doc")):
+                full=_resolve_arq(access, ob, rel)
+                if full:
+                    try: dropbox_rateio.apagar(access, full)
+                    except Exception: pass
+            base=os.path.basename(r.get("arquivo_pdf") or r.get("arquivo_doc") or "")
+            if base:
+                pnl=_pasta_manut(access, 4 if r.get("rateio") else 1, ob)
+                if pnl:
+                    for ext in (".pdf",".docx"):
+                        try: dropbox_rateio.apagar(access, f"{pnl}/{os.path.splitext(base)[0]}{ext}")
+                        except Exception: pass
+        try: _sb_write(f"notas_orcamento?id=eq.{r['id']}", {"status":"removido"}, "PATCH"); removidos+=1
+        except Exception: pass
+    log_frotahub(u["id"],p.get("papel"),"ORCAMENTOS_GERADOS","REMOVEU",f"{removidos} orçamento(s)")
+    return {"ok":True,"removidos":removidos}
 
 @app.get("/orc/planilha_orcamentos_xlsx")
 def orc_planilha_xlsx(request: Request, desde: str="", ate: str="", faixa: str=""):
