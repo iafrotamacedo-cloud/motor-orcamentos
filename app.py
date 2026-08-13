@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 101
+#  CONTADOR DE REVISÕES DESTE app.py: 102
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 101}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 102}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -4062,35 +4062,49 @@ def orc_dashboard(request: Request):
 # ==================================================================
 #  ANÁLISE DE MAU USO (más condutas prováveis por trás do chamado)
 # ==================================================================
+# Taxonomia recalibrada a partir da análise dos 4.210 chamados reais (ver ANALISE_MAU_USO.md).
+# Distingue MAU USO (comportamento/operação) de ESTRUTURAL/DESGASTE (não é mau uso).
 MAU_USO_CATS = [
- ("ELETRICA_SOBRECARGA","Sobrecarga elétrica / gambiarra"),
- ("FALTA_LIMPEZA","Falta de limpeza / entupimento"),
- ("FORCA_EXCESSIVA","Força excessiva / manuseio incorreto"),
- ("IMPACTO","Impacto mecânico (carrinho/empilhadeira)"),
- ("INFILTRACAO_DESCUIDO","Infiltração/vazamento por descuido"),
- ("DESCARTE_INCORRETO","Descarte incorreto em ralo/vaso"),
- ("OPERACAO_INCORRETA","Operação incorreta de equipamento"),
- ("UMIDADE_EXPOSICAO","Exposição indevida à água/umidade"),
- ("PREVENTIVA_NEGLIGENCIADA","Manutenção preventiva negligenciada"),
- ("VANDALISMO","Vandalismo / dano intencional"),
- ("DESGASTE_NATURAL","Desgaste natural (sem mau uso)"),
+ # --- MAU USO real ---
+ ("ENTUPIMENTO_DESCARTE","Entupimento por descarte (gordura/resíduo em ralo/caixa de gordura)"),
+ ("IMPACTO_OPERACAO","Impacto de carrinho/empilhadeira/paleteira"),
+ ("FERRAGEM_FORCA","Ferragem/fechadura/maçaneta quebrada por força/uso"),
+ ("SOBRECARGA_ELETRICA","Sobrecarga elétrica / uso indevido de tomada"),
+ ("AGUA_AREA_IMPROPRIA","Água/umidade indevida por lavagem/descuido (não telhado)"),
+ ("OPERACAO_EQUIPAMENTO","Operação incorreta de equipamento"),
+ ("FALTA_LIMPEZA","Falta de limpeza/conservação que gerou dano"),
+ # --- NÃO é mau uso (estrutural/desgaste) ---
+ ("INFILTRACAO_ESTRUTURAL","Infiltração/goteira de teto/telhado/laje (estrutural)"),
+ ("DESGASTE_ACABAMENTO","Desgaste de piso/cerâmica/pintura/forro"),
+ ("HIDRAULICA_DESGASTE","Vazamento de tubulação/registro/louça por desgaste"),
+ ("OUTRO_ESTRUTURAL","Outro reparo predial sem indício de mau uso"),
  ("INDETERMINADO","Indeterminado / descrição insuficiente"),
 ]
 MAU_USO_MAP=dict(MAU_USO_CATS)
-MAU_USO_SEM={"DESGASTE_NATURAL","INDETERMINADO"}
+MAU_USO_SEM={"INFILTRACAO_ESTRUTURAL","DESGASTE_ACABAMENTO","HIDRAULICA_DESGASTE","OUTRO_ESTRUTURAL","INDETERMINADO"}
 
 def _groq_mau_uso(descricoes):
     """Classifica um LOTE de descrições. Devolve {idx: (categoria, explicacao)}."""
     cats=" | ".join(f"{c}={n}" for c,n in MAU_USO_CATS)
     corpo="\n".join(f"{i}: {d}" for i,d in enumerate(descricoes))
-    prompt=("Você é engenheiro de manutenção predial de uma rede de supermercados. Para CADA chamado abaixo "
-      "(descrição do problema), identifique a PROVÁVEL má conduta/mau uso do usuário que levou ao problema e "
-      "escolha UMA categoria da lista (use o CÓDIGO). Se for claramente desgaste natural/fim de vida, use "
-      "DESGASTE_NATURAL. Se a descrição não permitir inferir, use INDETERMINADO. Não invente mau uso quando "
-      "não houver indício.\nCATEGORIAS: "+cats+"\n\n"
-      "Para cada item responda: i, categoria (código), explicacao (frase curta em pt-BR, até 120 caracteres, "
-      "dizendo a provável má conduta). Responda só JSON: "
-      '{"itens":[{"i":0,"categoria":"ELETRICA_SOBRECARGA","explicacao":"..."}]}\n\nCHAMADOS:\n'+corpo)
+    prompt=("Você é engenheiro de manutenção predial de uma rede de supermercados, analisando chamados. "
+      "IMPORTANTE: a MAIORIA dos chamados é infraestrutura/desgaste (teto, telhado, piso, cerâmica, pintura, "
+      "tubulação velha) e NÃO é mau uso — não invente mau uso quando não houver comportamento claro por trás. "
+      "Só classifique como mau uso quando a descrição indicar uma OPERAÇÃO/COMPORTAMENTO que causou o dano.\n"
+      "Regras e exemplos reais:\n"
+      "- 'caixa de gordura transbordando/entupida', 'cano entupido na sala de preparo/food service', 'ralo sem tela' -> ENTUPIMENTO_DESCARTE\n"
+      "- 'carrinho/empilhadeira bateu na porta/gôndola/parede', 'quina amassada' -> IMPACTO_OPERACAO\n"
+      "- 'fechadura/maçaneta/trinco quebrou (de novo)' -> FERRAGEM_FORCA\n"
+      "- 'tomada da fritadeira queimou', 'disjuntor cai com equipamentos ligados', 'gambiarra' -> SOBRECARGA_ELETRICA\n"
+      "- 'goteira/infiltração no teto/telhado na chuva', 'forro molhado/caindo por infiltração' -> INFILTRACAO_ESTRUTURAL (NÃO é mau uso)\n"
+      "- 'cerâmica solta/quebrada', 'rejunte', 'repintura', 'piso desnivelado', 'forro desgastado' -> DESGASTE_ACABAMENTO (NÃO é mau uso)\n"
+      "- 'vazamento em registro/torneira/vaso/cano por desgaste' -> HIDRAULICA_DESGASTE (NÃO é mau uso)\n"
+      "- reparo predial comum sem indício -> OUTRO_ESTRUTURAL ; descrição vaga -> INDETERMINADO\n"
+      "Obs.: água que atinge tomada/quadro POR CAUSA de infiltração de telhado é INFILTRACAO_ESTRUTURAL, não elétrica.\n"
+      "CATEGORIAS (use o CÓDIGO): "+cats+"\n\n"
+      "Para cada item responda: i, categoria (código), explicacao (frase curta em pt-BR até 120 caracteres com a "
+      "provável causa). Responda só JSON: "
+      '{"itens":[{"i":0,"categoria":"ENTUPIMENTO_DESCARTE","explicacao":"..."}]}\n\nCHAMADOS:\n'+corpo)
     c=_groq_chat([{"role":"user","content":prompt}], GROQ_TEXT_FALLBACK)
     d=_parse_json(c); out={}
     for a in (d.get("itens") or []):
@@ -4102,13 +4116,19 @@ def _groq_mau_uso(descricoes):
     return out
 
 _MU_JOBS={}; _MU_SEQ=[0]
-def _mau_uso_job(job, uid, papel):
+def _mau_uso_job(job, uid, papel, reset=False):
     st=_MU_JOBS[job]
     try:
+        if reset:   # taxonomia mudou -> reanálise total: limpa a tabela antes
+            try:
+                rq=urllib.request.Request(f"{SB_URL}/rest/v1/chamado_mau_uso?numero=neq.__nada__",method="DELETE",
+                    headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","prefer":"return=minimal"})
+                urllib.request.urlopen(rq,timeout=60)
+            except Exception as e: st["erro"]=f"reset: {str(e)[:120]}"
         # chamados desde o início, com descrição
         ap=["select=numero,aba,loja,tipo_predial,descricao,data_criacao",f"data_criacao=gte.{DASH_INICIO}","limit=50000"]
         ch=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
-        ja=_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?select=numero,aba&limit=50000",SB_KEY) or []
+        ja=[] if reset else (_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?select=numero,aba&limit=50000",SB_KEY) or [])
         feitos={(str(x.get("numero")),str(x.get("aba") or "")) for x in ja}
         pend=[c for c in ch if (str(c.get("numero")),str(c.get("aba") or "")) not in feitos and (c.get("descricao") or "").strip()]
         st["total"]=len(pend); st["feitas"]=0
@@ -4139,7 +4159,7 @@ def _mau_uso_job(job, uid, papel):
         st["estado"]="erro"; st["erro"]=str(e)[:300]
 
 @app.post("/orc/mau_uso_analisar")
-async def orc_mau_uso_analisar(request: Request):
+async def orc_mau_uso_analisar(request: Request, reset: int=0):
     from fastapi import HTTPException
     import threading
     u,p=exige(request,"MAU_USO")
@@ -4148,7 +4168,7 @@ async def orc_mau_uso_analisar(request: Request):
     if len(_MU_JOBS)>10:
         for k in list(_MU_JOBS)[:-5]: _MU_JOBS.pop(k,None)
     _MU_JOBS[job]={"estado":"rodando","total":0,"feitas":0,"novos":0}
-    threading.Thread(target=_mau_uso_job,args=(job,u["id"],p["papel"]),daemon=True).start()
+    threading.Thread(target=_mau_uso_job,args=(job,u["id"],p["papel"],bool(reset)),daemon=True).start()
     return {"job":job}
 
 @app.get("/orc/mau_uso_status")
