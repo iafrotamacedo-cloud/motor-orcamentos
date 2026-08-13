@@ -135,7 +135,8 @@ def listar_entradas(access, pasta):
             if e.code == 409: return out   # pasta não existe
             raise RuntimeError(_erro(e)) from None
         for ent in r.get("entries", []):
-            out.append({"name": ent["name"], "dir": ent.get(".tag") == "folder"})
+            out.append({"name": ent["name"], "dir": ent.get(".tag") == "folder",
+                        "size": ent.get("size"), "modificado": ent.get("client_modified")})
         if not r.get("has_more"): break
         url = "https://api.dropboxapi.com/2/files/list_folder/continue"; arg = {"cursor": r["cursor"]}
     return out
