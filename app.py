@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 98
+#  CONTADOR DE REVISÕES DESTE app.py: 99
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 98}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 99}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -3821,15 +3821,23 @@ async def orc_txt_parse(request: Request):
         valor=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for x in itens),2)
         info={"i":i,"ticket":tk or None,"nota_numero":nt.get("nota_numero"),"data_nota":nt.get("data_nota"),
               "itens":itens,"valor":valor,"reconhecido":False,"loja_nome":None,"duplicada":False,"motivo":None}
-        if not tk: info["motivo"]="sem ticket"
+        if not tk: info["motivo"]="sem ticket — irá para correção"
         else:
             lj=_loja_do_ticket(tk); loja=(lj or {}).get("loja") or {}
-            if not lj: info["motivo"]="ticket não encontrado nos chamados"
+            if not lj: info["motivo"]="ticket não associado — irá para correção"
             else:
                 info["reconhecido"]=True; info["loja_nome"]=loja.get("nome"); info["aba"]=lj.get("aba")
                 if _nota_ja_gerada(tk, nota_num): info["duplicada"]=True; info["motivo"]="orçamento já existe para este ticket/nota"
         out.append(info)
     return {"notas":out}
+
+def _nota_ja_registrada(ticket, nota_num):
+    """True se já existe QUALQUER registro (pendente ou gerado) para essa nota — evita duplicar."""
+    if not nota_num or str(nota_num)=="SN": return False
+    parts=[f"nota_numero=eq.{nota_num}","select=ticket","limit=1"]
+    parts.insert(0, f"ticket=eq.{ticket}" if ticket else "ticket=is.null")
+    try: return bool(_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{'&'.join(parts)}",SB_KEY))
+    except Exception: return False
 
 _TXT_JOBS={}; _TXT_SEQ=[0]
 def _txt_job_run(job, notas, uid, papel):
@@ -3842,9 +3850,22 @@ def _txt_job_run(job, notas, uid, papel):
             tk=_num_limpo(nt.get("ticket")); nota_num=_num_limpo(nt.get("nota_numero")) or "SN"
             itens=nt.get("itens") or []
             r={"ticket":tk,"nota":nota_num,"itens":len(itens)}
-            if not tk: r.update(status="erro",motivo="sem ticket"); res.append(r); st["feitas"]=_i+1; continue
+            valor_pend=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for x in itens),2)
+            # SEM TICKET -> vai para o BD como pendente (aparece em "Corrigir notas"); nada de nota física
+            if not tk:
+                if _nota_ja_registrada(None, nota_num):
+                    r.update(status="duplicada",motivo="nota já registrada"); res.append(r); st["feitas"]=_i+1; continue
+                _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket",
+                               "valor_nota":valor_pend,"itens":itens,"data_nota":_data_iso(nt.get("data_nota")),"criado_por":uid})
+                r.update(status="sem_ticket",motivo="enviada para correção"); res.append(r); st["feitas"]=_i+1; continue
             lj=_loja_do_ticket(tk); loja=(lj or {}).get("loja") or {}
-            if not lj: r.update(status="erro",motivo="ticket não encontrado"); res.append(r); st["feitas"]=_i+1; continue
+            # TICKET NÃO ASSOCIADO -> BD como pendente
+            if not lj:
+                if _nota_ja_registrada(tk, nota_num):
+                    r.update(status="duplicada",motivo="nota já registrada"); res.append(r); st["feitas"]=_i+1; continue
+                _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":tk,"status":"ticket_nao_associado",
+                               "valor_nota":valor_pend,"itens":itens,"data_nota":_data_iso(nt.get("data_nota")),"criado_por":uid})
+                r.update(status="ticket_nao_associado",motivo="enviada para correção"); res.append(r); st["feitas"]=_i+1; continue
             if _nota_ja_gerada(tk, nota_num):   # NUNCA processa a mesma nota 2x
                 r.update(status="duplicada",motivo="orçamento já existe"); res.append(r); st["feitas"]=_i+1; continue
             loja_nome=loja.get("nome") or "—"
