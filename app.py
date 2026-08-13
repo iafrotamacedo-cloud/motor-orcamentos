@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 100
+#  CONTADOR DE REVISÕES DESTE app.py: 101
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -864,7 +864,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 100}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 101}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -4058,6 +4058,141 @@ def orc_dashboard(request: Request):
         "por_tipo":_rank(por_tipo),"por_loja":_rank(por_loja),"por_responsavel":_rank(por_resp),
         "custo_mes":meta_serie,"habilidade":hab_out,
     }
+
+# ==================================================================
+#  ANÁLISE DE MAU USO (más condutas prováveis por trás do chamado)
+# ==================================================================
+MAU_USO_CATS = [
+ ("ELETRICA_SOBRECARGA","Sobrecarga elétrica / gambiarra"),
+ ("FALTA_LIMPEZA","Falta de limpeza / entupimento"),
+ ("FORCA_EXCESSIVA","Força excessiva / manuseio incorreto"),
+ ("IMPACTO","Impacto mecânico (carrinho/empilhadeira)"),
+ ("INFILTRACAO_DESCUIDO","Infiltração/vazamento por descuido"),
+ ("DESCARTE_INCORRETO","Descarte incorreto em ralo/vaso"),
+ ("OPERACAO_INCORRETA","Operação incorreta de equipamento"),
+ ("UMIDADE_EXPOSICAO","Exposição indevida à água/umidade"),
+ ("PREVENTIVA_NEGLIGENCIADA","Manutenção preventiva negligenciada"),
+ ("VANDALISMO","Vandalismo / dano intencional"),
+ ("DESGASTE_NATURAL","Desgaste natural (sem mau uso)"),
+ ("INDETERMINADO","Indeterminado / descrição insuficiente"),
+]
+MAU_USO_MAP=dict(MAU_USO_CATS)
+MAU_USO_SEM={"DESGASTE_NATURAL","INDETERMINADO"}
+
+def _groq_mau_uso(descricoes):
+    """Classifica um LOTE de descrições. Devolve {idx: (categoria, explicacao)}."""
+    cats=" | ".join(f"{c}={n}" for c,n in MAU_USO_CATS)
+    corpo="\n".join(f"{i}: {d}" for i,d in enumerate(descricoes))
+    prompt=("Você é engenheiro de manutenção predial de uma rede de supermercados. Para CADA chamado abaixo "
+      "(descrição do problema), identifique a PROVÁVEL má conduta/mau uso do usuário que levou ao problema e "
+      "escolha UMA categoria da lista (use o CÓDIGO). Se for claramente desgaste natural/fim de vida, use "
+      "DESGASTE_NATURAL. Se a descrição não permitir inferir, use INDETERMINADO. Não invente mau uso quando "
+      "não houver indício.\nCATEGORIAS: "+cats+"\n\n"
+      "Para cada item responda: i, categoria (código), explicacao (frase curta em pt-BR, até 120 caracteres, "
+      "dizendo a provável má conduta). Responda só JSON: "
+      '{"itens":[{"i":0,"categoria":"ELETRICA_SOBRECARGA","explicacao":"..."}]}\n\nCHAMADOS:\n'+corpo)
+    c=_groq_chat([{"role":"user","content":prompt}], GROQ_TEXT_FALLBACK)
+    d=_parse_json(c); out={}
+    for a in (d.get("itens") or []):
+        try:
+            i=int(a.get("i")); cat=str(a.get("categoria") or "").strip().upper()
+            if cat not in MAU_USO_MAP: cat="INDETERMINADO"
+            out[i]=(cat, str(a.get("explicacao") or "")[:160])
+        except Exception: pass
+    return out
+
+_MU_JOBS={}; _MU_SEQ=[0]
+def _mau_uso_job(job, uid, papel):
+    st=_MU_JOBS[job]
+    try:
+        # chamados desde o início, com descrição
+        ap=["select=numero,aba,loja,tipo_predial,descricao,data_criacao",f"data_criacao=gte.{DASH_INICIO}","limit=50000"]
+        ch=_sb_json(f"{SB_URL}/rest/v1/chamados?"+"&".join(ap),SB_KEY) or []
+        ja=_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?select=numero,aba&limit=50000",SB_KEY) or []
+        feitos={(str(x.get("numero")),str(x.get("aba") or "")) for x in ja}
+        pend=[c for c in ch if (str(c.get("numero")),str(c.get("aba") or "")) not in feitos and (c.get("descricao") or "").strip()]
+        st["total"]=len(pend); st["feitas"]=0
+        if not pend: st["estado"]="pronto"; return
+        LOTE=15
+        for k in range(0,len(pend),LOTE):
+            grupo=pend[k:k+LOTE]
+            descs=[f"{(c.get('tipo_predial') or '')}: {c.get('descricao')}" for c in grupo]
+            try: res=_groq_mau_uso(descs)
+            except Exception as e:
+                st["erro"]=f"Groq: {str(e)[:150]}"; res={}
+            linhas=[]
+            for i,c in enumerate(grupo):
+                cat,exp = res.get(i,("INDETERMINADO",""))
+                linhas.append({"numero":str(c.get("numero")),"aba":str(c.get("aba") or ""),
+                    "categoria":cat,"tem_mau_uso":(cat not in MAU_USO_SEM),"explicacao":exp,
+                    "loja":c.get("loja"),"tipo_predial":c.get("tipo_predial"),"data_criacao":c.get("data_criacao")})
+            try:
+                body=json.dumps(linhas,ensure_ascii=False).encode()
+                rq=urllib.request.Request(f"{SB_URL}/rest/v1/chamado_mau_uso?on_conflict=numero,aba",data=body,method="POST",
+                    headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","content-type":"application/json","prefer":"resolution=merge-duplicates,return=minimal"})
+                urllib.request.urlopen(rq,timeout=40)
+            except Exception as e: st["erro"]=f"gravar: {str(e)[:150]}"
+            st["feitas"]=min(len(pend),k+LOTE); st["novos"]=st.get("novos",0)+len(linhas)
+        log_frotahub(uid,papel,"MAU_USO","ANALISOU",f"{st['feitas']} chamados")
+        st["estado"]="pronto"
+    except Exception as e:
+        st["estado"]="erro"; st["erro"]=str(e)[:300]
+
+@app.post("/orc/mau_uso_analisar")
+async def orc_mau_uso_analisar(request: Request):
+    from fastapi import HTTPException
+    import threading
+    u,p=exige(request,"MAU_USO")
+    if not GROQ_KEY: raise HTTPException(400,"configure a GROQ_API_KEY no Render para a análise")
+    _MU_SEQ[0]+=1; job=str(_MU_SEQ[0])
+    if len(_MU_JOBS)>10:
+        for k in list(_MU_JOBS)[:-5]: _MU_JOBS.pop(k,None)
+    _MU_JOBS[job]={"estado":"rodando","total":0,"feitas":0,"novos":0}
+    threading.Thread(target=_mau_uso_job,args=(job,u["id"],p["papel"]),daemon=True).start()
+    return {"job":job}
+
+@app.get("/orc/mau_uso_status")
+def orc_mau_uso_status(request: Request, job: str=""):
+    from fastapi import HTTPException
+    exige(request,"MAU_USO")
+    j=_MU_JOBS.get(job)
+    if not j: raise HTTPException(404,"job não encontrado")
+    return {"estado":j["estado"],"total":j["total"],"feitas":j["feitas"],"novos":j.get("novos",0),"erro":j.get("erro")}
+
+@app.get("/orc/mau_uso_chamado")
+def orc_mau_uso_chamado(request: Request, numero: str=""):
+    exige(request,"MAU_USO")
+    numero=re.sub(r"\D","",numero or "")
+    if not numero: return {"ok":False,"erro":"informe o número do chamado"}
+    r=_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?numero=eq.{numero}&select=numero,aba,categoria,tem_mau_uso,explicacao,loja,tipo_predial&limit=4",SB_KEY) or []
+    ch=_sb_json(f"{SB_URL}/rest/v1/chamados?numero=eq.{numero}&select=loja,descricao,tipo_predial&limit=1",SB_KEY) or []
+    descricao=(ch[0].get("descricao") if ch else None)
+    itens=[{**x,"categoria_nome":MAU_USO_MAP.get(x.get("categoria"),x.get("categoria")),"loja_padrao":_loja_padrao(x.get("loja"))} for x in r]
+    return {"ok":bool(itens),"numero":numero,"descricao":descricao,"itens":itens,
+            "erro":(None if itens else "chamado ainda não analisado (rode a análise)")}
+
+@app.get("/orc/mau_uso_stats")
+def orc_mau_uso_stats(request: Request):
+    exige(request,"MAU_USO")
+    rows=_sb_json(f"{SB_URL}/rest/v1/chamado_mau_uso?select=categoria,tem_mau_uso,loja&limit=50000",SB_KEY) or []
+    total=len(rows); com=sum(1 for r in rows if r.get("tem_mau_uso"))
+    por_cat={}; por_loja={}; rank_cat={}
+    for r in rows:
+        cat=r.get("categoria") or "INDETERMINADO"
+        if cat in MAU_USO_SEM: continue          # só conta mau uso real
+        lj=_loja_padrao(r.get("loja"))
+        por_cat[cat]=por_cat.get(cat,0)+1
+        por_loja[lj]=por_loja.get(lj,0)+1
+        rank_cat.setdefault(cat,{}); rank_cat[cat][lj]=rank_cat[cat].get(lj,0)+1
+    cats=sorted(({"categoria":k,"nome":MAU_USO_MAP.get(k,k),"total":v} for k,v in por_cat.items()),key=lambda x:-x["total"])
+    lojas=sorted(({"loja":k,"total":v} for k,v in por_loja.items()),key=lambda x:-x["total"])
+    ranking=[]
+    for c in cats:
+        tops=sorted(({"loja":k,"total":v} for k,v in rank_cat.get(c["categoria"],{}).items()),key=lambda x:-x["total"])[:5]
+        ranking.append({"categoria":c["categoria"],"nome":c["nome"],"lojas":tops})
+    return {"total":total,"com_mau_uso":com,"sem_mau_uso":total-com,
+            "pct":(round(com*100.0/total,1) if total else 0),
+            "por_categoria":cats,"por_loja":lojas,"ranking":ranking}
 
 # ================= USUÁRIOS / LOGINS / CATEGORIAS / PIN =================
 import hashlib
