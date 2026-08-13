@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 108
+#  CONTADOR DE REVISÕES DESTE app.py: 109
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 108}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 109}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -1287,6 +1287,44 @@ async def notas_conferir(request: Request):
         except Exception: pass
     return {"ok": True, "oc_numero": oc_num, "resumo": resumo}
 
+# ================= NOTAS FISCAIS — ENTREGUES (visualizar) =================
+@app.get("/notas/entregues")
+def notas_entregues(request: Request):
+    """Todas as notas já entregues pela obra (via física recebida no adm)."""
+    u,p=exige(request,"PROCURAR_NOTA")
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas?entregue=eq.true&order=entregue_em.desc"
+                  "&select=id,oc_id,numero_nota,emissao,valor,forma_pagamento,vencimento,entregue_em,tem_boleto,recebimento,divergencia&limit=5000",SB_KEY) or []
+    ocids=list({str(r.get("oc_id")) for r in rows if r.get("oc_id")})
+    ocmap={}
+    if ocids:
+        inlist=",".join(urllib.parse.quote(x) for x in ocids[:1500])
+        for o in (_sb_json(f"{SB_URL}/rest/v1/ocs?id=in.({inlist})&select=id,numero,fornecedor,centro_custo",SB_KEY) or []):
+            ocmap[str(o.get("id"))]=o
+    itens=[]
+    for r in rows:
+        o=ocmap.get(str(r.get("oc_id")),{})
+        itens.append({"id":r.get("id"),"oc":o.get("numero"),"fornecedor":o.get("fornecedor"),
+            "centro_custo":o.get("centro_custo"),"numero_nota":r.get("numero_nota"),"emissao":r.get("emissao"),
+            "valor":_numf(r.get("valor")),"forma_pagamento":r.get("forma_pagamento"),"vencimento":r.get("vencimento"),
+            "entregue_em":(r.get("entregue_em") or "")[:10],"tem_boleto":bool(r.get("tem_boleto")),
+            "recebimento":r.get("recebimento"),"divergencia":r.get("divergencia")})
+    return {"itens":itens,"total":len(itens),"pode_excluir":(p.get("nivel") in ("builder","gerente"))}
+
+@app.post("/notas/excluir")
+async def notas_excluir(request: Request):
+    """Exclui uma nota entregue — só gerente/builder."""
+    from fastapi import HTTPException
+    u,p=exige(request,"PROCURAR_NOTA")
+    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas gerente e builder")
+    b=await request.json(); nid=str(b.get("id") or "").strip()
+    if not nid: raise HTTPException(400,"id?")
+    rq=urllib.request.Request(f"{SB_URL}/rest/v1/notas?id=eq.{urllib.parse.quote(nid)}",method="DELETE",
+        headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","prefer":"return=minimal"})
+    try: urllib.request.urlopen(rq,timeout=20)
+    except urllib.error.HTTPError as e: raise HTTPException(500,"excluir nota: "+e.read().decode()[:150])
+    log_frotahub(u["id"],p.get("papel"),"PROCURAR_NOTA","EXCLUIU_NOTA",nid)
+    return {"ok":True}
+
 # ================= NOTAS FISCAIS — RECEBER_NOTA (adm) =================
 @app.get("/notas/receber_lista")
 def notas_receber_lista(request: Request, q: str = ""):
@@ -1658,6 +1696,40 @@ def _pco_coleta(access):
         (aprov if d.get("valido") else bloq).append(d)
     return aprov, bloq
 
+# ---- config chave/valor (lembra escolhas do usuário) ----
+def _cfg_get(chave, default=None):
+    try:
+        r=_sb_json(f"{SB_URL}/rest/v1/app_config?chave=eq.{urllib.parse.quote(chave)}&select=valor&limit=1",SB_KEY) or []
+        return r[0]["valor"] if r else default
+    except Exception: return default
+def _cfg_set(chave, valor):
+    body=json.dumps([{"chave":chave,"valor":valor,"atualizado_em":_agora().isoformat()}],ensure_ascii=False).encode()
+    rq=urllib.request.Request(f"{SB_URL}/rest/v1/app_config?on_conflict=chave",data=body,method="POST",
+        headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","content-type":"application/json","prefer":"resolution=merge-duplicates,return=minimal"})
+    urllib.request.urlopen(rq,timeout=20)
+def _emails_norm(lst):
+    out=[]
+    for e in (lst or []):
+        e=str(e).strip()
+        if e and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", e) and e not in out: out.append(e)
+    return out
+def _pco_dest():
+    """Destinatários salvos (última escolha) ou o padrão do ambiente."""
+    d=_cfg_get("pco_destinatarios")
+    if not d: return {"to":PCO_TO,"cc":PCO_CC}
+    return {"to":(_emails_norm(d.get("to")) or PCO_TO),"cc":_emails_norm(d.get("cc"))}
+
+@app.post("/pco/destinatarios_set")
+async def pco_dest_set(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"ENVIAR_PCO")
+    b=await request.json()
+    to=_emails_norm(b.get("to")); cc=_emails_norm(b.get("cc"))
+    if not to: raise HTTPException(400,"informe ao menos um e-mail em 'Para'")
+    _cfg_set("pco_destinatarios",{"to":to,"cc":cc})
+    log_frotahub(u["id"],p.get("papel"),"ENVIAR_PCO","DESTINATARIOS",f"{len(to)} para / {len(cc)} cc")
+    return {"ok":True,"to":to,"cc":cc}
+
 @app.post("/pco/enviar_previa")
 def pco_enviar_previa(request: Request):
     from fastapi import HTTPException
@@ -1671,8 +1743,9 @@ def pco_enviar_previa(request: Request):
         cc = re.sub(r"\D", "", r.get("cnpj_centro_custo") or "")
         if not cc.startswith(FART_BASE): r["cnpj_cc_sugerido"] = _sugerir_cnpj_cc(r.get("centro_custo"))
         return r
+    dest=_pco_dest()
     return {"aprovadas": [limpo(d) for d in aprov], "bloqueadas": [limpo_bl(d) for d in bloq],
-            "destinatarios": {"to": PCO_TO, "cc": PCO_CC, "bloqueadas": PCO_BLOQ_TO},
+            "destinatarios": {"to": dest["to"], "cc": dest["cc"], "bloqueadas": PCO_BLOQ_TO},
             "smtp_ok": bool(BREVO_API_KEY or (SMTP_USER and SMTP_PASS))}
 
 @app.post("/pco/enviar")
@@ -1684,6 +1757,7 @@ def pco_enviar(request: Request):
         raise HTTPException(500, "Envio não configurado — defina BREVO_API_KEY (recomendado) no Render.")
     access = dropbox_rateio.obter_token()
     hoje = _hoje().strftime("%d/%m/%Y")
+    dest = _pco_dest()   # última escolha salva (ou padrão do ambiente)
     aprov, bloq = _pco_coleta(access)
     if not aprov and not bloq:
         return {"ok": True, "enviados": 0, "bloqueados": 0, "msg": "Nada novo para enviar."}
@@ -1697,7 +1771,7 @@ def pco_enviar(request: Request):
         zipnome = f"Pedidos_PCO_{_agora().strftime('%d-%m-%Y_%H%M%S')}.zip"
         try:
             enviar_email(f"Ordens de Compra (PCO) - {hoje} - Frota Macedo Engenharia",
-                         _pco_email_html(aprov, hoje), PCO_TO, PCO_CC,
+                         _pco_email_html(aprov, hoje), dest["to"], dest["cc"],
                          [(zipnome, zipbytes, "application/zip")])
         except Exception as e:
             raise HTTPException(500, f"falha ao enviar e-mail: {e}")
@@ -1733,9 +1807,9 @@ def pco_enviar(request: Request):
         try: enviar_email(f"O.C. bloqueadas no PCO - {hoje}", _bloq_email_html(bloq, hoje), PCO_BLOQ_TO)
         except Exception as e: erros.append(f"e-mail bloqueadas: {e}")
     log_frotahub(u["id"], p["papel"], "ENVIAR_PCO", "ENVIOU_PCO",
-                 f"{len(aprov)} enviadas / {len(bloq)} bloqueadas", {"to": PCO_TO})
+                 f"{len(aprov)} enviadas / {len(bloq)} bloqueadas", {"to": dest["to"]})
     return {"ok": True, "enviados": len(aprov), "bloqueados": len(bloq),
-            "to": PCO_TO, "cc": PCO_CC, "erros": erros}
+            "to": dest["to"], "cc": dest["cc"], "erros": erros}
 
 # ---------------- PCOS_ENVIADOS (planilha do banco) ----------------
 def _pco_enviados_query(desde, ate):
