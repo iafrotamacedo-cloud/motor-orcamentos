@@ -36,28 +36,27 @@ SLOT_IDS = {s["slot"] for s in SLOTS}
 
 # só catalogamos DOCUMENTOS de verdade (não scripts/config/apoio)
 _EXT_OK = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".jpeg", ".png")
-# pasta numerada -> slot (0=notas p/ orçar, 1=não lançados, 2=lançados, 4/5=rateio, 8=incluídas, 9=extrapolados, 11=montados)
-_NUM_SLOT = {0: "notas_orc", 1: "orc_nao_lancados", 2: "orc_lancados", 4: "rateio",
-             5: "rateio_lancado", 8: "notas_incluidas", 9: "extrapolados", 11: "orc_montados"}
 
 def _eh_lixo(rel):
-    """True para arquivos que NÃO devem ser catalogados (scripts, config, docs de apoio)."""
+    """True para arquivos que NÃO devem ser catalogados (scripts, apoio, DEV)."""
     r = (rel or "").lower()
     if not r.endswith(_EXT_OK):
         return True
+    if "somente dev" in r:                # 100 - PROGRAMACAO (SOMENTE DEV)
+        return True
     for seg in rel.split("/"):
-        if seg.startswith("_"):   # _RODAR LOCAL, _COMO RODAR (Claude), etc.
+        if seg.startswith("_"):           # _RODAR LOCAL, _COMO RODAR (Claude), etc.
             return True
     return False
 
 def _classificar_slot(rel):
-    """Classifica pelo NOME/NÚMERO da pasta (não por palavra solta no caminho)."""
-    r = (rel or "").lower()
-    if "pco" in r or "ordem de compra" in r or "ordens de compra" in r:
-        return "pco_oc"
-    m = re.search(r'(?:^|/)\s*(\d+)\s*-\s', rel)   # primeiro "N - " (a pasta numerada)
-    if m:
-        return _NUM_SLOT.get(int(m.group(1)), "diversos")
+    """Slot = DEPARTAMENTO (1º nível dentro de /FROTAHUB). O tipo (pasta numerada)
+    fica preservado no 'nome' (caminho completo), então dá para detalhar depois."""
+    top = (rel.split("/", 1)[0] if rel else "").lower()
+    if "administrativo" in top: return "adm"
+    if "manuten"        in top: return "manut"     # manutencao / manutenção
+    if "engenharia"     in top: return "eng"
+    if "sesmt"          in top: return "sesmt"
     return "diversos"
 
 def montar(app, D):
