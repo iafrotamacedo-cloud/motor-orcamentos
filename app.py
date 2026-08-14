@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 112
+#  CONTADOR DE REVISÕES DESTE app.py: 113
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 112}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 113}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -3027,7 +3027,16 @@ def orc_conferir_status(request: Request):
     from fastapi import HTTPException
     u,p=exige(request,"GERAR_ORCAMENTOS")
     if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
-    out={"itens":_CONFERIR.get("itens",{}),"atualizado":_CONFERIR.get("atualizado"),"gh":None}
+    itens=_CONFERIR.get("itens",{})
+    vals=list(itens.values())
+    resumo={
+        "total": len(vals),
+        "duplicatas": sum(1 for x in vals if x.get("duplicata")),
+        "reconciliados": sum(1 for x in vals if x.get("reconciliado")),
+        "a_lancar": sum(1 for x in vals if x.get("aberto") and not x.get("duplicata")),
+        "fora_conta": sum(1 for x in vals if x.get("outra_conta")),
+    }
+    out={"itens":itens,"atualizado":_CONFERIR.get("atualizado"),"resumo":resumo,"gh":None}
     if GH_TOKEN and GH_REPO:
         url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WF_LANCAR)}/runs?per_page=1"
         req=urllib.request.Request(url,headers={"Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
