@@ -34,6 +34,16 @@ SLOTS = [
 ]
 SLOT_IDS = {s["slot"] for s in SLOTS}
 
+def _classificar_slot(rel):
+    """Classifica um arquivo do Dropbox num slot pela pasta onde ele está."""
+    r = (rel or "").lower()
+    if "notas para orcamento" in r or "notas para orçamento" in r or "/0 - " in r: return "notas_orc"
+    if "rateio" in r: return "rateio"
+    if "pco" in r or "ordem de compra" in r or "ordens de compra" in r: return "pco_oc"
+    if "orcamento" in r or "orçamento" in r or "lançad" in r or "lancad" in r: return "orc_nao_lancados"
+    if "nota" in r: return "notas_orc"
+    return "diversos"
+
 def montar(app, D):
     from fastapi import Request, HTTPException
     from fastapi.responses import Response, RedirectResponse
@@ -360,18 +370,19 @@ def montar(app, D):
     @app.get("/backup/arq")
     def backup_arq(request: Request, slot: str = "", nome: str = ""):
         exige(request, "GERAR_ORCAMENTOS")
-        if slot not in SLOT_IDS or "/" in nome or ".." in nome:
+        if slot not in SLOT_IDS or ".." in nome or nome.startswith("/"):
             raise HTTPException(400, "parâmetros inválidos")
-        reg = _reg_get(f"slot=eq.{urllib.parse.quote(slot)}&nome=eq.{urllib.parse.quote(nome)}&select=storage,tamanho&limit=1")
+        reg = _reg_get(f"slot=eq.{urllib.parse.quote(slot)}&nome=eq.{urllib.parse.quote(nome)}&select=storage,tamanho,dropbox_path&limit=1")
         if not reg:
             raise HTTPException(404, "arquivo não registrado")
         if reg[0]["storage"] == "supabase":
             _egress_add(reg[0].get("tamanho") or 0)   # conta interação (aprox.)
             url = sst.signed_url(SBU, SBK, BUCKET, f"{slot}/{nome}", 3600)
             return RedirectResponse(url)
-        # frio: entrega do Dropbox
+        # frio: entrega do Dropbox — do caminho REAL (catalogado) ou do cofre _ARQUIVOS
+        caminho_dbx = reg[0].get("dropbox_path") or _cold_path(slot, nome)
         try:
-            dados = dbx.baixar(_dbx_token(), _cold_path(slot, nome))
+            dados = dbx.baixar(_dbx_token(), caminho_dbx)
         except Exception:
             dados = None
         if dados is None:
@@ -379,3 +390,60 @@ def montar(app, D):
         ct = sst._ctype(nome)
         return Response(content=dados, media_type=ct,
                         headers={"Content-Disposition": f'inline; filename="{urllib.parse.quote(nome)}"'})
+
+    # =====================================================================
+    #  BACKFILL — CATALOGAR o Dropbox atual (marca tudo como FRIO, não copia nada)
+    # =====================================================================
+    def _dbx_listar_pagina(access, base, cursor):
+        if cursor:
+            return _dbx_api("files/list_folder/continue", {"cursor": cursor}, access)
+        return _dbx_api("files/list_folder",
+                        {"path": base, "recursive": True, "limit": 2000,
+                         "include_deleted": False, "include_media_info": False}, access)
+
+    @app.post("/backup/backfill")
+    async def backup_backfill(request: Request):
+        """Cataloga os arquivos do Dropbox no arq_registro (storage='dropbox').
+        NÃO copia nada, NÃO ocupa Supabase. Processa uma página por chamada e devolve
+        um 'cursor' para continuar. Aceita robot key (cron/Action) OU builder."""
+        b = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        rk = request.headers.get("x-robot-key", "")
+        if not (rk and rk == os.environ.get("ROBOT_KEY", "___")):
+            _builder(request)
+        access = _dbx_token()
+        base = (b.get("base") or DROPBOX_BASE).rstrip("/")
+        cursor = b.get("cursor") or None
+        try:
+            pg = _dbx_listar_pagina(access, base, cursor)
+        except Exception as e:
+            raise HTTPException(500, f"Dropbox list_folder falhou: {str(e)[:160]}")
+        entries = pg.get("entries", [])
+        rows = []
+        for e in entries:
+            if e.get(".tag") != "file":
+                continue
+            path = e.get("path_display") or e.get("path_lower") or ""
+            rel = path
+            if path.lower().startswith(base.lower()):
+                rel = path[len(base):]
+            rel = rel.lstrip("/")
+            if not rel:
+                continue
+            slot = _classificar_slot(rel)
+            dia = (e.get("server_modified") or e.get("client_modified") or "")[:10] or hoje().isoformat()
+            rows.append({"slot": slot, "nome": rel, "caminho": f"{slot}/{rel}",
+                         "dia": dia, "tamanho": e.get("size", 0),
+                         "storage": "dropbox", "dropbox_path": path})
+        # grava em lotes (idempotente por slot,nome)
+        grav = 0
+        for i in range(0, len(rows), 500):
+            lote = rows[i:i + 500]
+            try:
+                _db("POST", "arq_registro?on_conflict=dropbox_path", data=lote,
+                    prefer="resolution=merge-duplicates,return=minimal")
+                grav += len(lote)
+            except Exception as ex:
+                raise HTTPException(500, f"gravação falhou no lote {i}: {str(ex)[:160]}")
+        prox = pg.get("cursor") if pg.get("has_more") else None
+        return {"ok": True, "arquivos_na_pagina": len(entries), "catalogados": grav,
+                "cursor": prox, "fim": prox is None}
