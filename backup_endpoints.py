@@ -17,7 +17,7 @@ REGRAS DE OURO:
   • Backup de SEGURANÇA nunca apaga nada (só espelha) e não muda acesso.
   • Nada é apagado do Dropbox em nenhuma rotina.
 """
-import os, json, hashlib, datetime, urllib.request, urllib.parse, urllib.error
+import os, re, json, hashlib, datetime, urllib.request, urllib.parse, urllib.error
 
 SUPA_LIMITE   = 1024 * 1024 * 1024        # 1 GB  (Storage free)
 EGRESS_LIMITE = 5 * 1024 * 1024 * 1024    # 5 GB/mês (interação free)
@@ -34,14 +34,30 @@ SLOTS = [
 ]
 SLOT_IDS = {s["slot"] for s in SLOTS}
 
-def _classificar_slot(rel):
-    """Classifica um arquivo do Dropbox num slot pela pasta onde ele está."""
+# só catalogamos DOCUMENTOS de verdade (não scripts/config/apoio)
+_EXT_OK = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".jpg", ".jpeg", ".png")
+# pasta numerada -> slot (0=notas p/ orçar, 1=não lançados, 2=lançados, 4/5=rateio, 8=incluídas, 9=extrapolados, 11=montados)
+_NUM_SLOT = {0: "notas_orc", 1: "orc_nao_lancados", 2: "orc_lancados", 4: "rateio",
+             5: "rateio_lancado", 8: "notas_incluidas", 9: "extrapolados", 11: "orc_montados"}
+
+def _eh_lixo(rel):
+    """True para arquivos que NÃO devem ser catalogados (scripts, config, docs de apoio)."""
     r = (rel or "").lower()
-    if "notas para orcamento" in r or "notas para orçamento" in r or "/0 - " in r: return "notas_orc"
-    if "rateio" in r: return "rateio"
-    if "pco" in r or "ordem de compra" in r or "ordens de compra" in r: return "pco_oc"
-    if "orcamento" in r or "orçamento" in r or "lançad" in r or "lancad" in r: return "orc_nao_lancados"
-    if "nota" in r: return "notas_orc"
+    if not r.endswith(_EXT_OK):
+        return True
+    for seg in rel.split("/"):
+        if seg.startswith("_"):   # _RODAR LOCAL, _COMO RODAR (Claude), etc.
+            return True
+    return False
+
+def _classificar_slot(rel):
+    """Classifica pelo NOME/NÚMERO da pasta (não por palavra solta no caminho)."""
+    r = (rel or "").lower()
+    if "pco" in r or "ordem de compra" in r or "ordens de compra" in r:
+        return "pco_oc"
+    m = re.search(r'(?:^|/)\s*(\d+)\s*-\s', rel)   # primeiro "N - " (a pasta numerada)
+    if m:
+        return _NUM_SLOT.get(int(m.group(1)), "diversos")
     return "diversos"
 
 def montar(app, D):
@@ -370,7 +386,7 @@ def montar(app, D):
     @app.get("/backup/arq")
     def backup_arq(request: Request, slot: str = "", nome: str = ""):
         exige(request, "GERAR_ORCAMENTOS")
-        if slot not in SLOT_IDS or ".." in nome or nome.startswith("/"):
+        if not slot or ".." in nome or nome.startswith("/"):
             raise HTTPException(400, "parâmetros inválidos")
         reg = _reg_get(f"slot=eq.{urllib.parse.quote(slot)}&nome=eq.{urllib.parse.quote(nome)}&select=storage,tamanho,dropbox_path&limit=1")
         if not reg:
@@ -390,6 +406,30 @@ def montar(app, D):
         ct = sst._ctype(nome)
         return Response(content=dados, media_type=ct,
                         headers={"Content-Disposition": f'inline; filename="{urllib.parse.quote(nome)}"'})
+
+    # =====================================================================
+    #  EXPLORAR — só LISTA as pastas de um caminho (não cataloga, não escreve)
+    # =====================================================================
+    @app.post("/backup/arvore")
+    async def backup_arvore(request: Request):
+        b = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        rk = request.headers.get("x-robot-key", "")
+        if not (rk and rk == os.environ.get("ROBOT_KEY", "___")):
+            _builder(request)
+        access = _dbx_token()
+        path = (b.get("path") or "").strip()
+        if path in ("/",):
+            path = ""                      # raiz da conta no Dropbox é ""
+        try:
+            res = _dbx_api("files/list_folder", {"path": path, "recursive": False, "limit": 2000}, access)
+        except Exception as e:
+            raise HTTPException(500, f"Dropbox list_folder falhou em {path or '/'}: {str(e)[:160]}")
+        entries = res.get("entries", [])
+        pastas = sorted([e.get("name") for e in entries if e.get(".tag") == "folder"])
+        arquivos = [e.get("name") for e in entries if e.get(".tag") == "file"]
+        return {"path": path or "/", "pastas": pastas,
+                "arquivos_diretos": len(arquivos), "amostra_arquivos": arquivos[:10],
+                "has_more": res.get("has_more", False)}
 
     # =====================================================================
     #  BACKFILL — CATALOGAR o Dropbox atual (marca tudo como FRIO, não copia nada)
@@ -427,7 +467,7 @@ def montar(app, D):
             if path.lower().startswith(base.lower()):
                 rel = path[len(base):]
             rel = rel.lstrip("/")
-            if not rel:
+            if not rel or _eh_lixo(rel):
                 continue
             slot = _classificar_slot(rel)
             dia = (e.get("server_modified") or e.get("client_modified") or "")[:10] or hoje().isoformat()
@@ -445,5 +485,8 @@ def montar(app, D):
             except Exception as ex:
                 raise HTTPException(500, f"gravação falhou no lote {i}: {str(ex)[:160]}")
         prox = pg.get("cursor") if pg.get("has_more") else None
-        return {"ok": True, "arquivos_na_pagina": len(entries), "catalogados": grav,
-                "cursor": prox, "fim": prox is None}
+        arquivos = sum(1 for e in entries if e.get(".tag") == "file")
+        pastas = sum(1 for e in entries if e.get(".tag") == "folder")
+        return {"ok": True, "base": base, "entradas": len(entries),
+                "arquivos_na_pagina": arquivos, "pastas_na_pagina": pastas,
+                "catalogados": grav, "cursor": prox, "fim": prox is None}
