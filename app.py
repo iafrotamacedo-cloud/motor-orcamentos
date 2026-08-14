@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 113
+#  CONTADOR DE REVISÕES DESTE app.py: 114
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 113}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 114}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -5170,6 +5170,20 @@ async def config_pin_policy_set(request: Request):
     log_frotahub(u["id"],p.get("papel"),"CONFIG_PIN","AJUSTOU_POLITICA_PIN",f"{len(rows)} itens")
     return {"ok":True}
 
+# ---- Camada de arquivos hot/cold + Backup (Supabase Storage <-> Dropbox) ----
+try:
+    import supabase_storage as sst
+    import backup_endpoints
+    backup_endpoints.montar(app, dict(
+        exige=exige, verifica_pin=_verifica_pin, dropbox=dropbox_rateio,
+        sb_url=SB_URL, sb_key=SB_KEY, bucket=os.environ.get("SUPABASE_BUCKET", "frotahub"),
+        agora=_agora, hoje=_hoje, cfg_get=_cfg_get, cfg_set=_cfg_set, log=log_frotahub, sst=sst,
+    ))
+    print("backup_endpoints montado (rev 114)")
+except Exception as _e:
+    print("AVISO: backup_endpoints não montado:", _e)
+
+
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
     import base64, secrets
@@ -5180,6 +5194,7 @@ def _basic_auth(app, user, pw):
                                         or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
                                         or _path.startswith("/desfazer") or _path.startswith("/usuarios") or _path.startswith("/config")
                                         or _path.startswith("/rateio") or _path.startswith("/arq") or _path.startswith("/robot")
+                                        or _path.startswith("/backup")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
