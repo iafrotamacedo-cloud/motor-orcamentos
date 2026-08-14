@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 111
+#  CONTADOR DE REVISÕES DESTE app.py: 112
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 111}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 112}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2971,11 +2971,15 @@ async def robot_lancar_ok(request: Request):
     b=await request.json(); origem=str(b.get("origem")); nome=b.get("nome")
     if origem not in ("1","4") or not _seg_ok(nome): raise HTTPException(400,"parâmetros inválidos")
     _LANCAR_PROG["itens"][nome]={"status":"lançado","pct":100}   # marca pronto no progresso
+    return _mover_marcar_lancado(origem, nome)
+
+def _mover_marcar_lancado(origem, nome):
+    """Move o PDF (1->2 / 4->5) e marca 'lancado' no banco. Idempotente."""
+    from fastapi import HTTPException
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
     dst_n=2 if origem=="1" else 5
     src=_pasta_manut(access,int(origem),ob); dst=_pasta_manut(access,dst_n,ob)
     if not src or not dst: raise HTTPException(500,"pasta de origem/destino não encontrada")
-    # marca lançado no banco (dedup à prova de recarga do robô)
     try:
         body=json.dumps({"lancado":True,"lancado_em":_agora().isoformat()}).encode()
         rq=urllib.request.Request(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&or=(arquivo_pdf.eq.{urllib.parse.quote(origem+'/'+nome)},arquivo_doc.ilike.*{urllib.parse.quote(os.path.splitext(nome)[0])}*)",
@@ -2986,10 +2990,67 @@ async def robot_lancar_ok(request: Request):
     try:
         dropbox_rateio.mover(access,f"{src}/{nome}",f"{dst}/{nome}"); moved=True
     except Exception as e:
-        # se já foi movido antes, não é erro
         if dropbox_rateio.baixar(access,f"{src}/{nome}") is None: moved=True
         else: raise HTTPException(500,f"mover: {str(e)[:120]}")
     return {"ok":True,"movido":moved}
+
+# ---- CONFERÊNCIA de duplicidade (custos já lançados no Trílogo) ----
+_CONFERIR={"itens":{},"atualizado":None}
+
+@app.post("/robot/conferir_resultado")
+async def robot_conferir_resultado(request: Request):
+    """O robô reporta, por orçamento pendente, os custos que já existem no ticket."""
+    _robot_ok(request)
+    b=await request.json()
+    lista=b.get("itens") if isinstance(b.get("itens"),list) else [b]
+    for it in lista:
+        a=it.get("arquivo")
+        if a: _CONFERIR["itens"][a]=it
+    _CONFERIR["atualizado"]=_agora().isoformat()
+    return {"ok":True}
+
+@app.post("/orc/conferir_disparar")
+async def orc_conferir_disparar(request: Request):
+    """Dispara o robô em modo CONFERÊNCIA (só lê custos, não lança). Builder/gerente."""
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
+    _CONFERIR["itens"]={}; _CONFERIR["atualizado"]=_agora().isoformat()
+    try: _gh_dispatch_wf(GH_WF_LANCAR,{"modo":"conferir","alvo":""})
+    except urllib.error.HTTPError as e: raise HTTPException(500,f"GitHub {e.code}: {e.read().decode()[:200]}")
+    except Exception as e: raise HTTPException(500,f"disparo falhou: {e}")
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","CONFERIR_DUP","conferência de duplicidade")
+    return {"ok":True}
+
+@app.get("/orc/conferir_status")
+def orc_conferir_status(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
+    out={"itens":_CONFERIR.get("itens",{}),"atualizado":_CONFERIR.get("atualizado"),"gh":None}
+    if GH_TOKEN and GH_REPO:
+        url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WF_LANCAR)}/runs?per_page=1"
+        req=urllib.request.Request(url,headers={"Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
+            "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor"})
+        try:
+            r=json.loads(urllib.request.urlopen(req,timeout=20).read().decode()); run=(r.get("workflow_runs") or [None])[0]
+            if run: out["gh"]={"estado":run.get("status"),"conclusao":run.get("conclusion"),"url":run.get("html_url")}
+        except Exception: pass
+    return out
+
+@app.post("/orc/lancar_reconciliar")
+async def orc_lancar_reconciliar(request: Request):
+    """Marca um orçamento como JÁ lançado (custo já existe no Trílogo): move 1->2/4->5 e
+    marca lancado, SEM relançar. Builder/gerente."""
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
+    b=await request.json(); origem=str(b.get("origem")); nome=b.get("nome")
+    if origem not in ("1","4") or not _seg_ok(nome): raise HTTPException(400,"parâmetros inválidos")
+    res=_mover_marcar_lancado(origem, nome)
+    _CONFERIR["itens"].pop(nome,None)
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","RECONCILIOU",f"{origem}/{nome}")
+    return res
 
 @app.post("/orc/trilogo_run")
 async def orc_trilogo_run(request: Request):
