@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 110
+#  CONTADOR DE REVISÕES DESTE app.py: 111
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 110}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 111}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2878,30 +2878,54 @@ def orc_lancar_worklist(request: Request):
     itens=_lancar_itens(dropbox_rateio.obter_token())
     return {"total":len(itens),"itens":itens}
 
+_LANCAR_PROG={"itens":{},"atualizado":None}   # {arquivo: {status,pct}} — progresso ao vivo do robô
+
+@app.get("/orc/lancar_ver")
+def orc_lancar_ver(request: Request, origem: str="", nome: str=""):
+    """Visualiza o PDF do orçamento (pasta 1 ou 4) pelo site."""
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS")
+    if origem not in ("1","4") or not _seg_ok(nome): raise HTTPException(400,"parâmetros inválidos")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    base=_pasta_manut(access,int(origem),ob)
+    data=dropbox_rateio.baixar(access,f"{base}/{nome}") if base else None
+    if data is None: raise HTTPException(404,"pdf não encontrado")
+    return Response(content=data,media_type="application/pdf",
+                    headers={"Content-Disposition":f'inline; filename="{urllib.parse.quote(nome)}"'})
+
 @app.post("/orc/lancar_disparar")
 async def orc_lancar_disparar(request: Request):
+    """alvo vazio = LANÇAR TODOS (exige PIN); alvo 'origem/arquivo' = lançar só um (sem PIN)."""
     from fastapi import HTTPException
     u,p=exige(request,"GERAR_ORCAMENTOS")
-    try: _gh_dispatch_wf(GH_WF_LANCAR,{"modo":"lancar"})
+    b={}
+    try: b=await request.json()
+    except Exception: pass
+    alvo=(b.get("alvo") or "").strip()
+    if not alvo:                                   # todos -> exige PIN do usuário
+        if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")):
+            raise HTTPException(403,"PIN incorreto")
+    _LANCAR_PROG["itens"]={}; _LANCAR_PROG["atualizado"]=_agora().isoformat()   # zera o progresso
+    try: _gh_dispatch_wf(GH_WF_LANCAR,{"modo":"lancar","alvo":alvo})
     except urllib.error.HTTPError as e: raise HTTPException(500,f"GitHub {e.code}: {e.read().decode()[:200]}")
     except Exception as e: raise HTTPException(500,f"disparo falhou: {e}")
-    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","DISPAROU_LANCAR","robô de lançamento")
-    return {"ok":True,"msg":"Robô de lançamento disparado no GitHub. Leva alguns minutos — acompanhe o status."}
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","DISPAROU_LANCAR", alvo or "TODOS")
+    return {"ok":True,"alvo":alvo}
 
 @app.get("/orc/lancar_status")
 def orc_lancar_status(request: Request):
     exige(request,"GERAR_ORCAMENTOS")
-    if not (GH_TOKEN and GH_REPO): return {"ok":False,"msg":"GitHub não configurado no Render"}
-    url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WF_LANCAR)}/runs?per_page=1"
-    req=urllib.request.Request(url,headers={"Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
-        "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor"})
-    try:
-        r=json.loads(urllib.request.urlopen(req,timeout=20).read().decode())
-        run=(r.get("workflow_runs") or [None])[0]
-        if not run: return {"ok":True,"estado":"nenhuma execução"}
-        return {"ok":True,"estado":run.get("status"),"conclusao":run.get("conclusion"),
-                "em":run.get("run_started_at") or run.get("created_at"),"url":run.get("html_url")}
-    except Exception as e: return {"ok":False,"msg":str(e)[:160]}
+    out={"progresso":_LANCAR_PROG.get("itens",{}),"atualizado":_LANCAR_PROG.get("atualizado"),"gh":None}
+    if GH_TOKEN and GH_REPO:
+        url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WF_LANCAR)}/runs?per_page=1"
+        req=urllib.request.Request(url,headers={"Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
+            "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor"})
+        try:
+            r=json.loads(urllib.request.urlopen(req,timeout=20).read().decode())
+            run=(r.get("workflow_runs") or [None])[0]
+            if run: out["gh"]={"estado":run.get("status"),"conclusao":run.get("conclusion"),"url":run.get("html_url")}
+        except Exception: pass
+    return out
 
 # ---- endpoints do ROBÔ (autenticados por ROBOT_KEY, não por login) ----
 def _robot_ok(request):
@@ -2914,6 +2938,18 @@ def robot_lancar_worklist(request: Request):
     _robot_ok(request)
     access=dropbox_rateio.obter_token()
     return {"itens":_lancar_itens(access)}
+
+@app.post("/robot/lancar_progresso")
+async def robot_lancar_progresso(request: Request):
+    """O robô reporta o andamento de cada orçamento: {arquivo,status,pct}."""
+    _robot_ok(request)
+    b=await request.json()
+    lista=b.get("itens") if isinstance(b.get("itens"),list) else [b]
+    for it in lista:
+        a=it.get("arquivo")
+        if a: _LANCAR_PROG["itens"][a]={"status":it.get("status") or "","pct":int(it.get("pct") or 0)}
+    _LANCAR_PROG["atualizado"]=_agora().isoformat()
+    return {"ok":True}
 
 @app.get("/robot/lancar_pdf")
 def robot_lancar_pdf(request: Request, origem: str="", nome: str=""):
@@ -2934,6 +2970,7 @@ async def robot_lancar_ok(request: Request):
     _robot_ok(request)
     b=await request.json(); origem=str(b.get("origem")); nome=b.get("nome")
     if origem not in ("1","4") or not _seg_ok(nome): raise HTTPException(400,"parâmetros inválidos")
+    _LANCAR_PROG["itens"][nome]={"status":"lançado","pct":100}   # marca pronto no progresso
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
     dst_n=2 if origem=="1" else 5
     src=_pasta_manut(access,int(origem),ob); dst=_pasta_manut(access,dst_n,ob)
