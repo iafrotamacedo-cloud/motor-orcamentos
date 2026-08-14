@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 109
+#  CONTADOR DE REVISÕES DESTE app.py: 110
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 109}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 110}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2829,6 +2829,130 @@ def _github_dispatch(modo="rotina"):
         "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor","Content-Type":"application/json"})
     urllib.request.urlopen(req,timeout=30)   # 204 No Content em caso de sucesso
     return True
+
+# --- Lançar orçamentos no Trílogo (robô próprio via GitHub Actions) ---
+GH_WF_LANCAR = os.environ.get("GH_WORKFLOW_LANCAR", "trilogo-lancar.yml")
+ROBOT_KEY    = os.environ.get("ROBOT_KEY", "")   # segredo compartilhado motor <-> robô
+
+def _gh_dispatch_wf(workflow, inputs=None):
+    if not (GH_TOKEN and GH_REPO): raise RuntimeError("Configure GITHUB_TOKEN e GH_REPO no Render.")
+    url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(workflow)}/dispatches"
+    data=json.dumps({"ref":GH_REF,"inputs":(inputs or {})}).encode()
+    req=urllib.request.Request(url,data=data,method="POST",headers={
+        "Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
+        "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor","Content-Type":"application/json"})
+    urllib.request.urlopen(req,timeout=30); return True
+
+def _lancar_itens(access):
+    """Orçamentos a lançar: pastas 1 (normais) e 4 (rateio). Casa cada arquivo com o
+    notas_orcamento pra pegar ticket/valor/aba. Só entra o que ainda está em 1/4."""
+    ob=_orc_base(access,_manut_base(access))
+    P1=_pasta_manut(access,1,ob); P4=_pasta_manut(access,4,ob)
+    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome&limit=8000",SB_KEY) or []
+    def _match(nome, origem):
+        alvo=f"{origem}/{nome}"
+        for o in orcs:
+            if str(o.get("arquivo_pdf") or "")==alvo: return o
+        for o in orcs:                                   # fallback: pelo ticket no nome
+            tk=str(o.get("ticket") or "")
+            if tk and (f"_{tk}_NOTA_" in nome or nome.endswith(f"_{tk}.pdf")): return o
+        return None
+    itens=[]
+    for origem,base in (("1",P1),("4",P4)):
+        if not base: continue
+        for e in dropbox_rateio.listar_entradas(access,base):
+            if e["dir"] or not e["name"].lower().endswith(".pdf"): continue
+            o=_match(e["name"],origem) or {}
+            itens.append({"arquivo":e["name"],"origem":origem,
+                "ticket":str(o.get("ticket") or ""),"aba":o.get("aba") or "",
+                "valor":round(_numf(o.get("valor_orcamento")),2) if o.get("valor_orcamento") is not None else None,
+                "loja":_loja_padrao(o.get("loja_nome")),"rateio":bool(o.get("rateio"))})
+    itens.sort(key=lambda x:(x["origem"],x["arquivo"].lower()))
+    return itens
+
+@app.get("/orc/lancar_worklist")
+def orc_lancar_worklist(request: Request):
+    from fastapi import HTTPException
+    exige(request,"GERAR_ORCAMENTOS")
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    itens=_lancar_itens(dropbox_rateio.obter_token())
+    return {"total":len(itens),"itens":itens}
+
+@app.post("/orc/lancar_disparar")
+async def orc_lancar_disparar(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    try: _gh_dispatch_wf(GH_WF_LANCAR,{"modo":"lancar"})
+    except urllib.error.HTTPError as e: raise HTTPException(500,f"GitHub {e.code}: {e.read().decode()[:200]}")
+    except Exception as e: raise HTTPException(500,f"disparo falhou: {e}")
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","DISPAROU_LANCAR","robô de lançamento")
+    return {"ok":True,"msg":"Robô de lançamento disparado no GitHub. Leva alguns minutos — acompanhe o status."}
+
+@app.get("/orc/lancar_status")
+def orc_lancar_status(request: Request):
+    exige(request,"GERAR_ORCAMENTOS")
+    if not (GH_TOKEN and GH_REPO): return {"ok":False,"msg":"GitHub não configurado no Render"}
+    url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WF_LANCAR)}/runs?per_page=1"
+    req=urllib.request.Request(url,headers={"Authorization":f"Bearer {GH_TOKEN}","Accept":"application/vnd.github+json",
+        "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor"})
+    try:
+        r=json.loads(urllib.request.urlopen(req,timeout=20).read().decode())
+        run=(r.get("workflow_runs") or [None])[0]
+        if not run: return {"ok":True,"estado":"nenhuma execução"}
+        return {"ok":True,"estado":run.get("status"),"conclusao":run.get("conclusion"),
+                "em":run.get("run_started_at") or run.get("created_at"),"url":run.get("html_url")}
+    except Exception as e: return {"ok":False,"msg":str(e)[:160]}
+
+# ---- endpoints do ROBÔ (autenticados por ROBOT_KEY, não por login) ----
+def _robot_ok(request):
+    from fastapi import HTTPException
+    k=request.headers.get("x-robot-key") or request.query_params.get("key")
+    if not ROBOT_KEY or k!=ROBOT_KEY: raise HTTPException(403,"robot key inválida")
+
+@app.get("/robot/lancar_worklist")
+def robot_lancar_worklist(request: Request):
+    _robot_ok(request)
+    access=dropbox_rateio.obter_token()
+    return {"itens":_lancar_itens(access)}
+
+@app.get("/robot/lancar_pdf")
+def robot_lancar_pdf(request: Request, origem: str="", nome: str=""):
+    from fastapi import HTTPException
+    _robot_ok(request)
+    if origem not in ("1","4") or not _seg_ok(nome): raise HTTPException(400,"parâmetros inválidos")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    base=_pasta_manut(access,int(origem),ob)
+    data=dropbox_rateio.baixar(access,f"{base}/{nome}") if base else None
+    if data is None: raise HTTPException(404,"pdf não encontrado")
+    return Response(content=data,media_type="application/pdf")
+
+@app.post("/robot/lancar_ok")
+async def robot_lancar_ok(request: Request):
+    """O robô chama após o custo entrar no Trílogo: move 1->2 / 4->5 e marca lançado.
+    Idempotente — se o arquivo já saiu da origem, não faz nada."""
+    from fastapi import HTTPException
+    _robot_ok(request)
+    b=await request.json(); origem=str(b.get("origem")); nome=b.get("nome")
+    if origem not in ("1","4") or not _seg_ok(nome): raise HTTPException(400,"parâmetros inválidos")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    dst_n=2 if origem=="1" else 5
+    src=_pasta_manut(access,int(origem),ob); dst=_pasta_manut(access,dst_n,ob)
+    if not src or not dst: raise HTTPException(500,"pasta de origem/destino não encontrada")
+    # marca lançado no banco (dedup à prova de recarga do robô)
+    try:
+        body=json.dumps({"lancado":True,"lancado_em":_agora().isoformat()}).encode()
+        rq=urllib.request.Request(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&or=(arquivo_pdf.eq.{urllib.parse.quote(origem+'/'+nome)},arquivo_doc.ilike.*{urllib.parse.quote(os.path.splitext(nome)[0])}*)",
+            data=body,method="PATCH",headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","content-type":"application/json","prefer":"return=minimal"})
+        urllib.request.urlopen(rq,timeout=20)
+    except Exception: pass
+    moved=False
+    try:
+        dropbox_rateio.mover(access,f"{src}/{nome}",f"{dst}/{nome}"); moved=True
+    except Exception as e:
+        # se já foi movido antes, não é erro
+        if dropbox_rateio.baixar(access,f"{src}/{nome}") is None: moved=True
+        else: raise HTTPException(500,f"mover: {str(e)[:120]}")
+    return {"ok":True,"movido":moved}
 
 @app.post("/orc/trilogo_run")
 async def orc_trilogo_run(request: Request):
@@ -4948,7 +5072,7 @@ def _basic_auth(app, user, pw):
         if scope["type"] == "http" and (_path.startswith("/pco") or _path.startswith("/api")
                                         or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
                                         or _path.startswith("/desfazer") or _path.startswith("/usuarios") or _path.startswith("/config")
-                                        or _path.startswith("/rateio") or _path.startswith("/arq")
+                                        or _path.startswith("/rateio") or _path.startswith("/arq") or _path.startswith("/robot")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
