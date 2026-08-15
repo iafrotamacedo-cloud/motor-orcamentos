@@ -2862,12 +2862,20 @@ def _lancar_itens(access):
         if not base: continue
         for e in dropbox_rateio.listar_entradas(access,base):
             if e["dir"] or not e["name"].lower().endswith(".pdf"): continue
-            o=_match(e["name"],origem) or {}
+            o=_match(e["name"],origem)
+            sem_reg = o is None
+            if o is None: o={}
+            # fallback: sem registro no BD -> lê ticket/loja do próprio nome do arquivo (pra não ficar em branco)
+            tkp=""; ljp=None
+            if sem_reg:
+                m=re.search(r'^(.*?)_(\d{4,7})(?:_NOTA_.*)?\.pdf$', e["name"], re.I)
+                if m: tkp=m.group(2); ljp=m.group(1).replace("_"," ").strip()
+            lnome=o.get("loja_nome")
             itens.append({"arquivo":e["name"],"origem":origem,
-                "ticket":str(o.get("ticket") or ""),"aba":o.get("aba") or "",
+                "ticket":str(o.get("ticket") or tkp),"aba":o.get("aba") or "",
                 "valor":round(_numf(o.get("valor_orcamento")),2) if o.get("valor_orcamento") is not None else None,
-                "loja":_loja_padrao(o.get("loja_nome")),"rateio":bool(o.get("rateio")),
-                "lancado":bool(o.get("lancado"))})
+                "loja":(_loja_padrao(lnome) if lnome else ljp),"rateio":bool(o.get("rateio")) or (origem=="4"),
+                "lancado":bool(o.get("lancado")),"sem_registro":sem_reg})
     itens.sort(key=lambda x:(x["origem"],x["arquivo"].lower()))
     return itens
 
