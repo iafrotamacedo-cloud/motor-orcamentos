@@ -3141,7 +3141,11 @@ async def robot_conferir_resultado(request: Request):
     lista=b.get("itens") if isinstance(b.get("itens"),list) else [b]
     for it in lista:
         a=it.get("arquivo")
-        if a: _CONFERIR["itens"][a]=it
+        if not a: continue
+        prev=_CONFERIR["itens"].get(a)
+        # não deixa um 'outra_conta' (sem info) sobrescrever um veredito real já reportado
+        if prev and prev.get("aberto") and it.get("outra_conta"): continue
+        _CONFERIR["itens"][a]=it
     _CONFERIR["atualizado"]=_agora().isoformat()
     return {"ok":True}
 
@@ -3150,7 +3154,7 @@ async def orc_conferir_disparar(request: Request):
     """Dispara o robô em modo CONFERÊNCIA (só lê custos, não lança). Builder/gerente."""
     from fastapi import HTTPException
     u,p=exige(request,"GERAR_ORCAMENTOS")
-    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
+    # read-only (não move nada): liberado para todos que já têm acesso à página de lançar
     _CONFERIR["itens"]={}; _CONFERIR["atualizado"]=_agora().isoformat()
     try: _gh_dispatch_wf(GH_WF_LANCAR,{"modo":"conferir","alvo":""})
     except urllib.error.HTTPError as e: raise HTTPException(500,f"GitHub {e.code}: {e.read().decode()[:200]}")
@@ -3162,7 +3166,6 @@ async def orc_conferir_disparar(request: Request):
 def orc_conferir_status(request: Request):
     from fastapi import HTTPException
     u,p=exige(request,"GERAR_ORCAMENTOS")
-    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
     itens=_CONFERIR.get("itens",{})
     vals=list(itens.values())
     resumo={
