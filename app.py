@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 114
+#  CONTADOR DE REVISÕES DESTE app.py: 116
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -870,7 +870,7 @@ def baixar(t: str):
 
 # ============ API do FrotaHub (protegida por token do Supabase) ============
 @app.get("/api/ping")
-def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 114}
+def api_ping(): return {"ok": True, "motor": "frotahub", "rev": 116}
 
 @app.get("/api/me")
 def api_me(request: Request):
@@ -2848,7 +2848,7 @@ def _lancar_itens(access):
     notas_orcamento pra pegar ticket/valor/aba. Só entra o que ainda está em 1/4."""
     ob=_orc_base(access,_manut_base(access))
     P1=_pasta_manut(access,1,ob); P4=_pasta_manut(access,4,ob)
-    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome&limit=8000",SB_KEY) or []
+    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome,lancado&limit=8000",SB_KEY) or []
     def _match(nome, origem):
         alvo=f"{origem}/{nome}"
         for o in orcs:
@@ -2866,7 +2866,8 @@ def _lancar_itens(access):
             itens.append({"arquivo":e["name"],"origem":origem,
                 "ticket":str(o.get("ticket") or ""),"aba":o.get("aba") or "",
                 "valor":round(_numf(o.get("valor_orcamento")),2) if o.get("valor_orcamento") is not None else None,
-                "loja":_loja_padrao(o.get("loja_nome")),"rateio":bool(o.get("rateio"))})
+                "loja":_loja_padrao(o.get("loja_nome")),"rateio":bool(o.get("rateio")),
+                "lancado":bool(o.get("lancado"))})
     itens.sort(key=lambda x:(x["origem"],x["arquivo"].lower()))
     return itens
 
@@ -2993,6 +2994,141 @@ def _mover_marcar_lancado(origem, nome):
         if dropbox_rateio.baixar(access,f"{src}/{nome}") is None: moved=True
         else: raise HTTPException(500,f"mover: {str(e)[:120]}")
     return {"ok":True,"movido":moved}
+
+def _mover_volta(origem, nome):
+    """Desfaz o move: volta o PDF de 2->1 / 5->4 (NÃO mexe no banco aqui)."""
+    from fastapi import HTTPException
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    dst_n=2 if origem=="1" else 5
+    p_orig=_pasta_manut(access,int(origem),ob); p_lanc=_pasta_manut(access,dst_n,ob)
+    if not p_orig or not p_lanc: raise HTTPException(500,"pasta não encontrada")
+    try:
+        dropbox_rateio.mover(access,f"{p_lanc}/{nome}",f"{p_orig}/{nome}"); return True
+    except Exception as e:
+        if dropbox_rateio.baixar(access,f"{p_lanc}/{nome}") is None: return True   # já voltou
+        raise HTTPException(500,f"mover volta: {str(e)[:120]}")
+
+@app.get("/orc/conferencia_movidas")
+def orc_conferencia_movidas(request: Request, desde: str=""):
+    """Lista os orçamentos marcados como lançados (candidatos a terem sido movidos
+    pela conferência). Se 'desde' for informado, filtra por lancado_em >= desde."""
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    if p.get("nivel") not in ("builder","gerente"): raise HTTPException(403,"apenas builder e gerente")
+    q=("lancado=eq.true&select=id,ticket,arquivo_pdf,valor_orcamento,lancado_em,loja_nome,aba,rateio"
+       "&order=lancado_em.desc&limit=5000")
+    if desde: q+=f"&lancado_em=gte.{urllib.parse.quote(desde)}"
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY) or []
+    for r in rows:
+        ap=str(r.get("arquivo_pdf") or ""); r["origem"]=ap.split("/")[0] if "/" in ap else ""
+        r["pasta_atual"]=("2 - ORÇAMENTOS LANÇADOS" if r["origem"]=="1"
+                          else "5 - ORÇAMENTOS DE RATEIO LANÇADOS" if r["origem"]=="4" else "?")
+    return {"total":len(rows),"itens":rows}
+
+@app.post("/orc/conferencia_desfazer")
+async def orc_conferencia_desfazer(request: Request):
+    """Desfaz uma rodada de conferência: volta os PDFs de 2->1 / 5->4 e zera 'lancado'.
+    Escopo obrigatório por 'desde' (timestamp). Builder+PIN OU robot key (para a Action)."""
+    from fastapi import HTTPException
+    b={}
+    try: b=await request.json()
+    except Exception: pass
+    rk=request.headers.get("x-robot-key")
+    if rk and ROBOT_KEY and rk==ROBOT_KEY:
+        actor="robot"
+    else:
+        u,p=exige(request,"GERAR_ORCAMENTOS")
+        if p.get("nivel")!="builder": raise HTTPException(403,"apenas builder")
+        if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+        actor=u["id"]
+    desde=(b.get("desde") or "").strip()
+    if not desde: raise HTTPException(400,"informe 'desde' (timestamp da conferência) por segurança")
+    q=f"lancado=eq.true&lancado_em=gte.{urllib.parse.quote(desde)}&status=eq.gerado&select=id,arquivo_pdf&limit=5000"
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY) or []
+    voltou=[]; erros=[]
+    for r in rows:
+        ap=str(r.get("arquivo_pdf") or ""); origem=ap.split("/")[0] if "/" in ap else ""
+        nome=ap.split("/",1)[1] if "/" in ap else ""
+        if origem not in ("1","4") or not nome: erros.append(ap or str(r.get("id"))); continue
+        try:
+            _mover_volta(origem, nome)
+            _sb_write(f"notas_orcamento?id=eq.{r['id']}", {"lancado":False,"lancado_em":None}, "PATCH")
+            voltou.append(f"{origem}/{nome}")
+        except Exception as e:
+            erros.append(f"{ap}: {str(e)[:80]}")
+    try: log_frotahub(actor,"builder","GERAR_ORCAMENTOS","DESFEZ_CONFERENCIA",f"{len(voltou)} desde {desde}")
+    except Exception: pass
+    return {"ok":True,"voltaram":voltou,"erros":erros,"total":len(voltou)}
+
+@app.post("/orc/aplicar_conferencia")
+async def orc_aplicar_conferencia(request: Request):
+    """Aplica a conferência do Trílogo (feita fora): marca 'lancado' no banco e ROTEIA as
+    pastas do Dropbox (não lançado -> 1/4, lançado -> 2/5), casando por TICKET + VALOR.
+    dry_run=true (padrão) só devolve o PLANO, não mexe em nada. Builder+PIN OU robot key."""
+    from fastapi import HTTPException
+    b={}
+    try: b=await request.json()
+    except Exception: pass
+    rk=request.headers.get("x-robot-key"); actor=None
+    if rk and ROBOT_KEY and rk==ROBOT_KEY:
+        actor="robot"
+    else:
+        u,p=exige(request,"GERAR_ORCAMENTOS")
+        if p.get("nivel")!="builder": raise HTTPException(403,"apenas builder")
+        if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+        actor=u["id"]
+    dry=bool(b.get("dry_run", True))
+    conf={}
+    for it in (b.get("itens") or []):
+        try: conf[(str(it["ticket"]), round(float(it["valor"]),2))]=bool(it["lancado"])
+        except Exception: pass
+    if not conf: raise HTTPException(400,"itens vazios")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,valor_orcamento,arquivo_pdf,rateio,lancado&limit=20000",SB_KEY) or []
+    planos=[]; fora=0; achados=set()
+    for o in orcs:
+        key=(str(o.get("ticket") or ""), round(_numf(o.get("valor_orcamento")),2))
+        if key not in conf: fora+=1; continue
+        achados.add(key)
+        deseja=conf[key]; rateio=bool(o.get("rateio"))
+        desired=(5 if rateio else 2) if deseja else (4 if rateio else 1)
+        ap=str(o.get("arquivo_pdf") or ""); cur=ap.split("/")[0] if "/" in ap else ""
+        nome=ap.split("/",1)[1] if "/" in ap else ""
+        flip=bool(o.get("lancado"))!=deseja
+        move=(cur in ("1","2","4","5")) and cur!=str(desired) and bool(nome)
+        if flip or move:
+            planos.append({"id":o["id"],"ticket":key[0],"valor":key[1],"nome":nome,
+                "para_lancado":deseja,"de_pasta":cur,"para_pasta":str(desired),
+                "mover":bool(move),"marcar":bool(flip)})
+    nao_no_db=[{"ticket":k[0],"valor":k[1]} for k in conf if k not in achados]
+    resumo={"db_total":len(orcs),"na_conferencia":len(achados),"fora_da_conferencia":fora,
+        "vao_mudar":len(planos),
+        "marcar_lancado":sum(1 for x in planos if x["marcar"] and x["para_lancado"]),
+        "marcar_nao_lancado":sum(1 for x in planos if x["marcar"] and not x["para_lancado"]),
+        "mover_p_lancados_2_5":sum(1 for x in planos if x["mover"] and x["para_pasta"] in ("2","5")),
+        "mover_p_naolancados_1_4":sum(1 for x in planos if x["mover"] and x["para_pasta"] in ("1","4")),
+        "conf_sem_par_no_db":len(nao_no_db)}
+    if dry:
+        return {"dry_run":True,"resumo":resumo,"amostra":planos[:20],"sem_par_no_db":nao_no_db[:20]}
+    feitos=0; erros=[]
+    for x in planos:
+        try:
+            if x["mover"]:
+                src=_pasta_manut(access,int(x["de_pasta"]),ob); dst=_pasta_manut(access,int(x["para_pasta"]),ob)
+                if not src or not dst: raise HTTPException(500,"pasta não encontrada")
+                try: dropbox_rateio.mover(access,f"{src}/{x['nome']}",f"{dst}/{x['nome']}")
+                except Exception:
+                    if dropbox_rateio.baixar(access,f"{src}/{x['nome']}") is not None: raise  # ainda no src -> erro real
+            patch={"lancado":x["para_lancado"]}
+            if x["mover"]: patch["arquivo_pdf"]=f"{x['para_pasta']}/{x['nome']}"
+            patch["lancado_em"]=_agora().isoformat() if x["para_lancado"] else None
+            _sb_write(f"notas_orcamento?id=eq.{x['id']}", patch, "PATCH")
+            feitos+=1
+        except Exception as e:
+            erros.append(f"{x['ticket']}/{x['nome']}: {str(e)[:80]}")
+    try: log_frotahub(actor,"builder","GERAR_ORCAMENTOS","APLICOU_CONFERENCIA",f"{feitos} de {len(planos)}")
+    except Exception: pass
+    return {"dry_run":False,"resumo":resumo,"aplicados":feitos,"erros":erros[:40]}
 
 # ---- CONFERÊNCIA de duplicidade (custos já lançados no Trílogo) ----
 _CONFERIR={"itens":{},"atualizado":None}
@@ -5183,6 +5319,18 @@ try:
 except Exception as _e:
     print("AVISO: backup_endpoints não montado:", _e)
 
+# ---- Servir o FrotaHub (front estático) pelo próprio motor, em /app ----
+# Alternativa ao Netlify: coloque os arquivos do site na pasta "frontend/" ao lado
+# do app.py (index.html, manifest.webmanifest, sw.js, share.html, favicon.ico, icons/).
+try:
+    from fastapi.staticfiles import StaticFiles
+    _FRONT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
+    if os.path.isdir(_FRONT):
+        app.mount("/app", StaticFiles(directory=_FRONT, html=True), name="frontend")
+        print("front estático montado em /app")
+except Exception as _e:
+    print("AVISO: front estático não montado:", _e)
+
 
 def _basic_auth(app, user, pw):
     """Protege TODAS as rotas com usuário/senha (HTTP Basic), na camada ASGI."""
@@ -5194,7 +5342,7 @@ def _basic_auth(app, user, pw):
                                         or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
                                         or _path.startswith("/desfazer") or _path.startswith("/usuarios") or _path.startswith("/config")
                                         or _path.startswith("/rateio") or _path.startswith("/arq") or _path.startswith("/robot")
-                                        or _path.startswith("/backup")
+                                        or _path.startswith("/backup") or _path.startswith("/app")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
