@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 118
+#  CONTADOR DE REVISÕES DESTE app.py: 120
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 118   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 120   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -3481,32 +3481,190 @@ def orc_planilha(request: Request, desde: str="", ate: str="", faixa: str=""):
     # quem pode remover orçamentos (builder/gerente) — o front usa isso para mostrar a opção
     return {"itens":rows,"total":total,"header":h,"pode_remover":(p.get("nivel") in ("builder","gerente"))}
 
-@app.get("/orc/planilha_anexados")
-def orc_planilha_anexados(request: Request, desde: str="", ate: str=""):
-    """Planilha de controle dos ORÇAMENTOS ANEXADOS (custo já lançado no Trílogo, com a nota
-    anexada). Lista direto do banco (notas_orcamento lancado=true). Filtro por DATA (lancado_em)
-    é server-side; loja e ticket o front filtra na tela. NÃO é Excel — é a lista BD-backed."""
-    from fastapi import HTTPException
-    u,p=exige(request,"ORCAMENTOS_UPADOS")
+def _anexados_rows(desde="", ate="", loja="", ticket=""):
+    """Linhas dos ORÇAMENTOS ANEXADOS (custo lançado no Trílogo). Filtro por DATA (lancado_em)
+    server-side; loja/ticket opcionais (substring) para a extração casar com a tela."""
     parts=["select=id,ticket,loja_nome,aba,valor_orcamento,lancado_em,arquivo_pdf,rateio",
            "lancado=eq.true","status=eq.gerado","order=lancado_em.desc","limit=8000"]
     if desde: parts.append(f"lancado_em=gte.{urllib.parse.quote(desde)}")
     if ate:   parts.append(f"lancado_em=lte.{urllib.parse.quote(ate)}T23:59:59")
     rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(parts),SB_KEY) or []
     itens=[]
-    for i,n in enumerate(rows,1):
+    for n in rows:
         ap=str(n.get("arquivo_pdf") or ""); tk=str(n.get("ticket") or "")
         itens.append({
-            "n":i, "id":n.get("id"), "ticket":tk,
+            "id":n.get("id"), "ticket":tk,
             "loja":(_loja_padrao(n.get("loja_nome")) if n.get("loja_nome") else ""),
             "valor":round(_numf(n.get("valor_orcamento")),2) if n.get("valor_orcamento") is not None else 0,
             "tipo":"Mão de obra", "documento":tk, "conta":_abacurta(n.get("aba")),
             "data":(n.get("lancado_em") or "")[:10], "rateio":bool(n.get("rateio")),
             "arquivo":(ap.rsplit("/",1)[-1] if ap else ""),
         })
+    if loja:   lf=loja.strip().lower();   itens=[x for x in itens if lf in (x["loja"] or "").lower()]
+    if ticket: tf=ticket.strip();         itens=[x for x in itens if tf in (x["ticket"] or "")]
+    for i,x in enumerate(itens,1): x["n"]=i
+    return itens
+
+def _anexados_header(desde,ate,resp,total,qtd):
+    per=(f"{_data_br(desde)} a {_data_br(ate)}" if (desde or ate) else "Todos os períodos")
+    return {"periodo":per,"gerado":_hoje().strftime("%d/%m/%Y"),"responsavel":resp or "—",
+            "total":_reais(total),"qtd":qtd,"titulo":"ORÇAMENTOS ANEXADOS NO TRÍLOGO (CUSTOS LANÇADOS)"}
+
+@app.get("/orc/planilha_anexados")
+def orc_planilha_anexados(request: Request, desde: str="", ate: str=""):
+    """Lista dos ORÇAMENTOS ANEXADOS (custo já lançado no Trílogo, nota anexada). Direto do banco.
+    Loja e ticket o front filtra na tela. NÃO é Excel — é a lista BD-backed (extração à parte)."""
+    from fastapi import HTTPException
+    u,p=exige(request,"ORCAMENTOS_UPADOS")
+    itens=_anexados_rows(desde,ate)
     total=round(sum(x["valor"] for x in itens),2)
     per=(f"{_data_br(desde)} a {_data_br(ate)}" if (desde or ate) else "Todos os períodos")
     return {"itens":itens,"total":_reais(total),"total_num":total,"qtd":len(itens),"periodo":per}
+
+@app.get("/orc/planilha_anexados_xlsx")
+def orc_planilha_anexados_xlsx(request: Request, desde: str="", ate: str="", loja: str="", ticket: str=""):
+    from fastapi import HTTPException
+    u,p=exige(request,"ORCAMENTOS_UPADOS")
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.drawing.image import Image as XLImage
+    rows=_anexados_rows(desde,ate,loja,ticket); total=round(sum(r["valor"] for r in rows),2)
+    h=_anexados_header(desde,ate,(p.get("nome_completo") or p.get("nome")),total,len(rows))
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title="Anexados"
+    larg=[6,8,34,13,12,12,16,12,42]
+    for i,w in enumerate(larg,1): ws.column_dimensions[get_column_letter(i)].width=w
+    try:
+        tmp=tempfile.NamedTemporaryFile(suffix=".png",delete=False); tmp.write(_b64.b64decode(_LOGO_ORC_B64)); tmp.close()
+        img=XLImage(tmp.name); img.width=150; img.height=64; ws.add_image(img,"A1")
+    except Exception: pass
+    ws.merge_cells("C1:I1"); ws["C1"]=h["titulo"]; ws["C1"].font=Font(bold=True,size=14,color=_MAROM); ws["C1"].alignment=Alignment(horizontal="left",vertical="center")
+    ws.merge_cells("C2:I2"); ws["C2"]=f"Período: {h['periodo']}"; ws["C2"].font=Font(size=10,color="555555")
+    ws.merge_cells("C3:I3"); ws["C3"]=f"Gerado em {h['gerado']} por {h['responsavel']}  ·  {h['qtd']} orçamento(s)  ·  Total {h['total']}"; ws["C3"].font=Font(size=10,color="555555")
+    ws.row_dimensions[1].height=22; ws.row_dimensions[2].height=16; ws.row_dimensions[3].height=16
+    H0=6
+    heads=["Nº","TICKET","LOJA","VALOR","TIPO","DOCUMENTO","CONTA","DATA","ARQUIVO"]
+    borda=Border(*(Side(style="thin",color=_MAROM),)*4)
+    for c,txt in enumerate(heads,1):
+        cell=ws.cell(H0,c,txt); cell.font=Font(bold=True,size=10,color="FFFFFF")
+        cell.fill=PatternFill("solid",fgColor=_MAROM); cell.alignment=Alignment(horizontal="center",vertical="center"); cell.border=borda
+    aligns={1:"center",2:"center",3:"left",4:"right",5:"center",6:"center",7:"left",8:"center",9:"left"}
+    fmtD='"R$"\\ #,##0.00'
+    for k,r in enumerate(rows):
+        rr=H0+1+k
+        vals=[r["n"],r["ticket"],r["loja"],r["valor"],r["tipo"],r["documento"],r["conta"],None,r["arquivo"]]
+        for c in range(1,10):
+            cell=ws.cell(rr,c,vals[c-1]); cell.font=Font(size=10); cell.alignment=Alignment(horizontal=aligns[c]); cell.border=borda
+        try:
+            y,mo,d=r["data"].split("-"); ws.cell(rr,8).value=datetime.date(int(y),int(mo),int(d)); ws.cell(rr,8).number_format="dd/mm/yyyy"
+        except Exception: ws.cell(rr,8).value=r["data"]
+        ws.cell(rr,4).number_format=fmtD
+    ws.freeze_panes=f"A{H0+1}"; ws.auto_filter.ref=f"A{H0}:I{H0+len(rows)}"
+    buf=io.BytesIO(); wb.save(buf)
+    return Response(content=buf.getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition":'attachment; filename="orcamentos_anexados_frota.xlsx"'})
+
+@app.get("/orc/planilha_anexados_pdf")
+def orc_planilha_anexados_pdf(request: Request, desde: str="", ate: str="", loja: str="", ticket: str=""):
+    from fastapi import HTTPException
+    u,p=exige(request,"ORCAMENTOS_UPADOS")
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.units import cm, mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    rows=_anexados_rows(desde,ate,loja,ticket); total=round(sum(r["valor"] for r in rows),2)
+    h=_anexados_header(desde,ate,(p.get("nome_completo") or p.get("nome")),total,len(rows))
+    buf=io.BytesIO()
+    doc=SimpleDocTemplate(buf,pagesize=landscape(A4),leftMargin=1.0*cm,rightMargin=1.0*cm,topMargin=0.9*cm,bottomMargin=0.9*cm,title=h["titulo"])
+    ss=getSampleStyleSheet()
+    tit=ParagraphStyle('t',parent=ss['Title'],textColor=colors.HexColor('#'+_MAROM),fontSize=15,alignment=0,spaceAfter=1)
+    sub=ParagraphStyle('s',parent=ss['Normal'],textColor=colors.HexColor('#555555'),fontSize=9,leading=12)
+    cel=ParagraphStyle('c',parent=ss['Normal'],fontSize=7,leading=8)
+    el=[]
+    try:
+        tmp=tempfile.NamedTemporaryFile(suffix=".png",delete=False); tmp.write(_b64.b64decode(_LOGO_ORC_B64)); tmp.close()
+        logo=RLImage(tmp.name,width=26*mm,height=11*mm)
+        cab=Table([[logo, Paragraph(h["titulo"],tit)]],colWidths=[30*mm,None])
+        cab.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),0)]))
+        el.append(cab)
+    except Exception: el.append(Paragraph(h["titulo"],tit))
+    el.append(Paragraph(f"Período: {h['periodo']}",sub))
+    el.append(Paragraph(f"Gerado em {h['gerado']} por {h['responsavel']} &nbsp;·&nbsp; {h['qtd']} orçamento(s) &nbsp;·&nbsp; Total {h['total']}",sub))
+    el.append(Spacer(1,7))
+    heads=["Nº","TICKET","LOJA","VALOR","TIPO","DOC.","CONTA","DATA","ARQUIVO"]
+    data=[heads]+[[str(r["n"]),r["ticket"],r["loja"][:34],_reais(r["valor"]),r["tipo"],r["documento"],r["conta"][:16],
+                   _data_br(r["data"]),Paragraph((r["arquivo"] or "")[:60],cel)] for r in rows]
+    t=Table(data,repeatRows=1,colWidths=[0.9*cm,1.7*cm,5.2*cm,2.2*cm,2.2*cm,1.9*cm,3.0*cm,1.9*cm,6.6*cm])
+    t.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#'+_MAROM)),('TEXTCOLOR',(0,0),(-1,0),colors.white),
+        ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('FONTSIZE',(0,0),(-1,-1),7.5),
+        ('GRID',(0,0),(-1,-1),0.4,colors.HexColor('#'+_MAROM)),('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ('ALIGN',(0,1),(1,-1),'CENTER'),('ALIGN',(3,1),(3,-1),'RIGHT'),('ALIGN',(4,1),(5,-1),'CENTER'),('ALIGN',(7,1),(7,-1),'CENTER'),
+        ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f6f2f2')]),
+        ('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+    el.append(t)
+    doc.build(el)
+    return Response(content=buf.getvalue(), media_type="application/pdf",
+        headers={"Content-Disposition":'attachment; filename="orcamentos_anexados_frota.pdf"'})
+
+def _exige_qualquer(request, *codes):
+    """Autentica e exige QUALQUER uma das permissões (usado pelas telas de controle)."""
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request))
+    if not u or not u.get("id"): raise HTTPException(401,"não autenticado")
+    p=perfil_de(u["id"])
+    if not p or p.get("ativo") is False: raise HTTPException(403,"usuário sem perfil ativo")
+    if not any(pode_rotina(p,c) for c in codes): raise HTTPException(403,"sem permissão")
+    return u,p
+
+@app.get("/orc/ver_arquivo")
+def orc_ver_arquivo(request: Request, id: str=""):
+    """Abre o PDF de um orçamento/nota pelo id (resolve arquivo_pdf ou arquivo_nota no Dropbox).
+    Serve o botão 👁 das planilhas de controle."""
+    from fastapi import HTTPException
+    _exige_qualquer(request,"ORCAMENTOS_GERADOS","ORCAMENTOS_UPADOS","SEM_TICKET","TICKET_NAO_ASSOCIADO")
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{urllib.parse.quote(id)}&select=arquivo_pdf,arquivo_nota&limit=1",SB_KEY) or []
+    if not row: raise HTTPException(404,"registro não encontrado")
+    ap=str(row[0].get("arquivo_pdf") or "") or str(row[0].get("arquivo_nota") or "")
+    if not ap: raise HTTPException(404,"sem arquivo no banco (rode a reconciliação de arquivos)")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    absp=_aud_abs(access,ob,ap)
+    data=dropbox_rateio.baixar(access,absp) if absp else None
+    if data is None: raise HTTPException(404,"arquivo não encontrado no Dropbox")
+    return Response(content=data,media_type="application/pdf",
+        headers={"Content-Disposition":f'inline; filename="{os.path.basename(ap)}"'})
+
+@app.get("/orc/planilha_pendentes")
+def orc_planilha_pendentes(request: Request, tipo: str="", desde: str="", ate: str=""):
+    """Listas de controle das notas pendentes: tipo='sem_ticket' (pasta 6) ou
+    'ticket_nao_associado' (pasta 7). Dados direto do banco. Filtro por data (criado_em)."""
+    from fastapi import HTTPException
+    st = "sem_ticket" if tipo=="sem_ticket" else "ticket_nao_associado"
+    code = "SEM_TICKET" if st=="sem_ticket" else "TICKET_NAO_ASSOCIADO"
+    u,p=_exige_qualquer(request,code)
+    parts=[f"status=eq.{st}",
+           "select=id,ticket,nota_numero,loja_nome,valor_nota,criado_em,arquivo_nota,itens",
+           "order=criado_em.desc","limit=8000"]
+    if desde: parts.append(f"criado_em=gte.{desde}")
+    if ate:   parts.append(f"criado_em=lte.{ate}T23:59:59")
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(parts),SB_KEY) or []
+    itens=[]
+    for i,n in enumerate(rows,1):
+        an=str(n.get("arquivo_nota") or ""); its=n.get("itens")
+        itens.append({
+            "n":i, "id":n.get("id"), "ticket":str(n.get("ticket") or ""),
+            "nota":n.get("nota_numero") or "—", "loja":n.get("loja_nome") or "",
+            "valor":round(_numf(n.get("valor_nota")),2) if n.get("valor_nota") is not None else None,
+            "itens":(len(its) if isinstance(its,list) else None),
+            "data":(n.get("criado_em") or "")[:10],
+            "arquivo":(an.rsplit("/",1)[-1] if an else ""),
+        })
+    total=round(sum(x["valor"] for x in itens if x["valor"] is not None),2)
+    per=(f"{_data_br(desde)} a {_data_br(ate)}" if (desde or ate) else "Todos os períodos")
+    titulo="Notas SEM TICKET" if st=="sem_ticket" else "Notas com TICKET NÃO ASSOCIADO"
+    return {"itens":itens,"total":_reais(total),"qtd":len(itens),"periodo":per,"titulo":titulo,"tipo":st}
 
 # ================= GERENCIADOR DE ARQUIVOS (fluxo pelas pastas, sem Dropbox direto) =================
 _ARQ_EXTS_DOC={".pdf",".jpg",".jpeg",".png"}
