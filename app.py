@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 122
+#  CONTADOR DE REVISÕES DESTE app.py: 123
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 122   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 123   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -2400,10 +2400,21 @@ def _reconcilia(q, vu, vt):
         return round(vt/q, 4)
     return vu
 
+def _ocr_limpa_col(ln):
+    """Remove as 'bordas de célula' e cifrões que o OCR injeta ENTRE as colunas
+       da tabela de itens de uma DANFE escaneada — ex.: '| 39211100 |', '790 [5405 |',
+       '1,000}', '$00,000)', '500,00]'. Sem esses ruídos a linha do item volta a casar
+       com o regex; o valor errado (ex.: '$00,000') é corrigido depois por _reconcilia,
+       que confia no TOTAL da linha. Em PDF digital (sem esses caracteres) não muda nada."""
+    ln=re.sub(r"[|\[\]{}()$¦]", " ", ln or "")
+    return re.sub(r"[ \t]{2,}", " ", ln)
+
 def _parse_danfe_texto(txt):
     """LEITOR (sem IA) da DANFE / Nota Fiscal Eletrônica (ex.: DISMONZA).
        Extrai nº da nota (N°. com pontos de milhar), ticket, itens (código, desc,
-       NCM, CST, CFOP, UNID, QUANT, VALOR UNIT, VALOR TOTAL)."""
+       NCM, CST, CFOP, UNID, QUANT, VALOR UNIT, VALOR TOTAL).
+       Robusto a DANFE ESCANEADA (só imagem): o texto vem de OCR e a tabela de itens
+       chega com bordas de célula ('|', '[]', '{}') e cifrões; _ocr_limpa_col os remove."""
     T=txt or ""; up=T.upper()
     if "DADOS DO PRODUTO" not in up and "DOCUMENTO AUXILIAR DA" not in up:
         return []
@@ -2417,6 +2428,7 @@ def _parse_danfe_texto(txt):
     IT=re.compile(r"^\s*(\d{3,})\s+(.+?)\s+(\d{8})\s+\d{1,3}\s+\d{3,4}\s+([A-Za-zÇç][A-Za-z0-9²³ºÇç]{0,4})\s+([\d.]+,\d+)\s+([\d.]+,\d+)\s+([\d.]+,\d+)")
     itens=[]
     for ln in seg.splitlines():
+        ln=_ocr_limpa_col(ln)
         m=IT.search(ln)
         if m:
             q=_num_br(m.group(5)); vu=_num_br(m.group(6)); vt=_num_br(m.group(7))
@@ -2444,6 +2456,7 @@ def _parse_dav_texto(txt):
     IT=re.compile(r"^\s*(\d{5,})\s*-\s*(.+?)\s+([A-Za-zÇç]{1,4})\s+([\d.]+,\d+)\s+([\d.]+,\d+)")
     itens=[]
     for ln in seg.splitlines():
+        ln=_ocr_limpa_col(ln)
         m=IT.search(ln)
         if m:
             q=_num_br(m.group(4)); vu=_num_br(m.group(5))
