@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 117
+#  CONTADOR DE REVISÕES DESTE app.py: 118
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 117   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 118   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -3480,6 +3480,33 @@ def orc_planilha(request: Request, desde: str="", ate: str="", faixa: str=""):
     h=_planilha_header(desde,ate,faixa,(p.get("nome_completo") or p.get("nome")),total,len(rows))
     # quem pode remover orçamentos (builder/gerente) — o front usa isso para mostrar a opção
     return {"itens":rows,"total":total,"header":h,"pode_remover":(p.get("nivel") in ("builder","gerente"))}
+
+@app.get("/orc/planilha_anexados")
+def orc_planilha_anexados(request: Request, desde: str="", ate: str=""):
+    """Planilha de controle dos ORÇAMENTOS ANEXADOS (custo já lançado no Trílogo, com a nota
+    anexada). Lista direto do banco (notas_orcamento lancado=true). Filtro por DATA (lancado_em)
+    é server-side; loja e ticket o front filtra na tela. NÃO é Excel — é a lista BD-backed."""
+    from fastapi import HTTPException
+    u,p=exige(request,"ORCAMENTOS_UPADOS")
+    parts=["select=id,ticket,loja_nome,aba,valor_orcamento,lancado_em,arquivo_pdf,rateio",
+           "lancado=eq.true","status=eq.gerado","order=lancado_em.desc","limit=8000"]
+    if desde: parts.append(f"lancado_em=gte.{urllib.parse.quote(desde)}")
+    if ate:   parts.append(f"lancado_em=lte.{urllib.parse.quote(ate)}T23:59:59")
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(parts),SB_KEY) or []
+    itens=[]
+    for i,n in enumerate(rows,1):
+        ap=str(n.get("arquivo_pdf") or ""); tk=str(n.get("ticket") or "")
+        itens.append({
+            "n":i, "id":n.get("id"), "ticket":tk,
+            "loja":(_loja_padrao(n.get("loja_nome")) if n.get("loja_nome") else ""),
+            "valor":round(_numf(n.get("valor_orcamento")),2) if n.get("valor_orcamento") is not None else 0,
+            "tipo":"Mão de obra", "documento":tk, "conta":_abacurta(n.get("aba")),
+            "data":(n.get("lancado_em") or "")[:10], "rateio":bool(n.get("rateio")),
+            "arquivo":(ap.rsplit("/",1)[-1] if ap else ""),
+        })
+    total=round(sum(x["valor"] for x in itens),2)
+    per=(f"{_data_br(desde)} a {_data_br(ate)}" if (desde or ate) else "Todos os períodos")
+    return {"itens":itens,"total":_reais(total),"total_num":total,"qtd":len(itens),"periodo":per}
 
 # ================= GERENCIADOR DE ARQUIVOS (fluxo pelas pastas, sem Dropbox direto) =================
 _ARQ_EXTS_DOC={".pdf",".jpg",".jpeg",".png"}
