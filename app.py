@@ -5331,25 +5331,42 @@ def _exige_auditoria(request):
 def _qk(chave):  # chave canônica p/ URL
     return urllib.parse.quote(chave, safe="")
 
+def _aud_exemplo(chave):
+    """Uma descrição de exemplo (texto de nota) para uma chave canônica órfã."""
+    r=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?chave=eq.{_qk(chave)}&select=item_descricao&limit=1",SB_KEY) or []
+    return (r and r[0].get("item_descricao")) or chave
+
 @app.get("/aud/catalogo")
 def aud_catalogo(request: Request):
-    """Lista o catálogo (item/grupo/classificação/permitido) + uso e resumo por grupo."""
+    """Lista o catálogo + os itens ÓRFÃOS (aparecem em orçamentos mas não estão no
+    catálogo) no topo, para poderem ser classificados. Inclui uso e resumo por grupo."""
     _exige_auditoria(request)
     from collections import defaultdict
     cat=_sb_json(f"{SB_URL}/rest/v1/itens_catalogo?select=chave_canonica,descricao_exemplo,grupo,classificacao,permitido,permitido_manual&limit=5000",SB_KEY) or []
-    vi=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?select=chave,orcamento_id&limit=200000",SB_KEY) or []
-    uso=defaultdict(set)
-    for r in vi: uso[r.get("chave")].add(r.get("orcamento_id"))
+    vi=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?select=chave,orcamento_id,item_descricao&limit=200000",SB_KEY) or []
+    catset={c["chave_canonica"] for c in cat}
+    uso=defaultdict(set); exemplo={}
+    for r in vi:
+        k=r.get("chave")
+        if not k: continue
+        uso[k].add(r.get("orcamento_id"))
+        if k not in exemplo and r.get("item_descricao"): exemplo[k]=r.get("item_descricao")
     for c in cat:
         c["uso"]=len(uso.get(c["chave_canonica"], ()))
         c["sem_classif"]=not (c.get("classificacao") or "").strip()
-    sem=sum(1 for c in cat if c["sem_classif"])
-    cat.sort(key=lambda c:(0 if c["sem_classif"] else 1, (c.get("grupo") or "").upper(), (c.get("descricao_exemplo") or "")))
+        c["sem_catalogo"]=False
+    orfaos=[{"chave_canonica":k,"descricao_exemplo":exemplo.get(k,k),"grupo":None,
+             "classificacao":"","permitido":False,"permitido_manual":False,
+             "uso":len(orcs),"sem_classif":True,"sem_catalogo":True}
+            for k,orcs in uso.items() if k not in catset]
+    itens=orfaos+cat
+    sem=sum(1 for c in itens if c["sem_classif"])
+    itens.sort(key=lambda c:(0 if c["sem_classif"] else 1, (c.get("grupo") or "").upper(), (c.get("descricao_exemplo") or "")))
     grp=defaultdict(lambda:{"n":0,"perm":0,"uso":0})
-    for c in cat:
+    for c in itens:
         g=grp[c.get("grupo") or "(sem grupo)"]; g["n"]+=1; g["perm"]+=(1 if c.get("permitido") else 0); g["uso"]+=c["uso"]
     grupos=[{"grupo":k,"itens":v["n"],"permitidos":v["perm"],"uso":v["uso"]} for k,v in sorted(grp.items())]
-    return {"itens":cat,"grupos":grupos,"sem_classificacao":sem,"total":len(cat)}
+    return {"itens":itens,"grupos":grupos,"sem_classificacao":sem,"total":len(itens),"sem_catalogo_qtd":len(orfaos)}
 
 @app.post("/aud/classificar")
 async def aud_classificar(request: Request):
@@ -5359,10 +5376,15 @@ async def aud_classificar(request: Request):
     if not chave: raise HTTPException(400,"chave vazia")
     if cls and cls not in _AUD_CLASSES: raise HTTPException(400,"classificação inválida")
     row=_sb_json(f"{SB_URL}/rest/v1/itens_catalogo?chave_canonica=eq.{_qk(chave)}&select=permitido_manual&limit=1",SB_KEY) or []
-    patch={"classificacao":cls,"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}
-    if not (row and row[0].get("permitido_manual")):   # permissão automática segue a classificação
-        patch["permitido"]=(cls=="MATERIAL")
-    _sb_write(f"itens_catalogo?chave_canonica=eq.{_qk(chave)}", patch, method="PATCH")
+    if row:  # já existe no catálogo → PATCH
+        patch={"classificacao":cls,"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}
+        if not row[0].get("permitido_manual"):   # permissão automática segue a classificação
+            patch["permitido"]=(cls=="MATERIAL")
+        _sb_write(f"itens_catalogo?chave_canonica=eq.{_qk(chave)}", patch, method="PATCH")
+    else:    # item órfão (aparecia só nos orçamentos) → cria a linha no catálogo
+        _sb_write("itens_catalogo", {"chave_canonica":chave,"descricao_exemplo":_aud_exemplo(chave),
+                  "classificacao":cls,"permitido":(cls=="MATERIAL"),"permitido_manual":False,
+                  "criado_por":u["id"],"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, method="POST")
     log_frotahub(u["id"],p.get("papel"),"AUDITORIA","CLASSIFICAR",f"{chave} -> {cls or '(sem)'}")
     return {"ok":True}
 
@@ -5370,8 +5392,14 @@ async def aud_classificar(request: Request):
 async def aud_permitir(request: Request):
     u,p=_exige_auditoria(request); b=await request.json()
     chave=(b.get("chave") or "").strip(); permitir=bool(b.get("permitir"))
-    _sb_write(f"itens_catalogo?chave_canonica=eq.{_qk(chave)}",
-              {"permitido":permitir,"permitido_manual":True,"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, method="PATCH")
+    row=_sb_json(f"{SB_URL}/rest/v1/itens_catalogo?chave_canonica=eq.{_qk(chave)}&select=chave_canonica&limit=1",SB_KEY) or []
+    if row:
+        _sb_write(f"itens_catalogo?chave_canonica=eq.{_qk(chave)}",
+                  {"permitido":permitir,"permitido_manual":True,"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, method="PATCH")
+    else:    # item órfão → cria a linha (sem classificação ainda)
+        _sb_write("itens_catalogo", {"chave_canonica":chave,"descricao_exemplo":_aud_exemplo(chave),
+                  "classificacao":"","permitido":permitir,"permitido_manual":True,
+                  "criado_por":u["id"],"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, method="POST")
     log_frotahub(u["id"],p.get("papel"),"AUDITORIA","PERMITIR",f"{chave} -> {'S' if permitir else 'N'}")
     return {"ok":True}
 
@@ -5417,13 +5445,13 @@ def aud_orcamento(request: Request, id: str=""):
     hdr=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{id}&select=id,ticket,loja_nome,aba,valor_orcamento,lancado,rateio,criado_em,comprador,fornecedor,itens&limit=1",SB_KEY) or []
     if not hdr: raise HTTPException(404,"orçamento não encontrado")
     o=hdr[0]; raw=o.get("itens") or []
-    cls=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?orcamento_id=eq.{id}&select=item_descricao,classificacao,permitido,sem_catalogo&limit=1000",SB_KEY) or []
+    cls=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?orcamento_id=eq.{id}&select=item_descricao,chave,classificacao,permitido,sem_catalogo&limit=1000",SB_KEY) or []
     cmap={c.get("item_descricao"):c for c in cls}
     merged=[]
     for it in raw:
         c=cmap.get(it.get("descricao"),{})
         merged.append({"descricao":it.get("descricao"),"quant":it.get("quant"),"unid":it.get("unid"),
-                       "valor_unit":it.get("valor_unit"),
+                       "valor_unit":it.get("valor_unit"),"chave":c.get("chave"),
                        "classificacao":c.get("classificacao") or "","permitido":bool(c.get("permitido")),
                        "sem_catalogo":c.get("sem_catalogo", True)})
     cab={k:o.get(k) for k in ("id","ticket","loja_nome","aba","valor_orcamento","lancado","rateio","criado_em","comprador","fornecedor")}
