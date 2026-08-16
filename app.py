@@ -5400,6 +5400,23 @@ async def aud_permitir(request: Request):
     log_frotahub(u["id"],p.get("papel"),"AUDITORIA","PERMITIR",f"{chave} -> {'S' if permitir else 'N'}")
     return {"ok":True}
 
+@app.post("/aud/grupo")
+async def aud_grupo(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_auditoria(request); b=await request.json()
+    chave=(b.get("chave") or "").strip(); grupo=(b.get("grupo") or "").strip() or None
+    if not chave: raise HTTPException(400,"chave vazia")
+    row=_sb_json(f"{SB_URL}/rest/v1/itens_catalogo?chave_canonica=eq.{_qk(chave)}&select=chave_canonica&limit=1",SB_KEY) or []
+    if row:
+        _sb_write(f"itens_catalogo?chave_canonica=eq.{_qk(chave)}",
+                  {"grupo":grupo,"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, method="PATCH")
+    else:    # item órfão → cria a linha
+        _sb_write("itens_catalogo", {"chave_canonica":chave,"descricao_exemplo":_aud_exemplo(chave),"grupo":grupo,
+                  "classificacao":"","permitido":False,"permitido_manual":False,
+                  "criado_por":u["id"],"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, method="POST")
+    log_frotahub(u["id"],p.get("papel"),"AUDITORIA","GRUPO",f"{chave} -> {grupo or '(sem)'}")
+    return {"ok":True}
+
 @app.post("/aud/excluir_item")
 async def aud_excluir_item(request: Request):
     from fastapi import HTTPException
