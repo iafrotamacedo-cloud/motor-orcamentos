@@ -2852,12 +2852,27 @@ def _gh_dispatch_wf(workflow, inputs=None):
         "X-GitHub-Api-Version":"2022-11-28","User-Agent":"frotahub-motor","Content-Type":"application/json"})
     urllib.request.urlopen(req,timeout=30); return True
 
+def _exige_lancar(request):
+    """Tela de lançar: aceita quem tem GERAR_ORCAMENTOS (builder/gerente/ceo e afins)
+    OU a permissão dedicada LANCAR_TRILOGO (ex.: categoria Manutenção)."""
+    from fastapi import HTTPException
+    u=auth_user(_bearer(request))
+    if not u or not u.get("id"): raise HTTPException(401,"não autenticado")
+    p=perfil_de(u["id"])
+    if not p or p.get("ativo") is False: raise HTTPException(403,"usuário sem perfil ativo")
+    if not (pode_rotina(p,"GERAR_ORCAMENTOS") or pode_rotina(p,"LANCAR_TRILOGO")):
+        raise HTTPException(403,"sem permissão para lançar no Trílogo")
+    return u,p
+
 def _lancar_itens(access):
     """Orçamentos a lançar: pastas 1 (normais) e 4 (rateio). Casa cada arquivo com o
     notas_orcamento pra pegar ticket/valor/aba. Só entra o que ainda está em 1/4."""
     ob=_orc_base(access,_manut_base(access))
     P1=_pasta_manut(access,1,ob); P4=_pasta_manut(access,4,ob)
-    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome,lancado&limit=8000",SB_KEY) or []
+    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome,lancado&limit=8000",SB_KEY) or []
+    # ids de orçamentos com ALGUM item não permitido (suspeitos) — pra marcar na lista de lançar
+    _susp_rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_suspeitos?select=orcamento_id&limit=20000",SB_KEY) or []
+    susp_ids={r.get("orcamento_id") for r in _susp_rows}
     def _match(nome, origem):
         alvo=f"{origem}/{nome}"
         for o in orcs:
@@ -2884,14 +2899,15 @@ def _lancar_itens(access):
                 "ticket":str(o.get("ticket") or tkp),"aba":o.get("aba") or "",
                 "valor":round(_numf(o.get("valor_orcamento")),2) if o.get("valor_orcamento") is not None else None,
                 "loja":(_loja_padrao(lnome) if lnome else ljp),"rateio":bool(o.get("rateio")) or (origem=="4"),
-                "lancado":bool(o.get("lancado")),"sem_registro":sem_reg})
+                "lancado":bool(o.get("lancado")),"sem_registro":sem_reg,
+                "suspeito":bool(o.get("id") and o.get("id") in susp_ids)})
     itens.sort(key=lambda x:(x["origem"],x["arquivo"].lower()))
     return itens
 
 @app.get("/orc/lancar_worklist")
 def orc_lancar_worklist(request: Request):
     from fastapi import HTTPException
-    exige(request,"GERAR_ORCAMENTOS")
+    _exige_lancar(request)
     if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
     itens=_lancar_itens(dropbox_rateio.obter_token())
     return {"total":len(itens),"itens":itens}
@@ -2902,7 +2918,7 @@ _LANCAR_PROG={"itens":{},"atualizado":None}   # {arquivo: {status,pct}} — prog
 def orc_lancar_ver(request: Request, origem: str="", nome: str=""):
     """Visualiza o PDF do orçamento (pasta 1 ou 4) pelo site."""
     from fastapi import HTTPException
-    exige(request,"GERAR_ORCAMENTOS")
+    _exige_lancar(request)
     if origem not in ("1","4") or not _seg_ok(nome): raise HTTPException(400,"parâmetros inválidos")
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
     base=_pasta_manut(access,int(origem),ob)
@@ -2915,7 +2931,7 @@ def orc_lancar_ver(request: Request, origem: str="", nome: str=""):
 async def orc_lancar_disparar(request: Request):
     """alvo vazio = LANÇAR TODOS (exige PIN); alvo 'origem/arquivo' = lançar só um (sem PIN)."""
     from fastapi import HTTPException
-    u,p=exige(request,"GERAR_ORCAMENTOS")
+    u,p=_exige_lancar(request)
     b={}
     try: b=await request.json()
     except Exception: pass
@@ -2932,7 +2948,7 @@ async def orc_lancar_disparar(request: Request):
 
 @app.get("/orc/lancar_status")
 def orc_lancar_status(request: Request):
-    exige(request,"GERAR_ORCAMENTOS")
+    _exige_lancar(request)
     out={"progresso":_LANCAR_PROG.get("itens",{}),"atualizado":_LANCAR_PROG.get("atualizado"),"gh":None}
     if GH_TOKEN and GH_REPO:
         url=f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{urllib.parse.quote(GH_WF_LANCAR)}/runs?per_page=1"
@@ -3170,7 +3186,7 @@ async def robot_conferir_resultado(request: Request):
 async def orc_conferir_disparar(request: Request):
     """Dispara o robô em modo CONFERÊNCIA (só lê custos, não lança). Builder/gerente."""
     from fastapi import HTTPException
-    u,p=exige(request,"GERAR_ORCAMENTOS")
+    u,p=_exige_lancar(request)
     # read-only (não move nada): liberado para todos que já têm acesso à página de lançar
     _CONFERIR["itens"]={}; _CONFERIR["atualizado"]=_agora().isoformat()
     try: _gh_dispatch_wf(GH_WF_LANCAR,{"modo":"conferir","alvo":""})
@@ -3182,7 +3198,7 @@ async def orc_conferir_disparar(request: Request):
 @app.get("/orc/conferir_status")
 def orc_conferir_status(request: Request):
     from fastapi import HTTPException
-    u,p=exige(request,"GERAR_ORCAMENTOS")
+    u,p=_exige_lancar(request)
     itens=_CONFERIR.get("itens",{})
     vals=list(itens.values())
     resumo={
