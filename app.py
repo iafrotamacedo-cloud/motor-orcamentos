@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 116
+#  CONTADOR DE REVISÕES DESTE app.py: 117
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -756,6 +756,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+APP_REV = 117   # bater com o contador do topo; conferir no /versao ou no log do boot
+print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
+
+@app.get("/versao")
+def _versao():
+    return {"rev": APP_REV}
 
 @app.exception_handler(Exception)
 async def _erro_com_cors(request, exc):
