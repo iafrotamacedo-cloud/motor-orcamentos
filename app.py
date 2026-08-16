@@ -5343,22 +5343,19 @@ def aud_catalogo(request: Request):
     _exige_auditoria(request)
     from collections import defaultdict
     cat=_sb_json(f"{SB_URL}/rest/v1/itens_catalogo?select=chave_canonica,descricao_exemplo,grupo,classificacao,permitido,permitido_manual&limit=5000",SB_KEY) or []
-    vi=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?select=chave,orcamento_id,item_descricao&limit=200000",SB_KEY) or []
+    # view AGREGADA: 1 linha por item distinto (evita truncamento do PostgREST)
+    chaves=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_chaves?select=chave,descricao_exemplo,uso,sem_catalogo&limit=20000",SB_KEY) or []
     catset={c["chave_canonica"] for c in cat}
-    uso=defaultdict(set); exemplo={}
-    for r in vi:
-        k=r.get("chave")
-        if not k: continue
-        uso[k].add(r.get("orcamento_id"))
-        if k not in exemplo and r.get("item_descricao"): exemplo[k]=r.get("item_descricao")
+    usomap={ch.get("chave"):ch for ch in chaves}
     for c in cat:
-        c["uso"]=len(uso.get(c["chave_canonica"], ()))
+        info=usomap.get(c["chave_canonica"]) or {}
+        c["uso"]=info.get("uso",0)
         c["sem_classif"]=not (c.get("classificacao") or "").strip()
         c["sem_catalogo"]=False
-    orfaos=[{"chave_canonica":k,"descricao_exemplo":exemplo.get(k,k),"grupo":None,
+    orfaos=[{"chave_canonica":ch["chave"],"descricao_exemplo":ch.get("descricao_exemplo") or ch["chave"],"grupo":None,
              "classificacao":"","permitido":False,"permitido_manual":False,
-             "uso":len(orcs),"sem_classif":True,"sem_catalogo":True}
-            for k,orcs in uso.items() if k not in catset]
+             "uso":ch.get("uso",0),"sem_classif":True,"sem_catalogo":True}
+            for ch in chaves if ch.get("sem_catalogo") and ch.get("chave") not in catset]
     itens=orfaos+cat
     sem=sum(1 for c in itens if c["sem_classif"])
     itens.sort(key=lambda c:(0 if c["sem_classif"] else 1, (c.get("grupo") or "").upper(), (c.get("descricao_exemplo") or "")))
@@ -5426,16 +5423,12 @@ def aud_conferir(request: Request, chave: str="", grupo: str=""):
 
 @app.get("/aud/orcamentos_auditoria")
 def aud_orcamentos_auditoria(request: Request):
-    """Todos os orçamentos com ALGUM item permitido=N."""
+    """Todos os orçamentos com ALGUM item permitido=N (view agregada, sem truncamento)."""
     _exige_auditoria(request)
-    from collections import defaultdict
-    rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?permitido=eq.false&select=orcamento_id,ticket,loja_nome,valor_orcamento,lancado,criado_em,comprador,fornecedor,item_descricao&limit=200000",SB_KEY) or []
-    orc={}; susp=defaultdict(list)
+    rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_suspeitos?select=orcamento_id,ticket,loja_nome,valor_orcamento,lancado,criado_em,comprador,fornecedor,suspeitos&order=criado_em.desc&limit=20000",SB_KEY) or []
     for r in rows:
-        oid=r["orcamento_id"]
-        orc[oid]={k:r.get(k) for k in ("orcamento_id","ticket","loja_nome","valor_orcamento","lancado","criado_em","comprador","fornecedor")}
-        susp[oid].append(r.get("item_descricao"))
-    return {"orcamentos":[{**v,"suspeitos":susp[k]} for k,v in orc.items()]}
+        r["suspeitos"]=r.get("suspeitos") or []
+    return {"orcamentos":rows}
 
 @app.get("/aud/orcamento")
 def aud_orcamento(request: Request, id: str=""):
