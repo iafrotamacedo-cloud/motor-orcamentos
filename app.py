@@ -756,6 +756,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(Exception)
+async def _erro_com_cors(request, exc):
+    # 500 não tratado sai por fora do CORS e vira "Failed to fetch" no navegador.
+    # Aqui devolvemos a mensagem REAL já com o cabeçalho CORS, pra dar pra diagnosticar.
+    import traceback; traceback.print_exc()
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"},
+                        headers={"Access-Control-Allow-Origin": "*"})
+
 RESULTS = {}   # token -> caminho da planilha de controle p/ download
 
 PAGINA = """<!doctype html><html lang="pt-br"><head><meta charset="utf-8">
