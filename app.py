@@ -5486,6 +5486,14 @@ def _aud_loja(o):
     if not loja: loja=loja_cadastro(o.get("loja_nome") or "")
     return loja
 
+def _aud_abs(access, ob, rel):
+    """Converte arquivo_pdf ('N/resto...') no caminho ABSOLUTO no Dropbox (usa a pasta N real)."""
+    if not rel or "/" not in rel: return None
+    pref,resto=rel.split("/",1)
+    try: base=_pasta_manut(access,int(pref),ob)
+    except Exception: return None
+    return f"{base}/{resto}" if base else None
+
 def _aud_dados_pdf(o, loja, itens):
     ln=o.get("loja_nome") or (loja.get("nome") if loja else None) or "—"
     cid=(loja.get("cidade") if loja else None)
@@ -5501,7 +5509,7 @@ async def aud_editar_orcamento(request: Request):
     u,p=_exige_auditoria(request); b=await request.json()
     oid=(b.get("id") or "").strip(); itens=b.get("itens") or []
     if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
-    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,loja_nome,loja_numero,rateio,lancado,status,mes_ref,arquivo_pdf,arquivo_doc&limit=1",SB_KEY) or []
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,nota_numero,loja_nome,loja_numero,rateio,lancado,status,mes_ref,extrapolado,arquivo_pdf,arquivo_doc&limit=1",SB_KEY) or []
     if not row: raise HTTPException(404,"orçamento não encontrado")
     o=row[0]
     if o.get("status")!="gerado": raise HTTPException(409,"orçamento não está ativo")
@@ -5515,22 +5523,31 @@ async def aud_editar_orcamento(request: Request):
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
     loja=_aud_loja(o); slug=_slug_loja(loja,o.get("loja_nome"))
     pdf_bytes=gera_orcamento_pdf(_aud_dados_pdf(o,loja,itens))
-    rateio=bool(o.get("rateio")); destino=9 if extrap else (4 if rateio else 1)
-    ap=str(o.get("arquivo_pdf") or ""); cur=ap.split("/")[0] if "/" in ap else ""
-    nome=os.path.basename(ap) if ap else f"{slug}_{o.get('ticket')}_NOTA_SN.pdf"
+    rateio=bool(o.get("rateio"))
+    destino=9 if extrap else (4 if rateio else 1)                       # pasta ativa NOVA
+    origem=9 if bool(o.get("extrapolado")) else (4 if rateio else 1)    # pasta ativa ANTIGA (pelo estado, não pelo prefixo)
+    ap=str(o.get("arquivo_pdf") or "")
+    nome=os.path.basename(ap) if ap else f"{slug}_{o.get('ticket')}_NOTA_{o.get('nota_numero') or 'SN'}.pdf"
     if not nome.lower().endswith(".pdf"): nome=os.path.splitext(nome)[0]+".pdf"
     mes=o.get("mes_ref") or _mes_atual(); erros=[]
-    Pdest=_pasta_manut(access,destino,ob); Pmaster=_pasta_manut(access,(11 if rateio else 10),ob)
+    Pdest=_pasta_manut(access,destino,ob)
+    apnum=ap.split("/",1)[0] if "/" in ap else ""
     try:
         if Pdest: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{Pdest}/{nome}",overwrite=True)
     except Exception as e: erros.append(f"destino: {str(e)[:80]}")
     try:
-        if Pmaster:
-            dropbox_rateio.criar_pasta(access,f"{Pmaster}/{mes}"); dropbox_rateio.criar_pasta(access,f"{Pmaster}/{mes}/{slug}")
-            dropbox_rateio.subir_bytes(access,pdf_bytes,f"{Pmaster}/{mes}/{slug}/{nome}",overwrite=True)
+        if apnum in ("10","11"):        # arquivo_pdf já é o caminho exato do mestre → sobrescreve nele
+            master_abs=_aud_abs(access,ob,ap)
+        else:                            # reconstrói (mês/slug) — caso raro
+            Pmaster=_pasta_manut(access,(11 if rateio else 10),ob)
+            master_abs=None
+            if Pmaster:
+                dropbox_rateio.criar_pasta(access,f"{Pmaster}/{mes}"); dropbox_rateio.criar_pasta(access,f"{Pmaster}/{mes}/{slug}")
+                master_abs=f"{Pmaster}/{mes}/{slug}/{nome}"
+        if master_abs: dropbox_rateio.subir_bytes(access,pdf_bytes,master_abs,overwrite=True)
     except Exception as e: erros.append(f"mestre: {str(e)[:80]}")
-    if cur and cur!=str(destino) and cur in ("1","4","9") and nome:   # mudou de pasta ativa → tira o antigo
-        Pold=_pasta_manut(access,int(cur),ob)
+    if origem!=destino and nome:   # mudou de pasta ativa (ex.: 1→9 ao extrapolar) → tira o antigo da pasta antiga
+        Pold=_pasta_manut(access,origem,ob)
         try:
             if Pold: dropbox_rateio.apagar(access,f"{Pold}/{nome}")
         except Exception as e: erros.append(f"remover antigo: {str(e)[:80]}")
@@ -5554,19 +5571,28 @@ async def aud_excluir_orcamento(request: Request):
     u,p=_exige_auditoria(request); b=await request.json()
     oid=(b.get("id") or "").strip(); motivo=(b.get("motivo") or "auditoria").strip()[:200]
     if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
-    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,rateio,lancado,status,arquivo_pdf&limit=1",SB_KEY) or []
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,rateio,lancado,status,extrapolado,arquivo_pdf&limit=1",SB_KEY) or []
     if not row: raise HTTPException(404,"orçamento não encontrado")
     o=row[0]
     if o.get("status")!="gerado": raise HTTPException(409,"orçamento não está ativo")
     if o.get("lancado"): raise HTTPException(409,"orçamento já lançado — exclusão é da Fase 3")
     erros=[]
     ap=str(o.get("arquivo_pdf") or ""); cur=ap.split("/")[0] if "/" in ap else ""; nome=os.path.basename(ap) if ap else ""
-    if cur in ("1","4","9") and nome:   # tira o PDF ativo (vai p/ lixeira do Dropbox, recuperável); MANTÉM o mestre 10/11
+    # pasta ativa pelo ESTADO (não pelo prefixo, que às vezes aponta pro mestre 10/11)
+    ativa=9 if bool(o.get("extrapolado")) else (4 if bool(o.get("rateio")) else 1)
+    if nome:   # tira o PDF ativo (vai p/ lixeira do Dropbox, recuperável); MANTÉM o mestre 10/11
         try:
             access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
-            Pold=_pasta_manut(access,int(cur),ob)
-            if Pold: dropbox_rateio.apagar(access,f"{Pold}/{nome}")
+            alvos={ativa}
+            if cur in ("1","4","9"): alvos.add(int(cur))   # e também onde o prefixo aponta, se for pasta ativa
+            for n in alvos:
+                Pn=_pasta_manut(access,n,ob)
+                if Pn:
+                    try: dropbox_rateio.apagar(access,f"{Pn}/{nome}")
+                    except Exception: pass
         except Exception as e: erros.append(str(e)[:100])
+    else:
+        erros.append("sem arquivo_pdf no registro — nada removido do Dropbox (rode a reconciliação de arquivos)")
     _sb_write(f"notas_orcamento?id=eq.{oid}",
               {"status":"removido","removido_motivo":motivo,"removido_em":_agora().isoformat(),"removido_por":u["id"]}, "PATCH")
     log_frotahub(u["id"],p.get("papel"),"AUDITORIA","EXCLUIR_ORCAMENTO",f"{o.get('ticket')} ({motivo})"+(f" | erros: {'; '.join(erros)}" if erros else ""))
@@ -5593,12 +5619,18 @@ async def aud_restaurar_orcamento(request: Request):
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
     loja=_aud_loja(o); slug=_slug_loja(loja,o.get("loja_nome"))
     ap=str(o.get("arquivo_pdf") or ""); nome=os.path.basename(ap) if ap else ""
+    apnum=ap.split("/",1)[0] if "/" in ap else ""
     rateio=bool(o.get("rateio")); extrap=bool(o.get("extrapolado")); destino=9 if extrap else (4 if rateio else 1)
     mes=o.get("mes_ref") or _mes_atual(); erros=[]; restaurado=False
-    Pmaster=_pasta_manut(access,(11 if rateio else 10),ob); Pdest=_pasta_manut(access,destino,ob)
-    if nome and Pmaster and Pdest:
+    Pdest=_pasta_manut(access,destino,ob)
+    # fonte = o mestre. Se arquivo_pdf já aponta pro 10/11, usa o caminho exato; senão reconstrói.
+    if apnum in ("10","11"): src=_aud_abs(access,ob,ap)
+    else:
+        Pmaster=_pasta_manut(access,(11 if rateio else 10),ob)
+        src=f"{Pmaster}/{mes}/{slug}/{nome}" if (Pmaster and nome) else None
+    if src and Pdest and nome:
         try:
-            dropbox_rateio.copiar(access,f"{Pmaster}/{mes}/{slug}/{nome}",f"{Pdest}/{nome}"); restaurado=True
+            dropbox_rateio.copiar(access,src,f"{Pdest}/{nome}"); restaurado=True
         except Exception as e: erros.append(f"copiar do mestre: {str(e)[:100]}")
     if not restaurado: erros.append("PDF não recuperado do mestre (10/11) — recupere da lixeira do Dropbox manualmente")
     _sb_write(f"notas_orcamento?id=eq.{oid}",
