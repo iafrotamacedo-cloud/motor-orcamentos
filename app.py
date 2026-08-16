@@ -3822,7 +3822,7 @@ def _orc_job_run(job, previa, uid, papel):
                     arq_pdf=arq_doc=None
                     try:
                         if extrap:
-                            if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                            if P9: dropbox_rateio.subir_bytes(access,gera_orcamento_pdf(dados),f"{P9}/{base_nome}.pdf",overwrite=True); arq_pdf=f"9/{base_nome}.pdf"   # extrapolado agora em PDF (antes DOCX)
                         else:
                             pdf_bytes=gera_orcamento_pdf(dados)
                             if P1: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P1}/{base_nome}.pdf",overwrite=True)
@@ -4230,7 +4230,7 @@ def _rat_job_run(job, dados_job, uid, papel):
             try:
                 doc_bytes=gera_orcamento_docx(dados)
                 if extrap:
-                    if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                    if P9: dropbox_rateio.subir_bytes(access,gera_orcamento_pdf(dados),f"{P9}/{base_nome}.pdf",overwrite=True); arq_pdf=f"9/{base_nome}.pdf"   # extrapolado agora em PDF (antes DOCX)
                 else:
                     pdf_bytes=gera_orcamento_pdf(dados)
                     if P4: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P4}/{base_nome}.pdf",overwrite=True); arq_pdf=f"4/{base_nome}.pdf"
@@ -4366,7 +4366,7 @@ def _corr_job_run(job, uid, papel):
             try:
                 doc_bytes=gera_orcamento_docx(dados)
                 if extrap:
-                    if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                    if P9: dropbox_rateio.subir_bytes(access,gera_orcamento_pdf(dados),f"{P9}/{base_nome}.pdf",overwrite=True); arq_pdf=f"9/{base_nome}.pdf"   # extrapolado agora em PDF (antes DOCX)
                 else:
                     pdf_bytes=gera_orcamento_pdf(dados)
                     if P1: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P1}/{base_nome}.pdf",overwrite=True)
@@ -4540,7 +4540,7 @@ def _txt_job_run(job, notas, uid, papel):
             try:
                 doc_bytes=gera_orcamento_docx(dados)
                 if extrap:
-                    if P9: dropbox_rateio.subir_bytes(access,doc_bytes,f"{P9}/{base_nome}.docx",overwrite=True); arq_doc=f"9/{base_nome}.docx"
+                    if P9: dropbox_rateio.subir_bytes(access,gera_orcamento_pdf(dados),f"{P9}/{base_nome}.pdf",overwrite=True); arq_pdf=f"9/{base_nome}.pdf"   # extrapolado agora em PDF (antes DOCX)
                 else:
                     pdf_bytes=gera_orcamento_pdf(dados)
                     if P1: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{P1}/{base_nome}.pdf",overwrite=True)
@@ -5467,17 +5467,145 @@ def aud_orcamento(request: Request, id: str=""):
     cab={k:o.get(k) for k in ("id","ticket","loja_nome","aba","valor_orcamento","lancado","rateio","criado_em","comprador","fornecedor")}
     return {"orcamento":cab,"itens":merged,"sem_itens":(len(raw)==0)}
 
+# ---- Fase 2: editar/excluir/restaurar orçamento NÃO lançado (refaz PDF + roteia pastas) ----
+def _aud_num(v):
+    try: return float(v or 0)
+    except Exception: return 0.0
+
+def _aud_calc(itens):
+    """Recalcula valor bruto (nota) e valor do orçamento (+20%, MESMA conta do PDF)."""
+    bruto=0.0; final=0.0
+    for it in itens:
+        vu=_aud_num(it.get("valor_unit")); q=_aud_num(it.get("quant"))
+        bruto+=vu*q; final+=round(round(vu*1.20,2)*q,2)
+    return round(bruto,2), round(final,2)
+
+def _aud_loja(o):
+    loja=None
+    if o.get("loja_numero") is not None: loja=CAD.get(str(o["loja_numero"]).zfill(2))
+    if not loja: loja=loja_cadastro(o.get("loja_nome") or "")
+    return loja
+
+def _aud_dados_pdf(o, loja, itens):
+    ln=o.get("loja_nome") or (loja.get("nome") if loja else None) or "—"
+    cid=(loja.get("cidade") if loja else None)
+    return {"num":o.get("ticket"),"revisao":1,"data":_hoje().strftime("%d/%m/%Y"),"loja_nome":ln,
+        "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
+        "tomador":{"nome":f"Mercadinhos São Luiz — {ln.title()}","cnpj":(loja.get("cnpj") if loja else None),
+                   "endereco":(loja.get("endereco") if loja else None),"cidade":(cid or "")+(" - CE" if cid else "")},
+        "itens":[{"descricao":it.get("descricao"),"quant":_aud_num(it.get("quant")),"unid":it.get("unid") or "UN","valor_unit":_aud_num(it.get("valor_unit"))} for it in itens]}
+
 @app.post("/aud/editar_orcamento")
 async def aud_editar_orcamento(request: Request):
     from fastapi import HTTPException
-    _exige_auditoria(request)
-    raise HTTPException(501,"Edição de orçamento — disponível na Fase 2.")
+    u,p=_exige_auditoria(request); b=await request.json()
+    oid=(b.get("id") or "").strip(); itens=b.get("itens") or []
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,loja_nome,loja_numero,rateio,lancado,status,mes_ref,arquivo_pdf,arquivo_doc&limit=1",SB_KEY) or []
+    if not row: raise HTTPException(404,"orçamento não encontrado")
+    o=row[0]
+    if o.get("status")!="gerado": raise HTTPException(409,"orçamento não está ativo")
+    if o.get("lancado"): raise HTTPException(409,"orçamento já lançado — edição é da Fase 3")
+    itens=[{"descricao":(it.get("descricao") or "").strip(),"quant":_aud_num(it.get("quant")),
+            "unid":(it.get("unid") or "UN"),"valor_unit":_aud_num(it.get("valor_unit"))}
+           for it in itens if (it.get("descricao") or "").strip()]
+    if not itens: raise HTTPException(400,"itens vazios — para remover o orçamento inteiro use Excluir")
+    bruto,final=_aud_calc(itens); extrap=bruto>ORC_EXTRAPOLA
+    if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    loja=_aud_loja(o); slug=_slug_loja(loja,o.get("loja_nome"))
+    pdf_bytes=gera_orcamento_pdf(_aud_dados_pdf(o,loja,itens))
+    rateio=bool(o.get("rateio")); destino=9 if extrap else (4 if rateio else 1)
+    ap=str(o.get("arquivo_pdf") or ""); cur=ap.split("/")[0] if "/" in ap else ""
+    nome=os.path.basename(ap) if ap else f"{slug}_{o.get('ticket')}_NOTA_SN.pdf"
+    if not nome.lower().endswith(".pdf"): nome=os.path.splitext(nome)[0]+".pdf"
+    mes=o.get("mes_ref") or _mes_atual(); erros=[]
+    Pdest=_pasta_manut(access,destino,ob); Pmaster=_pasta_manut(access,(11 if rateio else 10),ob)
+    try:
+        if Pdest: dropbox_rateio.subir_bytes(access,pdf_bytes,f"{Pdest}/{nome}",overwrite=True)
+    except Exception as e: erros.append(f"destino: {str(e)[:80]}")
+    try:
+        if Pmaster:
+            dropbox_rateio.criar_pasta(access,f"{Pmaster}/{mes}"); dropbox_rateio.criar_pasta(access,f"{Pmaster}/{mes}/{slug}")
+            dropbox_rateio.subir_bytes(access,pdf_bytes,f"{Pmaster}/{mes}/{slug}/{nome}",overwrite=True)
+    except Exception as e: erros.append(f"mestre: {str(e)[:80]}")
+    if cur and cur!=str(destino) and cur in ("1","4","9") and nome:   # mudou de pasta ativa → tira o antigo
+        Pold=_pasta_manut(access,int(cur),ob)
+        try:
+            if Pold: dropbox_rateio.apagar(access,f"{Pold}/{nome}")
+        except Exception as e: erros.append(f"remover antigo: {str(e)[:80]}")
+    adoc=str(o.get("arquivo_doc") or "")   # extrapolado antigo era DOCX na 9 → tira o docx
+    if adoc.startswith("9/"):
+        P9=_pasta_manut(access,9,ob)
+        try:
+            if P9: dropbox_rateio.apagar(access,f"{P9}/{os.path.basename(adoc)}")
+        except Exception: pass
+    _sb_write(f"notas_orcamento?id=eq.{oid}",
+              {"itens":itens,"valor_orcamento":final,"valor_nota":bruto,"extrapolado":extrap,
+               "arquivo_pdf":f"{destino}/{nome}","arquivo_doc":None,
+               "atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, "PATCH")
+    log_frotahub(u["id"],p.get("papel"),"AUDITORIA","EDITAR_ORCAMENTO",
+                 f"{o.get('ticket')} -> R${final:.2f}{' EXTRAP(9)' if extrap else ''}"+(f" | erros: {'; '.join(erros)}" if erros else ""))
+    return {"ok":True,"valor_orcamento":final,"extrapolado":extrap,"pasta":destino,"erros":erros}
 
 @app.post("/aud/excluir_orcamento")
 async def aud_excluir_orcamento(request: Request):
     from fastapi import HTTPException
+    u,p=_exige_auditoria(request); b=await request.json()
+    oid=(b.get("id") or "").strip(); motivo=(b.get("motivo") or "auditoria").strip()[:200]
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,rateio,lancado,status,arquivo_pdf&limit=1",SB_KEY) or []
+    if not row: raise HTTPException(404,"orçamento não encontrado")
+    o=row[0]
+    if o.get("status")!="gerado": raise HTTPException(409,"orçamento não está ativo")
+    if o.get("lancado"): raise HTTPException(409,"orçamento já lançado — exclusão é da Fase 3")
+    erros=[]
+    ap=str(o.get("arquivo_pdf") or ""); cur=ap.split("/")[0] if "/" in ap else ""; nome=os.path.basename(ap) if ap else ""
+    if cur in ("1","4","9") and nome:   # tira o PDF ativo (vai p/ lixeira do Dropbox, recuperável); MANTÉM o mestre 10/11
+        try:
+            access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+            Pold=_pasta_manut(access,int(cur),ob)
+            if Pold: dropbox_rateio.apagar(access,f"{Pold}/{nome}")
+        except Exception as e: erros.append(str(e)[:100])
+    _sb_write(f"notas_orcamento?id=eq.{oid}",
+              {"status":"removido","removido_motivo":motivo,"removido_em":_agora().isoformat(),"removido_por":u["id"]}, "PATCH")
+    log_frotahub(u["id"],p.get("papel"),"AUDITORIA","EXCLUIR_ORCAMENTO",f"{o.get('ticket')} ({motivo})"+(f" | erros: {'; '.join(erros)}" if erros else ""))
+    return {"ok":True,"erros":erros}
+
+@app.get("/aud/orcamentos_apagados")
+def aud_orcamentos_apagados(request: Request):
+    """Orçamentos apagados nos últimos 30 dias (recuperáveis)."""
     _exige_auditoria(request)
-    raise HTTPException(501,"Exclusão de orçamento — disponível na Fase 2.")
+    desde=(_agora()-datetime.timedelta(days=30)).isoformat()
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.removido&removido_em=gte.{urllib.parse.quote(desde)}&select=id,ticket,loja_nome,valor_orcamento,rateio,extrapolado,removido_em,removido_motivo,arquivo_pdf,mes_ref&order=removido_em.desc&limit=5000",SB_KEY) or []
+    return {"orcamentos":rows}
+
+@app.post("/aud/restaurar_orcamento")
+async def aud_restaurar_orcamento(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_auditoria(request); b=await request.json()
+    oid=(b.get("id") or "").strip()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,loja_nome,loja_numero,rateio,extrapolado,status,mes_ref,arquivo_pdf&limit=1",SB_KEY) or []
+    if not row: raise HTTPException(404,"orçamento não encontrado")
+    o=row[0]
+    if o.get("status")!="removido": raise HTTPException(409,"orçamento não está apagado")
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    loja=_aud_loja(o); slug=_slug_loja(loja,o.get("loja_nome"))
+    ap=str(o.get("arquivo_pdf") or ""); nome=os.path.basename(ap) if ap else ""
+    rateio=bool(o.get("rateio")); extrap=bool(o.get("extrapolado")); destino=9 if extrap else (4 if rateio else 1)
+    mes=o.get("mes_ref") or _mes_atual(); erros=[]; restaurado=False
+    Pmaster=_pasta_manut(access,(11 if rateio else 10),ob); Pdest=_pasta_manut(access,destino,ob)
+    if nome and Pmaster and Pdest:
+        try:
+            dropbox_rateio.copiar(access,f"{Pmaster}/{mes}/{slug}/{nome}",f"{Pdest}/{nome}"); restaurado=True
+        except Exception as e: erros.append(f"copiar do mestre: {str(e)[:100]}")
+    if not restaurado: erros.append("PDF não recuperado do mestre (10/11) — recupere da lixeira do Dropbox manualmente")
+    _sb_write(f"notas_orcamento?id=eq.{oid}",
+              {"status":"gerado","removido_motivo":None,"removido_em":None,"removido_por":None,
+               "arquivo_pdf":(f"{destino}/{nome}" if nome else o.get("arquivo_pdf"))}, "PATCH")
+    log_frotahub(u["id"],p.get("papel"),"AUDITORIA","RESTAURAR_ORCAMENTO",f"{o.get('ticket')}"+(f" | erros: {'; '.join(erros)}" if erros else ""))
+    return {"ok":True,"restaurado":restaurado,"erros":erros}
 
 # ---- Camada de arquivos hot/cold + Backup (Supabase Storage <-> Dropbox) ----
 try:
