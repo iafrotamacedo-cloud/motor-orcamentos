@@ -5495,6 +5495,13 @@ def _aud_loja(o):
     if not loja: loja=loja_cadastro(o.get("loja_nome") or "")
     return loja
 
+def _aud_slug(o, loja):
+    """slug da loja tolerante: no cadastro o 'numero' é string ('04') e o _slug_loja faz num<100."""
+    l=dict(loja) if loja else {}
+    n=l.get("numero")
+    if isinstance(n,str): l["numero"]=int(n) if n.strip().isdigit() else None
+    return _slug_loja(l, o.get("loja_nome"))
+
 def _aud_abs(access, ob, rel):
     """Converte arquivo_pdf ('N/resto...') no caminho ABSOLUTO no Dropbox (usa a pasta N real)."""
     if not rel or "/" not in rel: return None
@@ -5530,7 +5537,7 @@ async def aud_editar_orcamento(request: Request):
     bruto,final=_aud_calc(itens); extrap=bruto>ORC_EXTRAPOLA
     if not dropbox_rateio.ativo(): raise HTTPException(500,"Dropbox não configurado")
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
-    loja=_aud_loja(o); slug=_slug_loja(loja,o.get("loja_nome"))
+    loja=_aud_loja(o); slug=_aud_slug(o,loja)
     pdf_bytes=gera_orcamento_pdf(_aud_dados_pdf(o,loja,itens))
     rateio=bool(o.get("rateio"))
     destino=9 if extrap else (4 if rateio else 1)                       # pasta ativa NOVA
@@ -5626,7 +5633,7 @@ async def aud_restaurar_orcamento(request: Request):
     o=row[0]
     if o.get("status")!="removido": raise HTTPException(409,"orçamento não está apagado")
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
-    loja=_aud_loja(o); slug=_slug_loja(loja,o.get("loja_nome"))
+    loja=_aud_loja(o); slug=_aud_slug(o,loja)
     ap=str(o.get("arquivo_pdf") or ""); nome=os.path.basename(ap) if ap else ""
     apnum=ap.split("/",1)[0] if "/" in ap else ""
     rateio=bool(o.get("rateio")); extrap=bool(o.get("extrapolado")); destino=9 if extrap else (4 if rateio else 1)
