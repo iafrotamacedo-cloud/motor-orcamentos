@@ -2873,33 +2873,40 @@ def _lancar_itens(access):
     # ids de orçamentos com ALGUM item não permitido (suspeitos) — pra marcar na lista de lançar
     _susp_rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_suspeitos?select=orcamento_id&limit=20000",SB_KEY) or []
     susp_ids={r.get("orcamento_id") for r in _susp_rows}
+    def _tk_do_nome(nome):
+        m=re.search(r'_(\d{4,7})(?:_NOTA_.*)?\.pdf$', nome, re.I)
+        return m.group(1) if m else None
     def _match(nome, origem):
-        alvo=f"{origem}/{nome}"
+        # 1) casa pelo NOME do arquivo (robusto ao prefixo: 1/ vs 10/MÊS/SLUG/)
         for o in orcs:
-            if str(o.get("arquivo_pdf") or "")==alvo: return o
-        for o in orcs:                                   # fallback: pelo ticket no nome
-            tk=str(o.get("ticket") or "")
-            if tk and (f"_{tk}_NOTA_" in nome or nome.endswith(f"_{tk}.pdf")): return o
+            ap=str(o.get("arquivo_pdf") or "")
+            if ap and os.path.basename(ap)==nome: return o
+        # 2) casa pelo ticket EXATO lido do nome — só se for ÚNICO (NÃO adivinha)
+        tkf=_tk_do_nome(nome)
+        if tkf:
+            cand=[o for o in orcs if str(o.get("ticket") or "")==tkf]
+            if len(cand)==1: return cand[0]
         return None
     itens=[]
     for origem,base in (("1",P1),("4",P4)):
         if not base: continue
         for e in dropbox_rateio.listar_entradas(access,base):
             if e["dir"] or not e["name"].lower().endswith(".pdf"): continue
+            tkf=_tk_do_nome(e["name"]); ljf=None
+            m=re.search(r'^(.*?)_(\d{4,7})(?:_NOTA_.*)?\.pdf$', e["name"], re.I)
+            if m: ljf=m.group(1).replace("_"," ").strip()
             o=_match(e["name"],origem)
             sem_reg = o is None
             if o is None: o={}
-            # fallback: sem registro no BD -> lê ticket/loja do próprio nome do arquivo (pra não ficar em branco)
-            tkp=""; ljp=None
-            if sem_reg:
-                m=re.search(r'^(.*?)_(\d{4,7})(?:_NOTA_.*)?\.pdf$', e["name"], re.I)
-                if m: tkp=m.group(2); ljp=m.group(1).replace("_"," ").strip()
+            row_tk=str(o.get("ticket") or "")
+            # ALERTA: ticket do nome do arquivo diverge do registro casado (associação inconsistente)
+            alerta = (not sem_reg) and bool(tkf) and bool(row_tk) and (row_tk!=tkf)
             lnome=o.get("loja_nome")
             itens.append({"arquivo":e["name"],"origem":origem,
-                "ticket":str(o.get("ticket") or tkp),"aba":o.get("aba") or "",
+                "ticket":str(row_tk or tkf or ""),"ticket_arquivo":tkf or "","aba":o.get("aba") or "",
                 "valor":round(_numf(o.get("valor_orcamento")),2) if o.get("valor_orcamento") is not None else None,
-                "loja":(_loja_padrao(lnome) if lnome else ljp),"rateio":bool(o.get("rateio")) or (origem=="4"),
-                "lancado":bool(o.get("lancado")),"sem_registro":sem_reg,
+                "loja":(_loja_padrao(lnome) if lnome else ljf),"rateio":bool(o.get("rateio")) or (origem=="4"),
+                "lancado":bool(o.get("lancado")),"sem_registro":sem_reg,"alerta":alerta,
                 "suspeito":bool(o.get("id") and o.get("id") in susp_ids)})
     itens.sort(key=lambda x:(x["origem"],x["arquivo"].lower()))
     return itens
