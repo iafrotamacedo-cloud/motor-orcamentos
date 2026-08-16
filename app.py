@@ -725,7 +725,7 @@ def perfil_de(uid):
 
 def pode_rotina(perfil, rotina):
     nivel=(perfil or {}).get("nivel") or ("builder" if (perfil or {}).get("papel")=="builder" else "comum")
-    if nivel in ("builder","gerente"): return True   # gerente também tem acesso pleno às rotinas
+    if nivel in ("builder","gerente","ceo"): return True   # builder/gerente/ceo têm acesso pleno às rotinas
     cat=(perfil or {}).get("categoria_id") or (perfil or {}).get("papel")
     q=urllib.parse.urlencode({"categoria_id":f"eq.{cat}","rotina":f"eq.{rotina}","pode":"is.true","select":"rotina","limit":"1"})
     try:
@@ -5317,6 +5317,130 @@ async def config_pin_policy_set(request: Request):
     log_frotahub(u["id"],p.get("papel"),"CONFIG_PIN","AJUSTOU_POLITICA_PIN",f"{len(rows)} itens")
     return {"ok":True}
 
+# ==================== AUDITORIA — Materiais Comprados (Fase 1) ====================
+_AUD_CLASSES = ("MATERIAL","INSUMO","FERRAMENTA","SEM CONEXAO","PROIBIDO")
+
+def _exige_auditoria(request):
+    """Auditoria: só builder e CEO (gerente NÃO tem acesso). Barrado no servidor."""
+    from fastapi import HTTPException
+    u,p = exige(request, "AUDITORIA")
+    if p.get("nivel") not in ("builder","ceo"):
+        raise HTTPException(403, "Auditoria: acesso apenas para builder e CEO")
+    return u,p
+
+def _qk(chave):  # chave canônica p/ URL
+    return urllib.parse.quote(chave, safe="")
+
+@app.get("/aud/catalogo")
+def aud_catalogo(request: Request):
+    """Lista o catálogo (item/grupo/classificação/permitido) + uso e resumo por grupo."""
+    _exige_auditoria(request)
+    from collections import defaultdict
+    cat=_sb_json(f"{SB_URL}/rest/v1/itens_catalogo?select=chave_canonica,descricao_exemplo,grupo,classificacao,permitido,permitido_manual&limit=5000",SB_KEY) or []
+    vi=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?select=chave,orcamento_id&limit=200000",SB_KEY) or []
+    uso=defaultdict(set)
+    for r in vi: uso[r.get("chave")].add(r.get("orcamento_id"))
+    for c in cat:
+        c["uso"]=len(uso.get(c["chave_canonica"], ()))
+        c["sem_classif"]=not (c.get("classificacao") or "").strip()
+    sem=sum(1 for c in cat if c["sem_classif"])
+    cat.sort(key=lambda c:(0 if c["sem_classif"] else 1, (c.get("grupo") or "").upper(), (c.get("descricao_exemplo") or "")))
+    grp=defaultdict(lambda:{"n":0,"perm":0,"uso":0})
+    for c in cat:
+        g=grp[c.get("grupo") or "(sem grupo)"]; g["n"]+=1; g["perm"]+=(1 if c.get("permitido") else 0); g["uso"]+=c["uso"]
+    grupos=[{"grupo":k,"itens":v["n"],"permitidos":v["perm"],"uso":v["uso"]} for k,v in sorted(grp.items())]
+    return {"itens":cat,"grupos":grupos,"sem_classificacao":sem,"total":len(cat)}
+
+@app.post("/aud/classificar")
+async def aud_classificar(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_auditoria(request); b=await request.json()
+    chave=(b.get("chave") or "").strip(); cls=(b.get("classificacao") or "").strip()
+    if not chave: raise HTTPException(400,"chave vazia")
+    if cls and cls not in _AUD_CLASSES: raise HTTPException(400,"classificação inválida")
+    row=_sb_json(f"{SB_URL}/rest/v1/itens_catalogo?chave_canonica=eq.{_qk(chave)}&select=permitido_manual&limit=1",SB_KEY) or []
+    patch={"classificacao":cls,"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}
+    if not (row and row[0].get("permitido_manual")):   # permissão automática segue a classificação
+        patch["permitido"]=(cls=="MATERIAL")
+    _sb_write(f"itens_catalogo?chave_canonica=eq.{_qk(chave)}", patch, method="PATCH")
+    log_frotahub(u["id"],p.get("papel"),"AUDITORIA","CLASSIFICAR",f"{chave} -> {cls or '(sem)'}")
+    return {"ok":True}
+
+@app.post("/aud/permitir")
+async def aud_permitir(request: Request):
+    u,p=_exige_auditoria(request); b=await request.json()
+    chave=(b.get("chave") or "").strip(); permitir=bool(b.get("permitir"))
+    _sb_write(f"itens_catalogo?chave_canonica=eq.{_qk(chave)}",
+              {"permitido":permitir,"permitido_manual":True,"atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]}, method="PATCH")
+    log_frotahub(u["id"],p.get("papel"),"AUDITORIA","PERMITIR",f"{chave} -> {'S' if permitir else 'N'}")
+    return {"ok":True}
+
+@app.post("/aud/excluir_item")
+async def aud_excluir_item(request: Request):
+    from fastapi import HTTPException
+    u,p=_exige_auditoria(request); b=await request.json()
+    chave=(b.get("chave") or "").strip()
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    _sb_delete(f"{SB_URL}/rest/v1/itens_catalogo?chave_canonica=eq.{_qk(chave)}")
+    log_frotahub(u["id"],p.get("papel"),"AUDITORIA","EXCLUIR_ITEM",chave)
+    return {"ok":True}
+
+@app.get("/aud/conferir")
+def aud_conferir(request: Request, chave: str="", grupo: str=""):
+    """Orçamentos em que este item (ou itens de um grupo) aparece."""
+    _exige_auditoria(request)
+    sel="orcamento_id,ticket,loja_nome,valor_orcamento,lancado,criado_em,comprador,fornecedor"
+    filtro=f"grupo=eq.{_qk(grupo)}" if grupo else f"chave=eq.{_qk(chave)}"
+    rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?{filtro}&select={sel}&limit=20000",SB_KEY) or []
+    seen={}
+    for r in rows: seen[r["orcamento_id"]]=r
+    return {"orcamentos":list(seen.values())}
+
+@app.get("/aud/orcamentos_auditoria")
+def aud_orcamentos_auditoria(request: Request):
+    """Todos os orçamentos com ALGUM item permitido=N."""
+    _exige_auditoria(request)
+    from collections import defaultdict
+    rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?permitido=eq.false&select=orcamento_id,ticket,loja_nome,valor_orcamento,lancado,criado_em,comprador,fornecedor,item_descricao&limit=200000",SB_KEY) or []
+    orc={}; susp=defaultdict(list)
+    for r in rows:
+        oid=r["orcamento_id"]
+        orc[oid]={k:r.get(k) for k in ("orcamento_id","ticket","loja_nome","valor_orcamento","lancado","criado_em","comprador","fornecedor")}
+        susp[oid].append(r.get("item_descricao"))
+    return {"orcamentos":[{**v,"suspeitos":susp[k]} for k,v in orc.items()]}
+
+@app.get("/aud/orcamento")
+def aud_orcamento(request: Request, id: str=""):
+    """Renderiza o orçamento a partir do BD (não do arquivo). Leitura na Fase 1."""
+    from fastapi import HTTPException
+    _exige_auditoria(request)
+    hdr=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{id}&select=id,ticket,loja_nome,aba,valor_orcamento,lancado,rateio,criado_em,comprador,fornecedor,itens&limit=1",SB_KEY) or []
+    if not hdr: raise HTTPException(404,"orçamento não encontrado")
+    o=hdr[0]; raw=o.get("itens") or []
+    cls=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_itens?orcamento_id=eq.{id}&select=item_descricao,classificacao,permitido,sem_catalogo&limit=1000",SB_KEY) or []
+    cmap={c.get("item_descricao"):c for c in cls}
+    merged=[]
+    for it in raw:
+        c=cmap.get(it.get("descricao"),{})
+        merged.append({"descricao":it.get("descricao"),"quant":it.get("quant"),"unid":it.get("unid"),
+                       "valor_unit":it.get("valor_unit"),
+                       "classificacao":c.get("classificacao") or "","permitido":bool(c.get("permitido")),
+                       "sem_catalogo":c.get("sem_catalogo", True)})
+    cab={k:o.get(k) for k in ("id","ticket","loja_nome","aba","valor_orcamento","lancado","rateio","criado_em","comprador","fornecedor")}
+    return {"orcamento":cab,"itens":merged,"sem_itens":(len(raw)==0)}
+
+@app.post("/aud/editar_orcamento")
+async def aud_editar_orcamento(request: Request):
+    from fastapi import HTTPException
+    _exige_auditoria(request)
+    raise HTTPException(501,"Edição de orçamento — disponível na Fase 2.")
+
+@app.post("/aud/excluir_orcamento")
+async def aud_excluir_orcamento(request: Request):
+    from fastapi import HTTPException
+    _exige_auditoria(request)
+    raise HTTPException(501,"Exclusão de orçamento — disponível na Fase 2.")
+
 # ---- Camada de arquivos hot/cold + Backup (Supabase Storage <-> Dropbox) ----
 try:
     import supabase_storage as sst
@@ -5353,7 +5477,7 @@ def _basic_auth(app, user, pw):
                                         or _path.startswith("/notas") or _path.startswith("/orc") or _path.startswith("/migrar")
                                         or _path.startswith("/desfazer") or _path.startswith("/usuarios") or _path.startswith("/config")
                                         or _path.startswith("/rateio") or _path.startswith("/arq") or _path.startswith("/robot")
-                                        or _path.startswith("/backup") or _path.startswith("/app")
+                                        or _path.startswith("/backup") or _path.startswith("/app") or _path.startswith("/aud")
                                         or scope.get("method") == "OPTIONS"):
             await app(scope, receive, send); return
         if scope["type"] in ("http", "websocket"):
