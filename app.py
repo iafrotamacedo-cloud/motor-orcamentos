@@ -5456,6 +5456,15 @@ def aud_orcamentos_auditoria(request: Request):
         r["suspeitos"]=r.get("suspeitos") or []
     return {"orcamentos":rows}
 
+@app.get("/aud/buscar_orcamento")
+def aud_buscar_orcamento(request: Request, ticket: str=""):
+    """Abre QUALQUER orçamento ativo pelo ticket (mesmo que não seja suspeito)."""
+    _exige_auditoria(request)
+    t=re.sub(r"\D","",ticket or "")
+    if not t: return {"orcamentos":[]}
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?ticket=eq.{t}&status=eq.gerado&select=id,ticket,loja_nome,valor_orcamento,lancado,rateio,extrapolado,criado_em,comprador,fornecedor&order=criado_em.desc&limit=50",SB_KEY) or []
+    return {"orcamentos":rows}
+
 @app.get("/aud/orcamento")
 def aud_orcamento(request: Request, id: str=""):
     """Renderiza o orçamento a partir do BD (não do arquivo). Leitura na Fase 1."""
