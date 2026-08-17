@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 127
+#  CONTADOR DE REVISÕES DESTE app.py: 129
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 127   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 129   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -4298,6 +4298,21 @@ def _fp_nota(nota_num, itens, valor):
     if not n: return ""
     return f"{n}#{_itens_sig(itens)}#{round(_num_br(valor),2)}"
 
+def _orc_duplicado(ticket, nota_num, itens, valor_nota):
+    """DUPLICIDADE DE NOTA (regra nova do usuário, ago/2026): pode haver VÁRIOS orçamentos
+       DIFERENTES para o mesmo ticket; só é proibido gerar a MESMA nota de novo. É duplicata quando,
+       no MESMO ticket, já existe orçamento gerado com o mesmo Nº de nota — ou, quando a nota é SN
+       (sem número), com o mesmo VALOR e os mesmos ITENS. Diferente disso NÃO é duplicata."""
+    try:
+        ger=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&ticket=eq.{urllib.parse.quote(str(ticket))}&select=nota_numero,valor_nota,itens&limit=500",SB_KEY) or []
+    except Exception:
+        return False
+    n=_num_limpo(nota_num)
+    if n and n!="0":
+        return any(_num_limpo(r.get("nota_numero"))==n for r in ger)
+    sig=_itens_sig(itens); v=round(_num_br(valor_nota),2)
+    return any(abs(round(_num_br(r.get("valor_nota")),2)-v)<=0.02 and _itens_sig(r.get("itens"))==sig for r in ger)
+
 _REPROC_CATS=("lancados","nao_lancados","sem_ticket","ticket_nao_associado","removido","bloqueados","total")
 def _reproc_contagem():
     """Fotografia das linhas por categoria — base do invariante (Regra 3).
@@ -4431,17 +4446,14 @@ def _reproc_run(job, previa, uid, papel):
                 if not previa: _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data_nota,P7)
                 res.append(info); continue
             # ---- ticket VÁLIDO na Lista -> gera (Regra 1) ----
+            # NOVA REGRA: vários orçamentos DIFERENTES por ticket são permitidos.
+            # A duplicata da MESMA nota já é tratada acima pela Regra 5 (fp -> removido_dup).
             loja=lj.get("loja") or {}; loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
             extrap=valor_nota>ORC_EXTRAPOLA; valor_orc=round(valor_nota*1.20,2)
-            bloq=(ticket in tickets_orc)   # Regra 6: ticket já possui orçamento
-            info.update(resultado=("gerado_bloqueado" if bloq else "gerado"),loja=loja_nome,aba=lj.get("aba"),extrapolado=extrap)
-            if bloq: info["motivo"]="ticket já possui orçamento — gerado e marcado como bloqueado (duplicidade)"
+            info.update(resultado="gerado",loja=loja_nome,aba=lj.get("aba"),extrapolado=extrap)
             if not previa:
                 try:
                     _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,nota_num,lj,loja,loja_nome,extrap,{"data_nota":data_nota},P1,P9,P10,P8)
-                    if bloq:
-                        try: _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"bloqueado":True,"bloqueio_motivo":"duplicidade: ticket já possui orçamento","bloqueio_em":_agora().isoformat()},"PATCH")
-                        except Exception as e: info["motivo"]=(info.get("motivo") or "")+f" · flag bloqueado NÃO gravada ({str(e)[:40]}) — rodou o ALTER TABLE?"
                 except Exception as e:
                     info.update(resultado="erro",motivo=f"gerar: {str(e)[:100]}"); res.append(info); continue
             if fp: fp_run.add(fp)
@@ -4517,6 +4529,75 @@ async def orc_reprocessar_cancelar(request: Request):
     j=_REPROC_JOBS.get(str(b.get("job") or ""))
     if not j: raise HTTPException(404,"job não encontrado")
     j["cancelar"]=True; return {"ok":True}
+
+# ==================================================================
+#  TRATAR PENDENTES (ST/TNA) — tratamento MANUAL, 1 nota por vez
+#  O humano informa o ticket (lido da própria nota, inclusive manuscrito);
+#  o sistema valida na Lista do Trílogo e gera REUSANDO O MESMO id.
+# ==================================================================
+@app.get("/orc/tratar_listar")
+def orc_tratar_listar(request: Request):
+    """Notas pendentes (sem_ticket / ticket_nao_associado) para tratamento manual."""
+    exige(request,"GERAR_ORCAMENTOS")
+    q=("select=id,ticket,nota_numero,valor_nota,itens,arquivo_nota,status,data_nota,criado_em"
+       "&status=in.(sem_ticket,ticket_nao_associado)&order=status.asc,criado_em.asc&limit=4000")
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY) or []
+    out=[]
+    for r in rows:
+        itens=r.get("itens") or []
+        v=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for x in itens),2) or round(_num_br(r.get("valor_nota")),2)
+        out.append({"id":r["id"],"ticket":str(r.get("ticket") or ""),"nota":r.get("nota_numero") or "—",
+                    "itens":len(itens),"valor_nota":v,"valor_orc":round(v*1.20,2),
+                    "status":r.get("status"),"arquivo":r.get("arquivo_nota") or ""})
+    return {"itens":out}
+
+@app.post("/orc/tratar_pendente")
+async def orc_tratar_pendente(request: Request):
+    """Trata UMA nota pendente. O humano manda {id, ticket}. Reusa o MESMO id (nunca cria linha).
+       - ticket VÁLIDO na Lista do Trílogo -> GERA (roteia nota 6/7->8/aba, orçamento 1/9/10).
+       - ticket NÃO na Lista -> vira/continua TNA (ST->TNA ok; TNA nunca vira ST) com aviso.
+       - vários orçamentos DIFERENTES por ticket são permitidos; só a MESMA nota (duplicidade) é barrada."""
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS")
+    b=await request.json()
+    _id=b.get("id"); ticket=re.sub(r"\D","",str(b.get("ticket") or ""))[:7]
+    if not _id: raise HTTPException(400,"id ausente")
+    if len(ticket)<4: raise HTTPException(400,"informe um ticket válido")
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{urllib.parse.quote(str(_id))}&select=id,ticket,nota_numero,valor_nota,itens,arquivo_nota,status,data_nota&limit=1",SB_KEY) or []
+    if not rows: raise HTTPException(404,"nota não encontrada")
+    row=rows[0]
+    if row.get("status") not in ("sem_ticket","ticket_nao_associado"):
+        raise HTTPException(409,"essa nota não está pendente (já foi tratada)")
+    itens=row.get("itens") or []
+    if not itens: raise HTTPException(400,"nota sem itens no banco — não dá para gerar")
+    valor_nota=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for x in itens),2)
+    if valor_nota<=0: raise HTTPException(400,"valor da nota inválido")
+    nota_num=_num_limpo(row.get("nota_numero")) or "SN"
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    P1=_pasta_manut(access,1,ob); P6=_pasta_manut(access,6,ob); P7=_pasta_manut(access,7,ob)
+    P8=_pasta_manut(access,8,ob); P9=_pasta_manut(access,9,ob); P10=_pasta_manut(access,10,ob)
+    an=row.get("arquivo_nota") or ""; pref=an.split("/",1)[0] if "/" in an else ""
+    src_base=P6 if pref=="6" else (P7 if pref=="7" else None); src_nm=an.split("/",1)[1] if "/" in an else None
+    lj=_loja_do_ticket(ticket)
+    if not lj:
+        # ST->TNA (ou continua TNA): registra o ticket informado e avisa
+        _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,row.get("data_nota"),P7)
+        log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","TRATAR_TNA",f"{ticket}/NF {nota_num}")
+        return {"ok":False,"resultado":"ticket_nao_associado",
+                "motivo":f"ticket {ticket} não está na Lista do Trílogo — atualize a Lista e trate de novo"}
+    # DUPLICIDADE (regra nova): vários orçamentos por ticket são permitidos; só a MESMA nota não.
+    if _orc_duplicado(ticket,nota_num,itens,valor_nota):
+        return {"ok":False,"resultado":"duplicidade",
+                "motivo":f"a nota {('NF '+nota_num) if nota_num!='SN' else '(sem número)'} já tem orçamento no ticket {ticket} (duplicidade) — não gerei de novo"}
+    loja=lj.get("loja") or {}
+    loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
+    extrap=valor_nota>ORC_EXTRAPOLA; valor_orc=round(valor_nota*1.20,2)
+    try:
+        _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,nota_num,lj,loja,loja_nome,extrap,{"data_nota":row.get("data_nota")},P1,P9,P10,P8)
+    except Exception as e:
+        raise HTTPException(500,f"gerar: {str(e)[:150]}")
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","TRATOU_GEROU",f"{ticket}/NF {nota_num} -> {loja_nome}")
+    return {"ok":True,"resultado":"gerado","loja":loja_nome,"aba":lj.get("aba"),"valor_orc":valor_orc,"extrapolado":extrap}
 
 @app.get("/orc/gemini_cota")
 def orc_gemini_cota(request: Request):
