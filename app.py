@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 126
+#  CONTADOR DE REVISÕES DESTE app.py: 127
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 126   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 127   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -3074,26 +3074,75 @@ async def robot_lancar_ok(request: Request):
     _LANCAR_PROG["itens"][nome]={"status":"lançado","pct":100}   # marca pronto no progresso
     return _mover_marcar_lancado(origem, nome)
 
+def _acha_orc_por_arquivo(orcs, nome):
+    """Casa a linha do orçamento pelo arquivo — MESMA lógica robusta do worklist:
+       1) basename do arquivo_pdf igual ao nome (robusto ao prefixo 1/ vs 10/MÊS/SLUG/);
+       2) senão, ticket ÚNICO lido do nome (NÃO adivinha se houver mais de um)."""
+    for o in orcs:
+        ap=str(o.get("arquivo_pdf") or "")
+        if ap and os.path.basename(ap)==nome: return o
+    m=re.search(r'_(\d{4,7})(?:_NOTA_.*)?\.pdf$', nome, re.I)
+    if m:
+        cand=[o for o in orcs if str(o.get("ticket") or "")==m.group(1)]
+        if len(cand)==1: return cand[0]
+    return None
+
 def _mover_marcar_lancado(origem, nome):
-    """Move o PDF (1->2 / 4->5) e marca 'lancado' no banco. Idempotente."""
+    """Move o PDF (1->2 / 4->5) e marca 'lancado' no banco. Idempotente.
+       CASA A LINHA por basename/ticket (não por 'arquivo_pdf=1/nome', que nunca bate porque o
+       arquivo_pdf guarda o caminho do mestre 10/11). Devolve 'marcado' pra o robô/tela saberem
+       se o banco foi de fato atualizado — nada de falha silenciosa."""
     from fastapi import HTTPException
     access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
     dst_n=2 if origem=="1" else 5
     src=_pasta_manut(access,int(origem),ob); dst=_pasta_manut(access,dst_n,ob)
     if not src or not dst: raise HTTPException(500,"pasta de origem/destino não encontrada")
+    marcado=False; alvo_id=None
     try:
-        body=json.dumps({"lancado":True,"lancado_em":_agora().isoformat()}).encode()
-        rq=urllib.request.Request(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&or=(arquivo_pdf.eq.{urllib.parse.quote(origem+'/'+nome)},arquivo_doc.ilike.*{urllib.parse.quote(os.path.splitext(nome)[0])}*)",
-            data=body,method="PATCH",headers={"apikey":SB_KEY,"authorization":f"Bearer {SB_KEY}","content-type":"application/json","prefer":"return=minimal"})
-        urllib.request.urlopen(rq,timeout=20)
-    except Exception: pass
+        orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,arquivo_pdf,lancado&limit=8000",SB_KEY) or []
+        alvo=_acha_orc_por_arquivo(orcs, nome)
+        if alvo:
+            alvo_id=alvo["id"]
+            if not alvo.get("lancado"):
+                _sb_write(f"notas_orcamento?id=eq.{alvo['id']}", {"lancado":True,"lancado_em":_agora().isoformat()}, "PATCH")
+            marcado=True
+    except Exception as e:
+        print("marcar lancado erro:", str(e)[:150], flush=True)
     moved=False
     try:
         dropbox_rateio.mover(access,f"{src}/{nome}",f"{dst}/{nome}"); moved=True
     except Exception as e:
         if dropbox_rateio.baixar(access,f"{src}/{nome}") is None: moved=True
         else: raise HTTPException(500,f"mover: {str(e)[:120]}")
-    return {"ok":True,"movido":moved}
+    return {"ok":True,"movido":moved,"marcado":marcado,"id":alvo_id}
+
+@app.post("/orc/reparar_lancados")
+async def orc_reparar_lancados(request: Request):
+    """REPARO: orçamentos cujo custo JÁ entrou no Trílogo (o arquivo já está na pasta 2/5)
+       mas ficaram com lancado=false por causa do casamento antigo por caminho.
+       Varre 2 (lançados) e 5 (rateio lançados), casa a linha (basename/ticket) e marca lançado.
+       Seguro e idempotente: só marca o que já está fisicamente em 2/5 (= comprovadamente lançado)."""
+    from fastapi import HTTPException
+    u,p=_exige_lancar(request)
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,arquivo_pdf,lancado&limit=8000",SB_KEY) or []
+    reparados=[]; ja=0; sem=[]
+    for pn in (2,5):
+        base=_pasta_manut(access,pn,ob)
+        if not base: continue
+        for e in dropbox_rateio.listar_entradas(access,base):
+            if e.get("dir") or not e["name"].lower().endswith(".pdf"): continue
+            o=_acha_orc_por_arquivo(orcs, e["name"])
+            if not o: sem.append(e["name"]); continue
+            if o.get("lancado"): ja+=1; continue
+            try:
+                _sb_write(f"notas_orcamento?id=eq.{o['id']}", {"lancado":True,"lancado_em":_agora().isoformat()}, "PATCH")
+                o["lancado"]=True  # evita remarcar se o mesmo arquivo aparecer 2x
+                reparados.append({"ticket":o.get("ticket"),"arquivo":e["name"]})
+            except Exception as ex:
+                sem.append(f"{e['name']} (erro: {str(ex)[:60]})")
+    log_frotahub(u["id"],p.get("papel"),"LANCAR_TRILOGO","REPAROU_LANCADOS",f"{len(reparados)} marcado(s), {ja} já ok")
+    return {"reparados":len(reparados),"ja_lancados":ja,"sem_par":sem[:50],"detalhe":reparados[:300]}
 
 def _mover_volta(origem, nome):
     """Desfaz o move: volta o PDF de 2->1 / 5->4 (NÃO mexe no banco aqui)."""
