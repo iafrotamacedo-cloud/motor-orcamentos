@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 124
+#  CONTADOR DE REVISÕES DESTE app.py: 126
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 124   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 126   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -2471,8 +2471,45 @@ def _parse_dav_texto(txt):
     o={"ticket":ticket,"nota_numero":nota,"data_nota":data,"itens":itens}
     return [o] if _notas_seguras([o]) else []
 
+def _seg_por_nota(T):
+    """Quebra o texto de um arquivo em UM segmento por nota (arquivo MULTI-NOTA).
+       1) Preferência: quebra de página do pdftotext -layout (form feed \\f) — 1 página = 1 nota.
+       2) Sem \\f (ex.: OCR): quebra antes de cada cabeçalho de DANFE ('RECEBEMOS DE' / 'DOCUMENTO AUXILIAR')."""
+    T=T or ""
+    if "\f" in T:
+        segs=[s for s in T.split("\f") if s.strip()]
+        if len(segs)>=1: return segs
+    marks=[m.start() for m in re.finditer(r"(RECEBEMOS DE|DOCUMENTO AUXILIAR DA)", T, re.I)]
+    if len(marks)<=1: return [T]
+    return [T[marks[i]:(marks[i+1] if i+1<len(marks) else len(T))] for i in range(len(marks))]
+
+def _parse_danfe_multi(txt):
+    """Lê TODAS as notas de um arquivo DANFE multi-nota (multipágina). Cada segmento (página)
+       é lido pelo leitor de nota única e CONFERIDO pelo seu PRÓPRIO total — assim uma nota
+       ilegível numa página não contamina as outras. Devolve a lista na ordem das páginas
+       (alinha com _split_pdf: nota i = página i)."""
+    notas=[]
+    for seg in _seg_por_nota(txt):
+        up=(seg or "").upper()
+        if "DADOS DO PRODUTO" not in up and "DOCUMENTO AUXILIAR DA" not in up: continue
+        um=_parse_danfe_texto(seg)                     # 1 nota nesse segmento
+        if um and _bate_total(um, seg) is not False:   # confere pelo total DESTA página
+            notas.extend(um)
+    return notas
+
 def _parse_nota_local(txt):
-    """Leitor local sem IA: tenta DANFE (NF-e) e depois DAV (pedido)."""
+    """Leitor local sem IA. SEGURO por padrão:
+       - só trata como MULTI-NOTA quando achou 2+ notas válidas (cada uma conferida pelo seu total);
+       - caso contrário (1 nota, ou 1 nota que ocupa 2 páginas), usa o leitor de TEXTO INTEIRO —
+         que atravessa a quebra de página e não corre risco de ler a nota pela metade.
+       Assim o multi-nota é um GANHO, nunca uma regressão no fluxo normal (1 nota por arquivo)."""
+    multi=_parse_danfe_multi(txt)
+    nums=[_num_limpo(n.get("nota_numero")) for n in multi]
+    distintas={n for n in nums if n}
+    # MULTI-NOTA de verdade = 2+ segmentos, TODOS com Nº, e Nº TODOS DIFERENTES.
+    # (2 páginas com o MESMO Nº = uma nota só que virou duas folhas -> NÃO é multi; usa texto inteiro.)
+    if len(multi)>=2 and len(distintas)==len(multi):
+        return multi
     return _parse_danfe_texto(txt) or _parse_dav_texto(txt)
 
 def _data_br_any(v):
@@ -2587,7 +2624,10 @@ def _ler_notas_rota(fb, mime, nome, it, st):
     # ---- Camada 1: parsers locais (sem IA) ----
     if texto and len(texto)>=30:
         notas=_parse_nota_local(texto)
-        if notas and _leitura_ok(notas, texto):
+        # MULTI-NOTA: cada nota já foi conferida pelo total da SUA página em _parse_danfe_multi,
+        # então não se aplica a conferência global (não existe 1 total impresso = soma de todas).
+        ok = (_leitura_ok(notas, texto) if (notas and len(notas)==1) else _notas_seguras(notas))
+        if notas and ok:
             _formato_registra(texto, _qual_formato(texto), notas[0].get("nota_numero"))   # aprende o layout
             return notas, ("pdf" if origem=="digital" else "ocr-pdf")
         if notas and not _notas_seguras(notas):
