@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 123
+#  CONTADOR DE REVISÕES DESTE app.py: 124
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 123   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 124   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -4156,7 +4156,7 @@ def _reproc_mime(nm):
 def _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,nota_num,lj,loja,loja_nome,extrap,nt,P1,P9,P10,P8):
     """Vira GERADO reusando a MESMA linha (UPDATE). Espelha o caminho da geração original.
     Move o arquivo CASADO (src_base/src_nm), não o arquivo_nota (que pode estar nulo/errado)."""
-    ext=os.path.splitext(src_nm)[1] or ".pdf"; mes=_mes_atual(); slug=_slug_loja(loja,lj.get("unidade"))
+    ext=os.path.splitext(src_nm or "")[1] or ".pdf"; mes=_mes_atual(); slug=_slug_loja(loja,lj.get("unidade"))
     itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
     hoje=_hoje().strftime("%d/%m/%Y")
     dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
@@ -4180,7 +4180,7 @@ def _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,n
     # move a nota da pasta 6/7 -> pasta 8/<aba>
     sub="INSTALACOES" if (lj.get("aba") or "").upper().startswith("INST") else ("CIVIL" if (lj.get("aba") or "").upper().startswith("CIV") else "SEM CLASSIFICACAO")
     arq_nota=None
-    if P8 and src_base:
+    if P8 and src_base and src_nm:
         dropbox_rateio.criar_pasta(access,f"{P8}/{sub}")
         destino=f"TICKET_{ticket}_NOTA_{nota_num}{ext}"
         try: dropbox_rateio.mover(access,f"{src_base}/{src_nm}",f"{P8}/{sub}/{destino}"); arq_nota=f"8/{sub}/{destino}"
@@ -4191,37 +4191,93 @@ def _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,n
         "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
         "arquivo_nota":arq_nota,"arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc},"PATCH")
 
-def _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,P7):
-    """Vira/continua TICKET NÃO ASSOCIADO reusando a MESMA linha. Move o arquivo casado -> 7
-    e RELIGA o arquivo_nota."""
-    ext=os.path.splitext(src_nm)[1] or ".pdf"; destino=f"TICKET_{ticket}_NOTA_{nota_num}{ext}"; arq_nota=f"7/{src_nm}"
-    if P7 and src_base:
+def _itens_sig(itens):
+    """Assinatura estável dos itens: descrição curta + quant + valor_unit, ordenada.
+       Serve para comparar duas notas por CONTEÚDO (itens+valores) — Regra 5."""
+    parts=[]
+    for it in (itens or []):
+        d=re.sub(r"\s+"," ",str(it.get("descricao") or "")).strip().lower()[:40]
+        q=round(_num_br(it.get("quant")),3); v=round(_num_br(it.get("valor_unit")),2)
+        parts.append(f"{d}|{q}|{v}")
+    return ";".join(sorted(parts))
+
+def _fp_nota(nota_num, itens, valor):
+    """Impressão digital da nota p/ dedup (Regra 5): N da nota + itens + valor.
+       SÓ é forte quando há N da nota — sem N devolve '' e a nota NÃO é deduplicada
+       às cegas (protege notas distintas de mesmo valor, ex.: as CCF 130 e 132)."""
+    n=_num_limpo(nota_num) or ""
+    if not n: return ""
+    return f"{n}#{_itens_sig(itens)}#{round(_num_br(valor),2)}"
+
+_REPROC_CATS=("lancados","nao_lancados","sem_ticket","ticket_nao_associado","removido","bloqueados","total")
+def _reproc_contagem():
+    """Fotografia das linhas por categoria — base do invariante (Regra 3).
+       Tolerante à coluna 'bloqueado' ainda não existir (antes do ALTER TABLE)."""
+    try: rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?select=status,lancado,bloqueado&limit=20000",SB_KEY) or []
+    except Exception: rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?select=status,lancado&limit=20000",SB_KEY) or []
+    c={k:0 for k in _REPROC_CATS}
+    for r in rows:
+        s=r.get("status"); c["total"]+=1
+        if s=="gerado":
+            if r.get("lancado"): c["lancados"]+=1
+            else: c["nao_lancados"]+=1
+            if r.get("bloqueado"): c["bloqueados"]+=1
+        elif s=="sem_ticket": c["sem_ticket"]+=1
+        elif s=="ticket_nao_associado": c["ticket_nao_associado"]+=1
+        elif s=="removido": c["removido"]+=1
+    return c
+
+def _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data_nota,P7):
+    """Vira/continua TICKET NÃO ASSOCIADO reusando a MESMA linha (UPDATE por id).
+       Preenche TUDO que foi lido (Regra 0): nota_numero, data_nota, itens, valor. Move o arquivo -> 7."""
+    arq_nota=row.get("arquivo_nota") or (f"7/{src_nm}" if src_nm else None)
+    if P7 and src_base and src_nm:
+        ext=os.path.splitext(src_nm)[1] or ".pdf"; destino=f"TICKET_{ticket}_NOTA_{nota_num}{ext}"
         try: dropbox_rateio.mover(access,f"{src_base}/{src_nm}",f"{P7}/{destino}"); arq_nota=f"7/{destino}"
         except Exception: pass
     _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"ticket":ticket,"status":"ticket_nao_associado",
+        "nota_numero":(nota_num if nota_num and nota_num!='SN' else None),"data_nota":_data_iso(data_nota),
         "itens":itens,"valor_nota":valor_nota,"arquivo_nota":arq_nota},"PATCH")
 
-def _reproc_st(access,row,src_nm,itens,valor_nota):
-    """Continua SEM TICKET — atualiza itens/valor e RELIGA o arquivo_nota (fica na pasta 6)."""
-    _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"itens":itens,"valor_nota":valor_nota,"status":"sem_ticket","arquivo_nota":f"6/{src_nm}"},"PATCH")
+def _reproc_st(access,row,src_base,src_nm,itens,valor_nota,nota_num,data_nota,P6):
+    """Continua SEM TICKET reusando a MESMA linha (UPDATE por id).
+       Preenche TUDO que foi lido (Regra 0): nota_numero, data_nota, itens, valor. O arquivo fica na 6."""
+    arq_nota=(f"6/{src_nm}" if src_nm else (row.get("arquivo_nota") or None))
+    _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"status":"sem_ticket",
+        "nota_numero":(nota_num if nota_num and nota_num!='SN' else None),"data_nota":_data_iso(data_nota),
+        "itens":itens,"valor_nota":valor_nota,"arquivo_nota":arq_nota},"PATCH")
 
 def _reproc_run(job, previa, uid, papel):
+    """FASE 2 (row-centric). Processa CADA linha ST/TNA do banco, relendo o arquivo dela.
+       Regras:
+        0) toda nota é lida por inteiro; ST/TNA recebem nota_numero+data_nota+itens+valor (UPDATE por id).
+        1) só vira 'gerado' se o ticket for VÁLIDO na Lista do Trílogo (_loja_do_ticket).
+        2) sempre UPDATE por id — nunca cria linha.
+        3) invariante: total de linhas não muda (só reclassifica).
+        4) a cada nota: grava no BD + roteia a pasta (6/7 -> 8/aba, ou 9 se extrapolado).
+        5) nota == outra JÁ gerada (mesmo N da nota + itens + valor) -> arquivo p/ lixeira + status 'removido'.
+        6) ticket já tem orçamento -> gera e marca bloqueado (duplicidade)."""
     import time as _t
     st=_REPROC_JOBS[job]
     try:
         access=dropbox_rateio.obter_token(); _mb=_manut_base(access); _ob=_orc_base(access,_mb)
         P6=_pasta_manut(access,6,_ob); P7=_pasta_manut(access,7,_ob); P8=_pasta_manut(access,8,_ob)
         P1=_pasta_manut(access,1,_ob); P9=_pasta_manut(access,9,_ob); P10=_pasta_manut(access,10,_ob)
-        rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=in.(sem_ticket,ticket_nao_associado)&select=id,ticket,nota_numero,valor_nota,itens,arquivo_nota,status&limit=8000",SB_KEY) or []
-        files=[]
-        for pref,base in (("6",P6),("7",P7)):
-            if not base: continue
-            for nm in dropbox_rateio.listar(access,base):
-                if nm.lower().endswith((".pdf",".jpg",".jpeg",".png")): files.append((pref,base,nm))
-        st["total"]=len(files)
-        # ---- FASE A: relê TODOS os arquivos (parte lenta; o casamento é por CONTEÚDO, depois) ----
-        lidos=[]
-        for idx,(pref,base,nm) in enumerate(files):
+        st["contagem_antes"]=_reproc_contagem()
+        rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=in.(sem_ticket,ticket_nao_associado)"
+                      "&select=id,ticket,nota_numero,valor_nota,itens,arquivo_nota,status,data_nota,criado_em"
+                      "&order=criado_em.asc&limit=8000",SB_KEY) or []
+        st["total"]=len(rows)
+        # índices de dedup a partir das notas JÁ geradas (Regra 5 e 6)
+        ger=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=ticket,nota_numero,valor_nota,itens&limit=20000",SB_KEY) or []
+        fp_ger=set(); tickets_orc=set()
+        for r in ger:
+            fp=_fp_nota(r.get("nota_numero"),r.get("itens"),r.get("valor_nota"))
+            if fp: fp_ger.add(fp)
+            if r.get("ticket"): tickets_orc.add(_num_limpo(r.get("ticket")))
+        fp_run=set()   # notas geradas/mantidas NESTA rodada (Regra 5: "depois dela vier outra igual")
+        res=st["res"]
+        for idx,row in enumerate(rows):
             if st.get("cancelar"): break
             if idx and idx%ORC_LOTE==0:
                 st["pausa"]=True; st["retoma_em"]=ORC_DESCANSO
@@ -4230,73 +4286,105 @@ def _reproc_run(job, previa, uid, papel):
                     _t.sleep(1); st["retoma_em"]=ORC_DESCANSO-_s-1
                 st["pausa"]=False
                 if st.get("cancelar"): break
-            L={"pref":pref,"base":base,"nm":nm}
-            fb=dropbox_rateio.baixar(access,f"{base}/{nm}")
-            if not fb: L["erro"]="não baixou"; L["rtipo"]="erro"; lidos.append(L); st["feitas"]=idx+1; continue
-            try: notas,reader=_ler_notas_rota(fb,_reproc_mime(nm),nm,{"nome":nm},st)
-            except _CotaExcedida: L["erro"]="cota do Gemini excedida — rode de novo mais tarde"; L["rtipo"]="cota"; lidos.append(L); st["feitas"]=idx+1; continue
-            except Exception as e: L["erro"]=f"leitor: {str(e)[:100]}"; L["rtipo"]="erro"; lidos.append(L); st["feitas"]=idx+1; continue
-            if not notas: L["erro"]="leitor não identificou nota"; L["rtipo"]="nao_lida"; lidos.append(L); st["feitas"]=idx+1; continue
-            if len(notas)>1: L["erro"]=f"{len(notas)} notas no mesmo arquivo — colocado na mão?"; L["rtipo"]="revisar"; lidos.append(L); st["feitas"]=idx+1; continue
-            nt=notas[0]; L["ticket"]=_num_limpo(nt.get("ticket")); L["nota"]=_num_limpo(nt.get("nota_numero")) or "SN"
-            L["itens"]=nt.get("itens") or []; L["nt"]=nt
-            L["valor"]=round(sum((float(it.get("valor_unit") or 0)*float(it.get("quant") or 0)) for it in L["itens"]),2)
-            lidos.append(L); st["feitas"]=idx+1
-        if st.get("cancelar"): st["estado"]="cancelado"; return
-        # ---- FASE B: casa cada arquivo com UMA linha do BD por VALOR (+ nota / + ticket) ----
-        pool=list(rows)
-        def _vbate(r,v):
-            try: return abs(round(float(r.get("valor_nota")),2)-v)<=0.02
-            except Exception: return False
-        def _forca(L): return (1 if L.get("nota") and L["nota"]!="SN" else 0)+(1 if L.get("ticket") else 0)
-        for L in sorted([x for x in lidos if not x.get("erro")],key=_forca,reverse=True):
-            cands=[r for r in pool if _vbate(r,L["valor"])]
-            if L.get("nota") and L["nota"]!="SN":
-                ex=[r for r in cands if str(r.get("nota_numero") or "")==str(L["nota"])]
-                if ex: cands=ex
-            if L.get("ticket"):
-                ex2=[r for r in cands if str(r.get("ticket") or "")==str(L["ticket"])]
-                if ex2: cands=ex2
-            if len(cands)==1: L["row"]=cands[0]; pool.remove(cands[0])
-            elif len(cands)==0: L["semrow"]="sem_par"
-            else: L["semrow"]="ambiguo"; L["cands"]=[r["id"] for r in cands]
-        # ---- FASE C: classifica e (se aplicar) gera/roteia, sempre na MESMA linha ----
-        res=st["res"]
-        for L in lidos:
-            base_r={"arquivo":f"{L['pref']}/{L['nm']}","origem":L["pref"]}
-            if L.get("erro"): res.append({**base_r,"resultado":L.get("rtipo","erro"),"motivo":L["erro"]}); continue
-            info={**base_r,"ticket":L.get("ticket") or None,"nota":L.get("nota"),"valor_nota":L["valor"],"valor_orc":round(L["valor"]*1.20,2),"itens":len(L["itens"])}
-            row=L.get("row")
-            if not row:
-                info["resultado"]=L.get("semrow","sem_par")
-                info["motivo"]=("casa com "+", ".join(str(x)[:8] for x in L.get("cands",[]))+" — decidir na mão") if info["resultado"]=="ambiguo" else "arquivo sem linha no banco (ou duplicata de outro já casado)"
+            st["feitas"]=idx+1
+            an=row.get("arquivo_nota") or ""
+            pref=an.split("/",1)[0] if "/" in an else ""
+            src_base=P6 if pref=="6" else (P7 if pref=="7" else None)
+            src_nm=an.split("/",1)[1] if "/" in an else None
+            info={"arquivo":an or f"(id {str(row.get('id'))[:8]})","origem":pref or "?","id":row["id"],"origem_status":row.get("status")}
+            # ---- Regra 0: relê a nota (se possível); senão usa o que já está no BD ----
+            nt={}; leu=False
+            if src_base and src_nm:
+                try:
+                    fb=dropbox_rateio.baixar(access,f"{src_base}/{src_nm}")
+                    if fb:
+                        notas,reader=_ler_notas_rota(fb,_reproc_mime(src_nm),src_nm,{"nome":src_nm},st)
+                        if notas and len(notas)==1 and _notas_seguras(notas): nt=notas[0]; leu=True
+                        elif notas and len(notas)>1: info["motivo_leitura"]=f"{len(notas)} notas no mesmo arquivo"
+                except _CotaExcedida:
+                    info.update(resultado="erro",motivo="cota do Gemini excedida — rode mais tarde"); res.append(info); continue
+                except Exception as e:
+                    info["motivo_leitura"]=f"releitura falhou: {str(e)[:70]}"
+            if leu:
+                nota_num=_num_limpo(nt.get("nota_numero")) or (_num_limpo(row.get("nota_numero")) or "SN")
+                itens=nt.get("itens") or (row.get("itens") or [])
+                read_ticket=_num_limpo(nt.get("ticket"))
+                data_nota=nt.get("data_nota") or row.get("data_nota")
+                valor_nota=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for x in itens),2)
+            else:
+                nota_num=_num_limpo(row.get("nota_numero")) or "SN"
+                itens=row.get("itens") or []; read_ticket=None; data_nota=row.get("data_nota")
+                valor_nota=round(_num_br(row.get("valor_nota")),2)
+            if not itens or valor_nota<=0:
+                info.update(resultado="erro",nota=nota_num,motivo=(info.get("motivo_leitura") or "sem itens/valor para processar")); res.append(info); continue
+            info.update(nota=nota_num,valor_nota=valor_nota,valor_orc=round(valor_nota*1.20,2))
+            # ---- Regra 5: duplicata EXATA de nota já gerada (N da nota + itens + valor) ----
+            fp=_fp_nota(nota_num,itens,valor_nota)
+            if fp and (fp in fp_ger or fp in fp_run):
+                info["resultado"]="removido_dup"; info["motivo"]="duplicata de nota já gerada (N + itens + valor) — arquivo p/ lixeira"
+                if not previa:
+                    if src_base and src_nm:
+                        try: dropbox_rateio.apagar(access,f"{src_base}/{src_nm}")
+                        except Exception: pass
+                    _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"status":"removido",
+                        "removido_motivo":"duplicidade (N nota + itens + valor)","removido_em":_agora().isoformat(),"removido_por":uid},"PATCH")
                 res.append(info); continue
-            info["id"]=row["id"]
-            ticket=L.get("ticket"); nota_num=L.get("nota") or "SN"; itens=L["itens"]; valor_nota=L["valor"]; valor_orc=round(valor_nota*1.20,2); nt=L["nt"]
+            # ---- Regra 1/0: ticket (só do CONTEÚDO; TNA mantém o ticket que já tinha) ----
+            ticket=read_ticket or _num_limpo(row.get("ticket"))
+            info["ticket"]=ticket or None
             if not ticket:
                 info["resultado"]="sem_ticket"
-                if not previa: _reproc_st(access,row,L["nm"],itens,valor_nota)
+                if not previa: _reproc_st(access,row,src_base,src_nm,itens,valor_nota,nota_num,data_nota,P6)
                 res.append(info); continue
             lj=_loja_do_ticket(ticket)
             if not lj:
                 info["resultado"]="ticket_nao_associado"
-                if not previa: _reproc_tna(access,row,L["base"],L["nm"],itens,valor_nota,ticket,nota_num,P7)
+                if not previa: _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data_nota,P7)
                 res.append(info); continue
-            if _nota_ja_gerada(ticket,nota_num):
-                info["resultado"]="duplicado"; info["motivo"]="já existe orçamento para esse ticket/nota"
-                res.append(info); continue
+            # ---- ticket VÁLIDO na Lista -> gera (Regra 1) ----
             loja=lj.get("loja") or {}; loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
-            extrap=valor_nota>ORC_EXTRAPOLA
-            info["resultado"]="gerado"; info["loja"]=loja_nome; info["aba"]=lj.get("aba"); info["extrapolado"]=extrap
+            extrap=valor_nota>ORC_EXTRAPOLA; valor_orc=round(valor_nota*1.20,2)
+            bloq=(ticket in tickets_orc)   # Regra 6: ticket já possui orçamento
+            info.update(resultado=("gerado_bloqueado" if bloq else "gerado"),loja=loja_nome,aba=lj.get("aba"),extrapolado=extrap)
+            if bloq: info["motivo"]="ticket já possui orçamento — gerado e marcado como bloqueado (duplicidade)"
             if not previa:
-                try: _reproc_gerar(access,row,L["base"],L["nm"],itens,valor_nota,valor_orc,ticket,nota_num,lj,loja,loja_nome,extrap,nt,P1,P9,P10,P8)
-                except Exception as e: info["resultado"]="erro"; info["motivo"]=f"gerar: {str(e)[:100]}"
+                try:
+                    _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,nota_num,lj,loja,loja_nome,extrap,{"data_nota":data_nota},P1,P9,P10,P8)
+                    if bloq:
+                        try: _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"bloqueado":True,"bloqueio_motivo":"duplicidade: ticket já possui orçamento","bloqueio_em":_agora().isoformat()},"PATCH")
+                        except Exception as e: info["motivo"]=(info.get("motivo") or "")+f" · flag bloqueado NÃO gravada ({str(e)[:40]}) — rodou o ALTER TABLE?"
+                except Exception as e:
+                    info.update(resultado="erro",motivo=f"gerar: {str(e)[:100]}"); res.append(info); continue
+            if fp: fp_run.add(fp)
+            tickets_orc.add(ticket)
             res.append(info)
-        st["orfaos_pasta"]=[f"{L['pref']}/{L['nm']}" for L in lidos if (not L.get("erro")) and (not L.get("row"))]
-        st["orfaos_bd"]=[{"id":r["id"],"status":r.get("status"),"ticket":r.get("ticket"),"valor":r.get("valor_nota")} for r in pool]
-        st["gerados"]=sum(1 for r in res if r.get("resultado")=="gerado")
+        if st.get("cancelar"): st["estado"]="cancelado"; return
+        # ---- contagens / invariante (Regra 3) ----
+        cont={}
+        for r in res: cont[r.get("resultado")]=cont.get(r.get("resultado"),0)+1
+        st["prev_cont"]=cont
+        st["gerados"]=cont.get("gerado",0)+cont.get("gerado_bloqueado",0)
+        antes=st.get("contagem_antes") or {}
+        if previa:
+            dep=dict(antes)
+            for r in res:
+                og=r.get("origem_status"); oc=r.get("resultado")
+                if oc=="erro" or og not in ("sem_ticket","ticket_nao_associado"): continue
+                dep[og]=dep.get(og,0)-1
+                if oc in ("gerado","gerado_bloqueado"):
+                    dep["nao_lancados"]=dep.get("nao_lancados",0)+1
+                    if oc=="gerado_bloqueado": dep["bloqueados"]=dep.get("bloqueados",0)+1
+                elif oc=="removido_dup": dep["removido"]=dep.get("removido",0)+1
+                elif oc=="sem_ticket": dep["sem_ticket"]=dep.get("sem_ticket",0)+1
+                elif oc=="ticket_nao_associado": dep["ticket_nao_associado"]=dep.get("ticket_nao_associado",0)+1
+            dep["total"]=antes.get("total",0)
+            st["contagem_depois"]=dep
+        else:
+            st["contagem_depois"]=_reproc_contagem()
+        st["invariante_ok"]=(st["contagem_depois"].get("total")==antes.get("total"))
         st["estado"]="pronto"
-        if not previa: log_frotahub(uid,papel,"GERAR_ORCAMENTOS","REPROCESSOU_PENDENTES",f"{st['gerados']} gerado(s) de {st['feitas']}")
+        if not previa: log_frotahub(uid,papel,"GERAR_ORCAMENTOS","REPROCESSOU_FASE2",
+            f"{st['gerados']} gerado(s), {cont.get('removido_dup',0)} dup, {cont.get('gerado_bloqueado',0)} bloq, de {st['feitas']}")
     except Exception as e:
         st["estado"]="erro"; st["erro"]=str(e)[:300]
 
@@ -4314,7 +4402,7 @@ async def orc_reprocessar_pendentes(request: Request):
         for k in list(_REPROC_JOBS)[:-5]: _REPROC_JOBS.pop(k,None)
     _REPROC_SEQ[0]+=1; job=str(_REPROC_SEQ[0])
     _REPROC_JOBS[job]={"estado":"rodando","previa":previa,"total":0,"feitas":0,"gerados":0,"pausa":False,"retoma_em":0,
-                       "res":[],"orfaos_pasta":[],"orfaos_bd":[],"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
+                       "res":[],"contagem_antes":{},"contagem_depois":{},"prev_cont":{},"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
     threading.Thread(target=_reproc_run,args=(job,previa,u["id"],p["papel"]),daemon=True).start()
     return {"job":job,"previa":previa,"lote":ORC_LOTE,"descanso":ORC_DESCANSO}
 
@@ -4327,7 +4415,8 @@ def orc_reprocessar_status(request: Request, job: str=""):
     if not j: raise HTTPException(404,"job não encontrado (o motor pode ter reiniciado)")
     return {"estado":j["estado"],"previa":j["previa"],"total":j["total"],"feitas":j["feitas"],"gerados":j["gerados"],
             "pausa":j["pausa"],"retoma_em":j["retoma_em"],"lote":j["lote"],"descanso":j["descanso"],"erro":j.get("erro"),
-            "orfaos_pasta":j.get("orfaos_pasta",[]),"orfaos_bd":j.get("orfaos_bd",[]),"resultados":j["res"]}
+            "contagem_antes":j.get("contagem_antes",{}),"contagem_depois":j.get("contagem_depois",{}),
+            "prev_cont":j.get("prev_cont",{}),"invariante_ok":j.get("invariante_ok"),"resultados":j["res"]}
 
 @app.post("/orc/reprocessar_cancelar")
 async def orc_reprocessar_cancelar(request: Request):
