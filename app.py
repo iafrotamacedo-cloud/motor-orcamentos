@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 129
+#  CONTADOR DE REVISÕES DESTE app.py: 130
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -757,7 +757,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 129   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 130   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -3545,7 +3545,7 @@ def _conta_da_aba(aba):
     if a=="Instalações": return "PREDIAL INSTALAÇÕES - MANUENÇÃO CORRETIVA"
     return ""
 def _planilha_orc_rows(desde="",ate="",faixa=""):
-    parts=["select=id,ticket,nota_numero,loja_nome,aba,valor_orcamento,criado_em,rateio","status=eq.gerado","order=criado_em.asc","limit=8000"]
+    parts=["select=id,ticket,nota_numero,loja_nome,aba,valor_orcamento,criado_em,rateio,faturado,pago","status=eq.gerado","order=criado_em.asc","limit=8000"]
     if desde: parts.append(f"criado_em=gte.{desde}")
     if ate:   parts.append(f"criado_em=lte.{ate}T23:59:59")
     notas=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?"+"&".join(parts),SB_KEY) or []
@@ -3563,7 +3563,8 @@ def _planilha_orc_rows(desde="",ate="",faixa=""):
         tk=str(n.get("ticket") or ""); cm=lojamap.get(tk,{})
         aba=cm.get("aba") or n.get("aba") or ""
         rows.append({"n":i,"id":n.get("id"),"ticket":tk,"nota":n.get("nota_numero"),"loja":_loja_padrao(cm.get("loja") or n.get("loja_nome")),
-            "valor":round(val(n),2),"data":(n.get("criado_em") or "")[:10],"conta":_conta_da_aba(aba),"rateio":bool(n.get("rateio"))})
+            "valor":round(val(n),2),"data":(n.get("criado_em") or "")[:10],"conta":_conta_da_aba(aba),
+            "aba":_abacurta(aba),"faturada":bool(n.get("faturado")),"paga":bool(n.get("pago")),"rateio":bool(n.get("rateio"))})
     return rows
 
 def _planilha_header(desde,ate,faixa,resp,total,qtd):
