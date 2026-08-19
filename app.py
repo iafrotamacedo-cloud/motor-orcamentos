@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 132
+#  CONTADOR DE REVISÕES DESTE app.py: 133
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -758,7 +758,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 132   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 133   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -3046,7 +3046,7 @@ def _lancar_itens(access):
     notas_orcamento pra pegar ticket/valor/aba. Só entra o que ainda está em 1/4."""
     ob=_orc_base(access,_manut_base(access))
     P1=_pasta_manut(access,1,ob); P4=_pasta_manut(access,4,ob)
-    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome,lancado&limit=8000",SB_KEY) or []
+    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome,lancado,lancamento_motivo,lancamento_status_ticket,lancamento_em&limit=8000",SB_KEY) or []
     # ids de orçamentos com ALGUM item não permitido (suspeitos) — pra marcar na lista de lançar
     _susp_rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_suspeitos?select=orcamento_id&limit=20000",SB_KEY) or []
     susp_ids={r.get("orcamento_id") for r in _susp_rows}
@@ -3084,7 +3084,9 @@ def _lancar_itens(access):
                 "valor":round(_numf(o.get("valor_orcamento")),2) if o.get("valor_orcamento") is not None else None,
                 "loja":(_loja_padrao(lnome) if lnome else ljf),"rateio":bool(o.get("rateio")) or (origem=="4"),
                 "lancado":bool(o.get("lancado")),"sem_registro":sem_reg,"alerta":alerta,
-                "suspeito":bool(o.get("id") and o.get("id") in susp_ids)})
+                "suspeito":bool(o.get("id") and o.get("id") in susp_ids),
+                "motivo":o.get("lancamento_motivo"),"status_ticket":o.get("lancamento_status_ticket"),
+                "motivo_em":o.get("lancamento_em")})
     itens.sort(key=lambda x:(x["origem"],x["arquivo"].lower()))
     return itens
 
@@ -3157,15 +3159,43 @@ def robot_lancar_worklist(request: Request):
     access=dropbox_rateio.obter_token()
     return {"itens":_lancar_itens(access)}
 
+def _persist_lancamento(nome, motivo, status_ticket):
+    """Grava o MOTIVO/STATUS do último lançamento na linha do orçamento (notas_orcamento),
+       pra lista de 'não lançados' sobreviver a restart e aparecer sem rodar o robô de novo.
+       Casa pelo arquivo_pdf (basename) e, se não achar, pelo ticket lido do nome."""
+    if not (nome and motivo): return
+    try:
+        base=str(nome).split("/")[-1]
+        like=urllib.parse.quote("*"+base+"*")
+        rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?arquivo_pdf=ilike.{like}&status=eq.gerado&select=id&limit=5",SB_KEY) or []
+        ids=[r["id"] for r in rows if r.get("id")]
+        if not ids:
+            m=re.search(r'_(\d{4,7})(?:_NOTA_.*)?\.pdf$', base, re.I)
+            if m:
+                rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?ticket=eq.{m.group(1)}&status=eq.gerado&select=id&limit=5",SB_KEY) or []
+                ids=[r["id"] for r in rows if r.get("id")]
+        if not ids: return
+        payload={"lancamento_motivo":motivo,"lancamento_status_ticket":status_ticket,"lancamento_em":_agora().isoformat()}
+        for i in ids:
+            try: _sb_write(f"notas_orcamento?id=eq.{i}", payload, method="PATCH")
+            except Exception: pass
+    except Exception as e:
+        print("persist lancamento erro:", str(e)[:150], flush=True)
+
 @app.post("/robot/lancar_progresso")
 async def robot_lancar_progresso(request: Request):
-    """O robô reporta o andamento de cada orçamento: {arquivo,status,pct}."""
+    """O robô reporta o andamento/RESULTADO de cada orçamento: {arquivo,status,pct,motivo,status_ticket}.
+       Quando vem 'motivo' (resultado terminal), persiste o motivo+status na linha do orçamento."""
     _robot_ok(request)
     b=await request.json()
     lista=b.get("itens") if isinstance(b.get("itens"),list) else [b]
     for it in lista:
         a=it.get("arquivo")
-        if a: _LANCAR_PROG["itens"][a]={"status":it.get("status") or "","pct":int(it.get("pct") or 0)}
+        if not a: continue
+        _LANCAR_PROG["itens"][a]={"status":it.get("status") or "","pct":int(it.get("pct") or 0),
+                                  "motivo":it.get("motivo"),"status_ticket":it.get("status_ticket")}
+        if it.get("motivo"):   # resultado terminal -> grava no banco
+            _persist_lancamento(a, it.get("motivo"), it.get("status_ticket"))
     _LANCAR_PROG["atualizado"]=_agora().isoformat()
     return {"ok":True}
 
@@ -3425,7 +3455,7 @@ async def orc_conferir_disparar(request: Request):
     try: _gh_dispatch_wf(GH_WF_LANCAR,{"modo":"conferir","alvo":""})
     except urllib.error.HTTPError as e: raise HTTPException(500,f"GitHub {e.code}: {e.read().decode()[:200]}")
     except Exception as e: raise HTTPException(500,f"disparo falhou: {e}")
-    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","CONFERIR_DUP","conferência de duplicidade")
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","CONFERIR_FALHA","conferência do ponto de falha")
     return {"ok":True}
 
 @app.get("/orc/conferir_status")
