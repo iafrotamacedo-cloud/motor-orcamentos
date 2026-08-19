@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 130
+#  CONTADOR DE REVISÕES DESTE app.py: 131
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -15,7 +15,8 @@ O operador abre a página, sobe as NOTAS/DAVs (PDF ou imagem) e clica em
   - mantém a planilha de controle do mês atualizada (e oferece p/ baixar no app);
   - atualiza as planilhas de correção (SEM TICKET / TICKET NAO ASSOCIADO).
 
-Leitura das notas (visão): Groq (Llama/Qwen) se GROQ_API_KEY existir; senão Gemini.
+Leitura das notas: PDF digital -> Groq no texto; ESCANEADO/FOTO -> Gemini VISÃO
+(flash-lite ~1.000 req/dia grátis; 2.5-flash p/ as difíceis), Groq de reserva.
 Ticket -> loja/aba: tabela `chamados` no Supabase (alimentada pelo robô do Trílogo).
 Regras (dos scripts): +20% no unitário (sem mencionar), rateio de entrega,
 1 orçamento por ticket, dedup pelo NÚMERO DA NOTA (permite +1 orçamento por ticket).
@@ -757,7 +758,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 130   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 131   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -2002,6 +2003,18 @@ GEMINI_RPD     = int(os.environ.get("GEMINI_RPD", "500"))   # cota diária do pl
 GROQ_TEXT_MODEL= os.environ.get("GROQ_TEXT_MODEL", "llama-3.3-70b-versatile")   # leitor de PDF (texto) — gratuito
 GROQ_VIS_MODEL = os.environ.get("GROQ_VIS_MODEL", "")  # visão do Groq (vazio = conta sem modelo de visão -> usa OCR)
 _ORC_GEMINI_OK = None   # memoriza o 1º modelo que funcionar no leitor de notas
+
+# --- Camadas do Gemini (visão) p/ nota ESCANEADA/FOTO ---
+# LEVES: cota grátis maior (flash-lite ≈ 1.000 req/dia) — resolve a maioria das notas.
+# FORTES: 2.5-flash (≈ 250 req/dia) — só para as notas em que a leve não fechou o total.
+GEMINI_LEVES  = [m.strip() for m in os.environ.get("GEMINI_LEVES",
+    "gemini-2.5-flash-lite,gemini-flash-lite-latest,gemini-2.0-flash-lite").split(",") if m.strip()]
+GEMINI_FORTES = [m.strip() for m in os.environ.get("GEMINI_FORTES", "").split(",") if m.strip()] \
+    or list(dict.fromkeys([GEMINI_MODEL, "gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash"]))
+
+ORC_ESPACO      = float(os.environ.get("ORC_ESPACO", "7"))       # espaço mínimo (s) entre chamadas de IA (planos grátis limitam por MINUTO)
+GROQ_429_ESPERA = float(os.environ.get("GROQ_429_ESPERA", "75")) # 429 do Groq: espera até isso (s) e repete; acima disso pula p/ o próximo modelo
+_AI_ULT = [0.0]   # monotonic da última chamada de IA (para o espaçamento)
 ORC_EXTRAPOLA  = float(os.environ.get("ORC_EXTRAPOLA", "500"))   # nota (antes do +20%) acima disso -> extrapolado
 RATEIO_TETO    = float(os.environ.get("RATEIO_TETO", "600"))     # NENHUM orçamento de rateio (JÁ com +20%) pode passar disto
 _LOGO_ORC_B64  = "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"
@@ -2164,23 +2177,34 @@ _ORC_PROMPT=(
 "quant (número), unid (coluna 'Embalagem': KG, UN, M...), valor_unit (o 'Preço Unitário', número). Inclua 'SERVICO DE ENTREGA' se existir.\n"
 "Responda só JSON: {\"notas\":[{\"ticket\":\"126486\",\"nota_numero\":\"18747\",\"data_nota\":\"03/08/2026\",\"itens\":[{\"descricao\":\"...\",\"quant\":1.0,\"unid\":\"UN\",\"valor_unit\":1.70}]}]}. Use ponto decimal."
 )
-def _ler_notas_gemini(file_bytes, mime="application/pdf"):
-    """Tenta uma lista de modelos e usa o 1º que funcionar (memoriza em _ORC_GEMINI_OK)."""
+def _ai_pace():
+    """Espaça as chamadas de IA (Groq/Gemini) em ORC_ESPACO segundos.
+       Os planos grátis limitam por MINUTO (RPM/TPM); com o espaçamento o lote não estoura o minuto."""
+    import time as _t
+    falta=ORC_ESPACO-(_t.monotonic()-_AI_ULT[0])
+    if falta>0: _t.sleep(falta)
+    _AI_ULT[0]=_t.monotonic()
+
+def _ler_notas_gemini(file_bytes, mime="application/pdf", modelos=None):
+    """Lê a nota com o Gemini (VISÃO — a imagem vai direto, sem OCR).
+       'modelos' define a ordem de tentativa (LEVES/FORTES); sem 'modelos',
+       usa a lista padrão e memoriza o 1º que funcionar em _ORC_GEMINI_OK."""
     global _ORC_GEMINI_OK
     import google.generativeai as genai
     genai.configure(api_key=GEMINI_API_KEY)
-    candidatos=[_ORC_GEMINI_OK] if _ORC_GEMINI_OK else list(dict.fromkeys([
-        GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest",
-        "gemini-2.5-flash-lite", "gemini-2.0-flash-lite",
-    ]))
+    if modelos:
+        candidatos=list(dict.fromkeys([m for m in modelos if m]))
+    else:
+        candidatos=[_ORC_GEMINI_OK] if _ORC_GEMINI_OK else list(dict.fromkeys(GEMINI_LEVES+GEMINI_FORTES))
     ultimo=None
     for nome in candidatos:                  # tenta cada modelo 1x (cotas separadas), sem esperas longas
         if not nome: continue
         try:
+            _ai_pace()
             model=genai.GenerativeModel(nome)
             r=model.generate_content([{"mime_type":mime,"data":file_bytes},_ORC_PROMPT],
                 generation_config={"response_mime_type":"application/json","temperature":0})
-            _ORC_GEMINI_OK=nome
+            if not modelos: _ORC_GEMINI_OK=nome
             _gemini_conta_inc()   # contabiliza 1 requisição na cota do dia
             try: return (json.loads(r.text) or {}).get("notas") or []
             except Exception: return []
@@ -2230,24 +2254,44 @@ def _pdf_texto(fb):
 GROQ_TEXT_FALLBACK = [GROQ_TEXT_MODEL, "llama-3.1-8b-instant", "openai/gpt-oss-20b"]
 GROQ_VIS_FALLBACK  = [GROQ_VIS_MODEL, "meta-llama/llama-4-maverick-17b-128e-instruct"]
 
+def _groq_espera_429(body, headers=None):
+    """Quanto tempo o Groq pede para esperar num 429 (header retry-after ou 'try again in 2m59.5s')."""
+    try:
+        ra=headers.get("retry-after") if headers else None
+        if ra: return float(ra)
+    except Exception: pass
+    m=re.search(r"try again in\s+(?:(\d+)m)?([\d.]+)s", body or "", re.I)
+    if m: return int(m.group(1) or 0)*60+float(m.group(2))
+    m=re.search(r"try again in\s+([\d.]+)m", body or "", re.I)
+    if m: return float(m.group(1))*60
+    return None
+
 def _groq_post(messages, model, json_mode=True):
-    """1 chamada ao Groq. Devolve o texto da resposta ou levanta RuntimeError('Groq <code>: <body>')."""
+    """1 chamada ao Groq. 429 com espera CURTA (limite do minuto): aguarda e repete 1x.
+       Devolve o texto da resposta ou levanta RuntimeError('Groq <code>: <body>')."""
     payload={"model":model,"temperature":0,"messages":messages,"max_tokens":4096}
     if json_mode: payload["response_format"]={"type":"json_object"}
-    req=urllib.request.Request("https://api.groq.com/openai/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json","Accept":"application/json",
-                 # Cloudflare barra sem UA de navegador (erro 1010 browser_signature_banned)
-                 "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
-    try:
-        raw=urllib.request.urlopen(req,timeout=90).read().decode()
-    except urllib.error.HTTPError as e:
-        body=""
-        try: body=e.read().decode("utf-8","ignore")
-        except Exception: pass
-        raise RuntimeError(f"Groq {e.code}: {body[:400]}") from None
-    return json.loads(raw)["choices"][0]["message"]["content"]
+    for tent in range(2):
+        _ai_pace()
+        req=urllib.request.Request("https://api.groq.com/openai/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Authorization":f"Bearer {GROQ_KEY}","Content-Type":"application/json","Accept":"application/json",
+                     # Cloudflare barra sem UA de navegador (erro 1010 browser_signature_banned)
+                     "User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"})
+        try:
+            raw=urllib.request.urlopen(req,timeout=90).read().decode()
+            return json.loads(raw)["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            body=""
+            try: body=e.read().decode("utf-8","ignore")
+            except Exception: pass
+            if e.code==429 and tent==0:
+                esp=_groq_espera_429(body, e.headers)
+                if esp is not None and 0<esp<=GROQ_429_ESPERA:   # limite do MINUTO -> espera e repete
+                    import time as _t; _t.sleep(esp+1); continue
+            raise RuntimeError(f"Groq {e.code}: {body[:400]}") from None
+    raise RuntimeError("Groq: sem resposta")
 
 def _groq_models():
     """Lista os modelos que a conta Groq tem acesso (GET /models)."""
@@ -2270,7 +2314,10 @@ def _groq_chat(messages, modelos):
             # modelo não aceita response_format json -> tenta sem
             if "400" in s and ("json" in s.lower() or "response_format" in s.lower()):
                 try: return _groq_post(messages, m, json_mode=False)
-                except RuntimeError as e2: ultimo=e2
+                except RuntimeError as e2: ultimo=e2; s=str(e2)
+            # 429 = limite DESTE modelo (cotas separadas por modelo) -> tenta o próximo
+            if "Groq 429" in s:
+                continue
             # modelo inexistente/desativado -> próximo
             if any(x in s.lower() for x in ("not found","does not exist","decommission","not supported","400","404")):
                 continue
@@ -2565,17 +2612,18 @@ def _parse_excel_nota(fb):
     if not itens: return []
     return [{"fornecedor":fornecedor,"cnpj":cnpj,"nota_numero":nota,"data_nota":data,"itens":itens}]
 
-def _via_gemini(fb, mime, it, st):
-    """Gemini como ÚLTIMO recurso, respeitando a cota diária."""
-    if st.get("gemini_bloqueado"): raise _CotaExcedida()
+def _via_gemini(fb, mime, it, st, modelos=None, rotulo="gemini"):
+    """Chama o Gemini (visão) respeitando a cota diária. O bloqueio por 429 é POR GRUPO
+       de modelos ('rotulo'): se as LEVES esgotarem, as FORTES continuam disponíveis."""
+    if st.get("gemini_bloqueado") or st.get(f"gem_bloq_{rotulo}"): raise _CotaExcedida()
     if _gemini_cota()["restantes"]<=0:
         st["gemini_bloqueado"]=True; raise _CotaExcedida()
     it["etapa"]="gemini"; it["status"]="lendo com Gemini"
     try:
-        return _ler_notas_gemini(fb, mime)
+        return _ler_notas_gemini(fb, mime, modelos)
     except Exception as e:
         if any(s in str(e).lower() for s in ("429","quota","exceeded","resource_exhausted","rate limit")):
-            st["gemini_bloqueado"]=True; raise _CotaExcedida()
+            st[f"gem_bloq_{rotulo}"]=True; raise _CotaExcedida()
         raise
 
 # ---------- CONFERÊNCIA POR TOTAL (garante que a leitura fechou) ----------
@@ -2606,8 +2654,13 @@ def _ler_notas_rota(fb, mime, nome, it, st):
     """CASCATA DE LEITURA (barata/confiável -> cara/último caso):
        Camada 0: vira TEXTO — PDF digital (pdftotext) ou OCR (scan/imagem, com pré-processamento).
        Camada 1: parsers locais DANFE/DAV (sem IA), conferidos pelo total da nota.
-       Camada 2: Groq no texto (grátis, sem cota diária), também conferido pelo total.
-       Camada 3: Gemini na imagem (último recurso; respeita a cota diária).
+       Camadas de IA (a ordem depende da origem):
+         · ESCANEADO/IMAGEM: Gemini VISÃO primeiro (a imagem vai direto, sem perder dígitos no OCR)
+           — leve (flash-lite, ~1.000 req/dia grátis) e depois forte (2.5-flash) se o total não fechar;
+           Groq no texto do OCR fica de RESERVA.
+         · PDF DIGITAL: Groq no texto primeiro (não gasta cota do Gemini); Gemini por último.
+       Toda leitura de IA é conferida pelo total impresso; se nada validar mas houver uma leitura
+       íntegra (itens completos), ela é aproveitada em vez de virar erro.
        Devolve (notas, reader)."""
     is_pdf = (nome or "").lower().endswith(".pdf") or mime=="application/pdf"
 
@@ -2635,19 +2688,58 @@ def _ler_notas_rota(fb, mime, nome, it, st):
         elif notas:
             it["diag"]="leitor local: soma não bateu com o total"
 
-        # ---- Camada 2: Groq no texto (grátis) ----
-        if GROQ_KEY:
-            it["etapa"]="groq"; it["status"]=("lendo com Groq (OCR)" if origem=="ocr" else "lendo com Groq")
-            try:
-                g=_groq_notas_texto(texto)
-                if g and _leitura_ok(g, texto):
-                    _formato_registra(texto, "groq", g[0].get("nota_numero"))
-                    return g, ("groq-ocr" if origem=="ocr" else "groq")
-                it["diag"]="Groq leu incompleto / total não bateu"
-            except Exception as e: it["diag"]=f"Groq: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
+    # ---- Camadas de IA ----
+    candidata=[None]   # melhor leitura ÍNTEGRA que não deu p/ conferir pelo total (aproveitada no fim)
+    cota_hit=[False]   # algum grupo do Gemini estourou cota/429 nesta nota
 
-    # ---- Camada 3: Gemini na imagem (último recurso) ----
-    return _via_gemini(fb, mime, it, st), "gemini"
+    def _guarda_candidata(g, rotulo):
+        if g and _notas_seguras(g) and candidata[0] is None:
+            candidata[0]=(g, rotulo)
+
+    def _groq_texto_tenta():
+        if not (GROQ_KEY and texto and len(texto)>=30): return None
+        rot=("groq-ocr" if origem=="ocr" else "groq")
+        it["etapa"]="groq"; it["status"]=("lendo com Groq (OCR)" if origem=="ocr" else "lendo com Groq")
+        try:
+            g=_groq_notas_texto(texto)
+            if g and _leitura_ok(g, texto):
+                _formato_registra(texto, "groq", g[0].get("nota_numero"))
+                return g, rot
+            _guarda_candidata(g, rot)
+            if g: it["diag"]="Groq leu incompleto / total não bateu"
+        except Exception as e:
+            it["diag"]=f"Groq: {str(e)[:160]}"; st["groq_erro"]=it["diag"]
+        return None
+
+    def _gemini_tenta(modelos, rotulo):
+        try:
+            g=_via_gemini(fb, mime, it, st, modelos, rotulo)
+        except _CotaExcedida:
+            cota_hit[0]=True; return None                 # esse grupo esgotou; os outros seguem
+        except Exception as e:
+            it["diag"]=f"Gemini: {str(e)[:160]}"; return None
+        if g and (_leitura_ok(g, texto) if texto else _notas_seguras(g)):
+            return g, rotulo
+        _guarda_candidata(g, rotulo)
+        if g: it["diag"]="Gemini leu incompleto / total não bateu"
+        return None
+
+    if origem=="ocr" and GEMINI_API_KEY:
+        # ESCANEADO/IMAGEM: visão primeiro (leve -> forte), Groq de reserva
+        r=_gemini_tenta(GEMINI_LEVES, "gemini-lite") or _gemini_tenta(GEMINI_FORTES, "gemini") or _groq_texto_tenta()
+    else:
+        # PDF DIGITAL (ou sem chave Gemini): Groq no texto primeiro, Gemini por último
+        r=_groq_texto_tenta() or _gemini_tenta(GEMINI_LEVES+GEMINI_FORTES, "gemini")
+    if r: return r
+
+    if candidata[0]:                                      # leu tudo, só não deu p/ bater o total impresso
+        return candidata[0]
+    if st.get("gemini_bloqueado") or cota_hit[0]:         # cota/429 do Gemini: NÃO move a nota —
+        raise _CotaExcedida()                             # ela fica na pasta p/ a próxima rodada
+    d=str(it.get("diag") or "")
+    if re.match(r"(Groq|Gemini):", d):                    # falha de serviço (429 etc.):
+        raise RuntimeError(d)                             # mantém a nota na pasta p/ a próxima rodada
+    return [], ("ocr" if origem=="ocr" else "pdf")
 
 # ---------- PADRONIZAÇÃO DO NOME DA LOJA (item: "LOJA NN - NOME"; CD -> Centro de Distribuição) ----------
 _LOJA_NOME_FULL = {20:"RUI BARBOSA", 23:"JÚLIO VENTURA", 101:"CENTRO DE DISTRIBUIÇÃO"}   # nomes por extenso/oficiais
