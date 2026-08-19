@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # =====================================================================
-#  CONTADOR DE REVISÕES DESTE app.py: 131
+#  CONTADOR DE REVISÕES DESTE app.py: 132
 #  (some +1 sempre que uma versão nova for gerada)
 # =====================================================================
 """
@@ -758,7 +758,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 131   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 132   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -2168,14 +2168,16 @@ def gera_orcamento_docx(d):
     out=io.BytesIO(); doc.save(out); return out.getvalue()
 
 _ORC_PROMPT=(
-"Você recebe um 'DOCUMENTO AUXILIAR DE VENDA - PEDIDO' (nota de material). Pode haver MAIS DE UMA nota (uma por página). "
-"Para CADA nota extraia em JSON:\n"
+"Você recebe um documento de venda de material: NOTA FISCAL (DANFE) ou 'DOCUMENTO AUXILIAR DE VENDA - PEDIDO' (DAV). "
+"Pode haver MAIS DE UM documento (um por página). Para CADA um extraia em JSON:\n"
+"- tipo_doc: 'NF' se for NOTA FISCAL / DANFE (tem 'DOCUMENTO AUXILIAR DA NOTA FISCAL ELETRÔNICA', chave de acesso de 44 dígitos, 'DADOS DO PRODUTO'); "
+"'DAV' se for DOCUMENTO AUXILIAR DE VENDA / PEDIDO / ORÇAMENTO de fornecedor (não é nota fiscal; será faturado depois).\n"
 "- ticket: número do chamado, no campo 'Observação' (aparece como 'TICKET', 'TICKER' ou '#' seguido de dígitos). Só os dígitos; se não houver, null.\n"
-"- nota_numero: o 'Nº do Documento' da nota (só dígitos).\n"
+"- nota_numero: o Nº do documento (na NF é o 'Nº' da nota; na DAV é o 'Nº do Documento'). Só dígitos.\n"
 "- data_nota: a data de emissão ('Dt. Emis') no formato DD/MM/AAAA.\n"
 "- itens: linhas da tabela de produtos. Para cada item: descricao (nome do produto SEM o código numérico inicial e sem ' - '), "
 "quant (número), unid (coluna 'Embalagem': KG, UN, M...), valor_unit (o 'Preço Unitário', número). Inclua 'SERVICO DE ENTREGA' se existir.\n"
-"Responda só JSON: {\"notas\":[{\"ticket\":\"126486\",\"nota_numero\":\"18747\",\"data_nota\":\"03/08/2026\",\"itens\":[{\"descricao\":\"...\",\"quant\":1.0,\"unid\":\"UN\",\"valor_unit\":1.70}]}]}. Use ponto decimal."
+"Responda só JSON: {\"notas\":[{\"tipo_doc\":\"DAV\",\"ticket\":\"126486\",\"nota_numero\":\"18747\",\"data_nota\":\"03/08/2026\",\"itens\":[{\"descricao\":\"...\",\"quant\":1.0,\"unid\":\"UN\",\"valor_unit\":1.70}]}]}. Use ponto decimal."
 )
 def _ai_pace():
     """Espaça as chamadas de IA (Groq/Gemini) em ORC_ESPACO segundos.
@@ -2423,6 +2425,26 @@ class _CotaExcedida(Exception):
     """Gemini indisponível por limite diário — pula a nota e avisa."""
     pass
 
+def _tag_tipo(notas, texto):
+    """Garante 'tipo_doc' (NF|DAV) em cada nota lida por IA. A IA responde tipo_doc;
+       se vier faltando/errado, cai no detector local (_qual_formato do texto)."""
+    for nt in (notas or []):
+        t=str(nt.get("tipo_doc") or "").upper().strip()
+        nt["tipo_doc"]=t if t in ("NF","DAV") else ("NF" if _qual_formato(texto)=="danfe" else "DAV")
+    return notas
+
+def _doc_cols(nt=None, nota_num=None, tipo=None):
+    """Colunas de documento p/ o BD notas_orcamento:
+       NF  -> preenche só nota_numero (dav_numero fica null);
+       DAV -> preenche só dav_numero (nota_numero fica null; a NF virá no faturamento).
+       Sem número -> só limpa nota_numero (não mexe no dav_numero de linha antiga)."""
+    n=_num_limpo(nota_num)
+    if not n or str(nota_num)=="SN": n=None
+    t=str(tipo or (nt or {}).get("tipo_doc") or "").upper()
+    if n is None: return {"nota_numero": None}
+    if t=="DAV": return {"nota_numero": None, "dav_numero": n}
+    return {"nota_numero": n, "dav_numero": None}
+
 def _num_br(s):
     s=re.sub(r"[^\d,.\-]","",str(s or "").strip())
     if not s: return 0.0
@@ -2486,7 +2508,7 @@ def _parse_danfe_texto(txt):
             if itens and t and not re.search(r"\d{8}",t) and len(t)>=3 and not re.match(r"^[\d,.\s%]+$",t) and not re.match(r"^\s*C[ÓO]DIGO",t,re.I):
                 itens[-1]["descricao"]=(itens[-1]["descricao"]+" "+t)[:160]
     if not itens: return []
-    o={"ticket":ticket,"nota_numero":nota,"data_nota":data,"itens":itens}
+    o={"tipo_doc":"NF","ticket":ticket,"nota_numero":nota,"data_nota":data,"itens":itens}
     return [o] if _notas_seguras([o]) else []
 
 def _parse_dav_texto(txt):
@@ -2515,7 +2537,7 @@ def _parse_dav_texto(txt):
             if itens and t and not re.match(r"^\s*\d{5,}\s*-",t) and len(t)>=3 and not re.match(r"^[\d,.\s%]+$",t):
                 itens[-1]["descricao"]=(itens[-1]["descricao"]+" "+t)[:160]
     if not itens: return []
-    o={"ticket":ticket,"nota_numero":nota,"data_nota":data,"itens":itens}
+    o={"tipo_doc":"DAV","ticket":ticket,"nota_numero":nota,"data_nota":data,"itens":itens}
     return [o] if _notas_seguras([o]) else []
 
 def _seg_por_nota(T):
@@ -2610,7 +2632,8 @@ def _parse_excel_nota(fb):
         nota=nota or (_num_limpo(g(r,ci_num)) if g(r,ci_num) else None)
         data=data or _data_br_any(g(r,ci_data))
     if not itens: return []
-    return [{"fornecedor":fornecedor,"cnpj":cnpj,"nota_numero":nota,"data_nota":data,"itens":itens}]
+    tipo="DAV" if any("DAV" in h for h in hdr) else "NF"   # planilha com coluna de DAV -> documento é DAV
+    return [{"tipo_doc":tipo,"fornecedor":fornecedor,"cnpj":cnpj,"nota_numero":nota,"data_nota":data,"itens":itens}]
 
 def _via_gemini(fb, mime, it, st, modelos=None, rotulo="gemini"):
     """Chama o Gemini (visão) respeitando a cota diária. O bloqueio por 429 é POR GRUPO
@@ -2701,7 +2724,7 @@ def _ler_notas_rota(fb, mime, nome, it, st):
         rot=("groq-ocr" if origem=="ocr" else "groq")
         it["etapa"]="groq"; it["status"]=("lendo com Groq (OCR)" if origem=="ocr" else "lendo com Groq")
         try:
-            g=_groq_notas_texto(texto)
+            g=_tag_tipo(_groq_notas_texto(texto), texto)
             if g and _leitura_ok(g, texto):
                 _formato_registra(texto, "groq", g[0].get("nota_numero"))
                 return g, rot
@@ -2718,6 +2741,7 @@ def _ler_notas_rota(fb, mime, nome, it, st):
             cota_hit[0]=True; return None                 # esse grupo esgotou; os outros seguem
         except Exception as e:
             it["diag"]=f"Gemini: {str(e)[:160]}"; return None
+        g=_tag_tipo(g, texto)
         if g and (_leitura_ok(g, texto) if texto else _notas_seguras(g)):
             return g, rotulo
         _guarda_candidata(g, rotulo)
@@ -2876,7 +2900,8 @@ def _nota_ja_gerada(ticket, nota_num, base_nome=None):
     ticket+loja+nota), fechando o furo que deixava notas sem número serem rateadas várias vezes."""
     # 1) por ticket + número da nota (quando há número)
     if nota_num and str(nota_num)!="SN":
-        q=urllib.parse.urlencode({"ticket":f"eq.{ticket}","nota_numero":f"eq.{nota_num}","status":"eq.gerado","select":"ticket","limit":"1"})
+        # o Nº pode estar na coluna da NF (nota_numero) OU na da DAV (dav_numero)
+        q=urllib.parse.urlencode({"ticket":f"eq.{ticket}","or":f"(nota_numero.eq.{nota_num},dav_numero.eq.{nota_num})","status":"eq.gerado","select":"ticket","limit":"1"})
         try:
             if _sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{q}",SB_KEY): return True
         except Exception: pass
@@ -4203,14 +4228,14 @@ def _orc_job_run(job, previa, uid, papel):
                     info.update(status="pendente",motivo="sem ticket",destino="6")
                     dest6 = nome if pages is None else f"{os.path.splitext(nome)[0]}_p{i+1}{ext}"
                     _mv_nota(P6, dest6)
-                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket","valor_nota":valor_nota,"itens":itens,"arquivo_nota":f"6/{dest6}","criado_por":uid})
+                    if not previa: _orc_registra({**_doc_cols(nt,nota_num),"ticket":None,"status":"sem_ticket","valor_nota":valor_nota,"itens":itens,"arquivo_nota":f"6/{dest6}","criado_por":uid})
                     res.append(info); continue
                 lj=_loja_do_ticket(ticket)
                 if not lj:
                     info.update(status="pendente",motivo="ticket não encontrado nos chamados",destino="7")
                     dest7 = nome if pages is None else f"TICKET_{ticket}_NOTA_{nota_num}{ext}"
                     _mv_nota(P7, dest7)
-                    if not previa: _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,"status":"ticket_nao_associado","valor_nota":valor_nota,"itens":itens,"arquivo_nota":f"7/{dest7}","criado_por":uid})
+                    if not previa: _orc_registra({**_doc_cols(nt,nota_num),"ticket":ticket,"status":"ticket_nao_associado","valor_nota":valor_nota,"itens":itens,"arquivo_nota":f"7/{dest7}","criado_por":uid})
                     res.append(info); continue
                 loja=lj.get("loja") or {}
                 loja_nome=(loja.get("nome") if loja else None) or re.sub(r"^LOJA\s*\d*\s*-?\s*","",lj.get("unidade") or "",flags=re.I).strip() or "—"
@@ -4258,7 +4283,7 @@ def _orc_job_run(job, previa, uid, papel):
                         dropbox_rateio.criar_pasta(access,f"{P8}/{sub}")
                         _mv_nota(f"{P8}/{sub}", f"TICKET_{ticket}_NOTA_{nota_num}{ext}")
                         arq_nota=f"8/{sub}/TICKET_{ticket}_NOTA_{nota_num}{ext}"
-                    _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":ticket,
+                    _orc_registra({**_doc_cols(nt,nota_num),"ticket":ticket,
                         "loja_numero":(loja.get("numero") if loja else None),"loja_nome":loja_nome,"aba":lj.get("aba"),
                         "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
                         "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
@@ -4367,7 +4392,7 @@ def _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,n
         destino=f"TICKET_{ticket}_NOTA_{nota_num}{ext}"
         try: dropbox_rateio.mover(access,f"{src_base}/{src_nm}",f"{P8}/{sub}/{destino}"); arq_nota=f"8/{sub}/{destino}"
         except Exception: pass
-    _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"ticket":ticket,"nota_numero":(nota_num if nota_num!='SN' else None),
+    _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"ticket":ticket,**_doc_cols(nt,nota_num),
         "loja_numero":(loja.get("numero") if loja else None),"loja_nome":loja_nome,"aba":lj.get("aba"),
         "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
         "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
@@ -4424,7 +4449,7 @@ def _reproc_contagem():
         elif s=="removido": c["removido"]+=1
     return c
 
-def _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data_nota,P7):
+def _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data_nota,P7,tipo_doc=None):
     """Vira/continua TICKET NÃO ASSOCIADO reusando a MESMA linha (UPDATE por id).
        Preenche TUDO que foi lido (Regra 0): nota_numero, data_nota, itens, valor. Move o arquivo -> 7."""
     arq_nota=row.get("arquivo_nota") or (f"7/{src_nm}" if src_nm else None)
@@ -4433,15 +4458,15 @@ def _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data
         try: dropbox_rateio.mover(access,f"{src_base}/{src_nm}",f"{P7}/{destino}"); arq_nota=f"7/{destino}"
         except Exception: pass
     _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"ticket":ticket,"status":"ticket_nao_associado",
-        "nota_numero":(nota_num if nota_num and nota_num!='SN' else None),"data_nota":_data_iso(data_nota),
+        **_doc_cols(None,nota_num,tipo_doc),"data_nota":_data_iso(data_nota),
         "itens":itens,"valor_nota":valor_nota,"arquivo_nota":arq_nota},"PATCH")
 
-def _reproc_st(access,row,src_base,src_nm,itens,valor_nota,nota_num,data_nota,P6):
+def _reproc_st(access,row,src_base,src_nm,itens,valor_nota,nota_num,data_nota,P6,tipo_doc=None):
     """Continua SEM TICKET reusando a MESMA linha (UPDATE por id).
        Preenche TUDO que foi lido (Regra 0): nota_numero, data_nota, itens, valor. O arquivo fica na 6."""
     arq_nota=(f"6/{src_nm}" if src_nm else (row.get("arquivo_nota") or None))
     _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"status":"sem_ticket",
-        "nota_numero":(nota_num if nota_num and nota_num!='SN' else None),"data_nota":_data_iso(data_nota),
+        **_doc_cols(None,nota_num,tipo_doc),"data_nota":_data_iso(data_nota),
         "itens":itens,"valor_nota":valor_nota,"arquivo_nota":arq_nota},"PATCH")
 
 def _reproc_run(job, previa, uid, papel):
@@ -4508,10 +4533,12 @@ def _reproc_run(job, previa, uid, papel):
                 read_ticket=_num_limpo(nt.get("ticket"))
                 data_nota=nt.get("data_nota") or row.get("data_nota")
                 valor_nota=round(sum(_num_br(x.get("valor_unit"))*_num_br(x.get("quant")) for x in itens),2)
+                tipo_doc=nt.get("tipo_doc")
             else:
                 nota_num=_num_limpo(row.get("nota_numero")) or "SN"
                 itens=row.get("itens") or []; read_ticket=None; data_nota=row.get("data_nota")
                 valor_nota=round(_num_br(row.get("valor_nota")),2)
+                tipo_doc=None                      # sem releitura: mantém o padrão (número veio da coluna de NF)
             if not itens or valor_nota<=0:
                 info.update(resultado="erro",nota=nota_num,motivo=(info.get("motivo_leitura") or "sem itens/valor para processar")); res.append(info); continue
             info.update(nota=nota_num,valor_nota=valor_nota,valor_orc=round(valor_nota*1.20,2))
@@ -4531,12 +4558,12 @@ def _reproc_run(job, previa, uid, papel):
             info["ticket"]=ticket or None
             if not ticket:
                 info["resultado"]="sem_ticket"
-                if not previa: _reproc_st(access,row,src_base,src_nm,itens,valor_nota,nota_num,data_nota,P6)
+                if not previa: _reproc_st(access,row,src_base,src_nm,itens,valor_nota,nota_num,data_nota,P6,tipo_doc)
                 res.append(info); continue
             lj=_loja_do_ticket(ticket)
             if not lj:
                 info["resultado"]="ticket_nao_associado"
-                if not previa: _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data_nota,P7)
+                if not previa: _reproc_tna(access,row,src_base,src_nm,itens,valor_nota,ticket,nota_num,data_nota,P7,tipo_doc)
                 res.append(info); continue
             # ---- ticket VÁLIDO na Lista -> gera (Regra 1) ----
             # NOVA REGRA: vários orçamentos DIFERENTES por ticket são permitidos.
@@ -4546,7 +4573,7 @@ def _reproc_run(job, previa, uid, papel):
             info.update(resultado="gerado",loja=loja_nome,aba=lj.get("aba"),extrapolado=extrap)
             if not previa:
                 try:
-                    _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,nota_num,lj,loja,loja_nome,extrap,{"data_nota":data_nota},P1,P9,P10,P8)
+                    _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,nota_num,lj,loja,loja_nome,extrap,{"data_nota":data_nota,"tipo_doc":tipo_doc},P1,P9,P10,P8)
                 except Exception as e:
                     info.update(resultado="erro",motivo=f"gerar: {str(e)[:100]}"); res.append(info); continue
             if fp: fp_run.add(fp)
@@ -4820,7 +4847,7 @@ def _rateio_leitura(fb, mime, nome):
         _formato_registra(texto,_qual_formato(texto),notas[0].get("nota_numero")); return notas, texto
     if GROQ_KEY and texto:
         try:
-            g=_groq_notas_texto(texto)
+            g=_tag_tipo(_groq_notas_texto(texto), texto)
             if g and _leitura_ok(g, texto):
                 _formato_registra(texto,"groq",g[0].get("nota_numero")); return g, texto
         except Exception: pass
@@ -4838,7 +4865,8 @@ def _rateio_info(access, pasta3, arquivo):
         nt=notas[0]
         info={"ok":True,"arquivo":arquivo,"fornecedor":nt.get("fornecedor") or _nome_emitente(texto) or "—",
               "data":nt.get("data_nota"),"valor":_soma_itens(notas),
-              "nota_numero":nt.get("nota_numero"),"cnpj":nt.get("cnpj") or _cnpj_emitente(texto),
+              "nota_numero":nt.get("nota_numero"),"tipo_doc":nt.get("tipo_doc"),
+              "cnpj":nt.get("cnpj") or _cnpj_emitente(texto),
               "itens":nt.get("itens") or []}
     _RAT_INFO[arquivo]=info
     if len(_RAT_INFO)>60:
@@ -5024,7 +5052,7 @@ def _rat_job_run(job, dados_job, uid, papel):
                         dropbox_rateio.subir_bytes(access,doc_bytes,f"{P11}/{mes}/{slug}/{base_nome}.docx",overwrite=True)
                         arq_pdf=f"11/{mes}/{slug}/{base_nome}.pdf"; arq_doc=f"11/{mes}/{slug}/{base_nome}.docx"
             except Exception as e: r["motivo"]=f"salvar: {str(e)[:90]}"
-            _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":tk,
+            _orc_registra({**_doc_cols(dados_job,nota_num),"ticket":tk,
                 "loja_numero":loja.get("numero"),"loja_nome":loja_nome,"aba":aba,
                 "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
                 "rateio":True,"itens":itens_orc,"data_nota":_data_iso(dados_job.get("data_nota")),"mes_ref":mes,
@@ -5071,8 +5099,8 @@ async def rateio_gerar(request: Request):
     if len(_RAT_JOBS)>20:
         for k in list(_RAT_JOBS)[:-10]: _RAT_JOBS.pop(k,None)
     _RAT_JOBS[job]={"estado":"rodando","total":0,"feitas":0,"gerados":0,"res":[]}
-    dados_job={"arquivo":arquivo,"nota_numero":b.get("nota_numero"),"data_nota":b.get("data_nota"),
-               "loja":lj,"alocacao":alocacao}
+    dados_job={"arquivo":arquivo,"nota_numero":b.get("nota_numero"),"tipo_doc":b.get("tipo_doc"),
+               "data_nota":b.get("data_nota"),"loja":lj,"alocacao":alocacao}
     threading.Thread(target=_rat_job_run,args=(job,dados_job,u["id"],p["papel"]),daemon=True).start()
     return {"job":job}
 
@@ -5276,7 +5304,7 @@ async def orc_txt_parse(request: Request):
 def _nota_ja_registrada(ticket, nota_num):
     """True se já existe QUALQUER registro (pendente ou gerado) para essa nota — evita duplicar."""
     if not nota_num or str(nota_num)=="SN": return False
-    parts=[f"nota_numero=eq.{nota_num}","select=ticket","limit=1"]
+    parts=[f"or=(nota_numero.eq.{nota_num},dav_numero.eq.{nota_num})","select=ticket","limit=1"]
     parts.insert(0, f"ticket=eq.{ticket}" if ticket else "ticket=is.null")
     try: return bool(_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?{'&'.join(parts)}",SB_KEY))
     except Exception: return False
@@ -5297,7 +5325,7 @@ def _txt_job_run(job, notas, uid, papel):
             if not tk:
                 if _nota_ja_registrada(None, nota_num):
                     r.update(status="duplicada",motivo="nota já registrada"); res.append(r); st["feitas"]=_i+1; continue
-                _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":None,"status":"sem_ticket",
+                _orc_registra({**_doc_cols(nt,nota_num),"ticket":None,"status":"sem_ticket",
                                "valor_nota":valor_pend,"itens":itens,"data_nota":_data_iso(nt.get("data_nota")),"criado_por":uid})
                 r.update(status="sem_ticket",motivo="enviada para correção"); res.append(r); st["feitas"]=_i+1; continue
             lj=_loja_do_ticket(tk); loja=(lj or {}).get("loja") or {}
@@ -5305,7 +5333,7 @@ def _txt_job_run(job, notas, uid, papel):
             if not lj:
                 if _nota_ja_registrada(tk, nota_num):
                     r.update(status="duplicada",motivo="nota já registrada"); res.append(r); st["feitas"]=_i+1; continue
-                _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":tk,"status":"ticket_nao_associado",
+                _orc_registra({**_doc_cols(nt,nota_num),"ticket":tk,"status":"ticket_nao_associado",
                                "valor_nota":valor_pend,"itens":itens,"data_nota":_data_iso(nt.get("data_nota")),"criado_por":uid})
                 r.update(status="ticket_nao_associado",motivo="enviada para correção"); res.append(r); st["feitas"]=_i+1; continue
             if _nota_ja_gerada(tk, nota_num):   # NUNCA processa a mesma nota 2x
@@ -5334,7 +5362,7 @@ def _txt_job_run(job, notas, uid, papel):
                         dropbox_rateio.subir_bytes(access,doc_bytes,f"{P10}/{mes}/{slug}/{base_nome}.docx",overwrite=True)
                         arq_pdf=f"10/{mes}/{slug}/{base_nome}.pdf"; arq_doc=f"10/{mes}/{slug}/{base_nome}.docx"
             except Exception as e: r["motivo"]=f"salvar: {str(e)[:80]}"
-            _orc_registra({"nota_numero":nota_num if nota_num!="SN" else None,"ticket":tk,
+            _orc_registra({**_doc_cols(nt,nota_num),"ticket":tk,
                 "loja_numero":loja.get("numero"),"loja_nome":loja_nome,"aba":lj.get("aba"),
                 "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
                 "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
