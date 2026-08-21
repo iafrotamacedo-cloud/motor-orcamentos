@@ -758,7 +758,7 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI(title="Motor de Orçamentos — Frota Macedo")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-APP_REV = 136   # bater com o contador do topo; conferir no /versao ou no log do boot
+APP_REV = 137   # bater com o contador do topo; conferir no /versao ou no log do boot
 print(f"MOTOR app.py rev {APP_REV} — iniciando", flush=True)
 
 @app.get("/versao")
@@ -2175,6 +2175,9 @@ _ORC_PROMPT=(
 "- ticket: número do chamado, no campo 'Observação' (aparece como 'TICKET', 'TICKER' ou '#' seguido de dígitos). Só os dígitos; se não houver, null.\n"
 "- nota_numero: o Nº do documento (na NF é o 'Nº' da nota; na DAV é o 'Nº do Documento'). Só dígitos.\n"
 "- data_nota: a data de emissão ('Dt. Emis') no formato DD/MM/AAAA.\n"
+"- fornecedor: razão social do EMITENTE do documento (quem vendeu). Se não achar, null.\n"
+"- pedido_fatura: se o documento citar um PEDIDO DE FATURA (ex.: 'PEDIDO DE FATURA PF-0007' ou 'PED. FATURA 7', "
+"geralmente nas observações), devolva o número como aparece; senão null.\n"
 "- itens: linhas da tabela de produtos. Para cada item: descricao (nome do produto SEM o código numérico inicial e sem ' - '), "
 "quant (número), unid (coluna 'Embalagem': KG, UN, M...), valor_unit (o 'Preço Unitário', número). Inclua 'SERVICO DE ENTREGA' se existir.\n"
 "Responda só JSON: {\"notas\":[{\"tipo_doc\":\"DAV\",\"ticket\":\"126486\",\"nota_numero\":\"18747\",\"data_nota\":\"03/08/2026\",\"itens\":[{\"descricao\":\"...\",\"quant\":1.0,\"unid\":\"UN\",\"valor_unit\":1.70}]}]}. Use ponto decimal."
@@ -2887,6 +2890,64 @@ def _split_pdf(pdf_bytes):
     except Exception: return [pdf_bytes]
     return out or [pdf_bytes]
 
+def _parte_soma(ticket):
+    """(parte, soma_ja_orcada): quantos orçamentos ativos o ticket já tem e a soma deles."""
+    try:
+        ja=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?ticket=eq.{ticket}&status=eq.gerado&select=id,valor_orcamento",SB_KEY) or []
+    except Exception: ja=[]
+    return len(ja)+1, round(sum(_numf(x.get("valor_orcamento")) for x in ja),2)
+
+def _pasta12(access, ob):
+    """Pasta '12 - NOTAS DE FATURAMENTO DAV' — cria se não existir."""
+    p=_pasta_manut(access,12,ob)
+    if p: return p
+    try:
+        dropbox_rateio.criar_pasta(access, f"{ob}/12 - NOTAS DE FATURAMENTO DAV")
+        return _pasta_manut(access,12,ob)
+    except Exception: return None
+
+def _pf_num_limpo(v):
+    d=re.sub(r"\D","",str(v or ""))
+    return d.lstrip("0") or None
+
+def _pf_processa(access, ob, nt, nota_num, valor_nota, itens, mover_nota):
+    """NF que cita um Pedido de Fatura: NÃO gera orçamento. Casa com o pedido aberto:
+       bate valor (tolerância R$0,05) e nº de itens; OK -> preenche nota_numero nas DAVs
+       e o pedido vira 'faturado'; senão vira 'divergente' com o comparativo. O PDF da NF
+       vai para a pasta 12 em qualquer caso (prefixo DIVERGENTE_ quando não bateu)."""
+    pfn=_pf_num_limpo(nt.get("pedido_fatura"))
+    if not pfn: return None
+    peds=_sb_json(f"{SB_URL}/rest/v1/pedidos_fatura?status=in.(aberto,divergente)&select=id,numero,valor_total&limit=200",SB_KEY) or []
+    ped=next((p for p in peds if _pf_num_limpo(p.get("numero"))==pfn), None)
+    if not ped:
+        return {"resultado":"pf_nao_encontrado","pedido":pfn,
+                "motivo":f"NF cita pedido de fatura {pfn}, mas não há pedido aberto com esse número"}
+    davs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?pedido_fatura_id=eq.{ped['id']}&select=id,dav_numero,valor_nota,itens&limit=500",SB_KEY) or []
+    soma_dav=round(sum(_numf(d.get("valor_nota")) for d in davs),2)
+    it_dav=sum(len(d.get("itens") or []) for d in davs)
+    vnf=round(_numf(valor_nota),2); it_nf=len(itens or [])
+    ok=(abs(vnf-soma_dav)<=0.05) and (it_nf==it_dav)
+    P12=_pasta12(access, ob)
+    pref="" if ok else "DIVERGENTE_"
+    nome12=f"{pref}NF_{nota_num}_PEDIDO_{ped['numero']}.pdf"
+    try:
+        if P12: mover_nota(P12, nome12)
+    except Exception: pass
+    if ok:
+        for d in davs:
+            _sb_write(f"notas_orcamento?id=eq.{d['id']}",
+                      {"nota_numero":_num_limpo(nota_num),"status_pagamento":"faturada"},"PATCH")
+        _sb_write(f"pedidos_fatura?id=eq.{ped['id']}",
+                  {"status":"faturado","nota_numero":_num_limpo(nota_num),
+                   "faturado_em":_hoje().isoformat(),"divergencia":None},"PATCH")
+        return {"resultado":"pf_faturado","pedido":ped["numero"],"davs":len(davs),"valor":vnf}
+    div={"nf_numero":_num_limpo(nota_num),"nf_valor":vnf,"nf_itens":it_nf,
+         "pedido_valor":soma_dav,"pedido_itens":it_dav,"davs":[d.get("dav_numero") for d in davs]}
+    _sb_write(f"pedidos_fatura?id=eq.{ped['id']}",
+              {"status":"divergente","divergencia":div},"PATCH")
+    return {"resultado":"pf_divergente","pedido":ped["numero"],"motivo":
+            f"valor NF R${vnf:.2f} × pedido R${soma_dav:.2f} · itens {it_nf}×{it_dav}"}
+
 def _orc_registra(row):
     req=urllib.request.Request(f"{SB_URL}/rest/v1/notas_orcamento",
         data=json.dumps([row],ensure_ascii=False).encode(),method="POST",
@@ -3046,7 +3107,7 @@ def _lancar_itens(access):
     notas_orcamento pra pegar ticket/valor/aba. Só entra o que ainda está em 1/4."""
     ob=_orc_base(access,_manut_base(access))
     P1=_pasta_manut(access,1,ob); P4=_pasta_manut(access,4,ob)
-    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome,lancado&limit=8000",SB_KEY) or []
+    orcs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select=id,ticket,aba,valor_orcamento,arquivo_pdf,rateio,loja_nome,lancado,lancamento_bloqueado,extrapolado_status,parte&limit=8000",SB_KEY) or []
     # ids de orçamentos com ALGUM item não permitido (suspeitos) — pra marcar na lista de lançar
     _susp_rows=_sb_json(f"{SB_URL}/rest/v1/v_auditoria_suspeitos?select=orcamento_id&limit=20000",SB_KEY) or []
     susp_ids={r.get("orcamento_id") for r in _susp_rows}
@@ -3079,11 +3140,15 @@ def _lancar_itens(access):
             # ALERTA: ticket do nome do arquivo diverge do registro casado (associação inconsistente)
             alerta = (not sem_reg) and bool(tkf) and bool(row_tk) and (row_tk!=tkf)
             lnome=o.get("loja_nome")
-            itens.append({"arquivo":e["name"],"origem":origem,
+            itens.append({"arquivo":e["name"],"origem":origem,"id":o.get("id"),
                 "ticket":str(row_tk or tkf or ""),"ticket_arquivo":tkf or "","aba":o.get("aba") or "",
                 "valor":round(_numf(o.get("valor_orcamento")),2) if o.get("valor_orcamento") is not None else None,
                 "loja":(_loja_padrao(lnome) if lnome else ljf),"rateio":bool(o.get("rateio")) or (origem=="4"),
                 "lancado":bool(o.get("lancado")),"sem_registro":sem_reg,"alerta":alerta,
+                "parte":int(o.get("parte") or 1),
+                "bloqueado":bool(o.get("lancamento_bloqueado")),
+                "extrapolado_pendente":(o.get("extrapolado_status")=="pendente"),
+                "aprovado":(o.get("extrapolado_status")=="aprovado"),
                 "suspeito":bool(o.get("id") and o.get("id") in susp_ids)})
     itens.sort(key=lambda x:(x["origem"],x["arquivo"].lower()))
     return itens
@@ -3155,7 +3220,8 @@ def _robot_ok(request):
 def robot_lancar_worklist(request: Request):
     _robot_ok(request)
     access=dropbox_rateio.obter_token()
-    return {"itens":_lancar_itens(access)}
+    itens=[i for i in _lancar_itens(access) if not i.get("bloqueado") and not i.get("extrapolado_pendente")]
+    return {"itens":itens}
 
 @app.post("/robot/lancar_progresso")
 async def robot_lancar_progresso(request: Request):
@@ -4224,6 +4290,13 @@ def _orc_job_run(job, previa, uid, papel):
                         dropbox_rateio.mover(access,f"{ORC_NOTAS}/{nome}",f"{destino_folder}/{destino_nome}"); usou_source=True
                     else:
                         dropbox_rateio.subir_bytes(access,page,f"{destino_folder}/{destino_nome}",overwrite=True)
+                # ---- NF citando PEDIDO DE FATURA: casa com as DAVs, não gera orçamento ----
+                if (nt.get("pedido_fatura")) and str(nt.get("tipo_doc") or "").upper()!="DAV" and not previa:
+                    r_pf=_pf_processa(access,_ob,nt,nota_num,valor_nota,itens,_mv_nota)
+                    if r_pf and r_pf.get("resultado") in ("pf_faturado","pf_divergente"):
+                        info.update(status=r_pf["resultado"],motivo=r_pf.get("motivo") or f"pedido {r_pf.get('pedido')}",destino="12")
+                        res.append(info); continue
+                    if r_pf: info.update(aviso_pf=r_pf.get("motivo"))
                 if not ticket:
                     info.update(status="pendente",motivo="sem ticket",destino="6")
                     dest6 = nome if pages is None else f"{os.path.splitext(nome)[0]}_p{i+1}{ext}"
@@ -4251,17 +4324,20 @@ def _orc_job_run(job, previa, uid, papel):
                         try: dropbox_rateio.apagar(access,f"{ORC_NOTAS}/{nome}"); usou_source=True
                         except Exception as e: info.update(motivo=f"duplicada — não consegui excluir: {str(e)[:80]}")
                     res.append(info); continue
+                parte,soma_tk=_parte_soma(ticket)
+                info.update(parte=parte)
+                if soma_tk+valor_orc>600: info.update(teto_alerta=f"ticket já tem R${soma_tk:.2f} orçados — com este vai a R${soma_tk+valor_orc:.2f}")
                 if not previa:
                     # dados do orçamento
                     hoje=_hoje().strftime("%d/%m/%Y")
                     itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
-                    dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
+                    dados={"num":(f"{ticket} — Parte {parte}" if parte>1 else ticket),"revisao":1,"data":hoje,"loja_nome":loja_nome,
                         "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
                         "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":(loja.get("cnpj") if loja else None),
                                    "endereco":(loja.get("endereco") if loja else None),
                                    "cidade":((loja.get("cidade") if loja else None) or "")+(" - CE" if (loja.get("cidade") if loja else None) else "")},
                         "itens":itens_orc}
-                    base_nome=f"{slug}_{ticket}_NOTA_{nota_num}"
+                    base_nome=f"{slug}_{ticket}_NOTA_{nota_num}"+(f"_P{parte}" if parte>1 else "")
                     doc_bytes=gera_orcamento_docx(dados)
                     arq_pdf=arq_doc=None
                     try:
@@ -4286,6 +4362,7 @@ def _orc_job_run(job, previa, uid, papel):
                     _orc_registra({**_doc_cols(nt,nota_num),"ticket":ticket,
                         "loja_numero":(loja.get("numero") if loja else None),"loja_nome":loja_nome,"aba":lj.get("aba"),
                         "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
+                        "parte":parte,"fornecedor":(nt.get("fornecedor") or None),
                         "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
                         "arquivo_nota":arq_nota,"arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc,"criado_por":uid})
                 res.append(info)
@@ -4366,13 +4443,14 @@ def _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,n
     ext=os.path.splitext(src_nm or "")[1] or ".pdf"; mes=_mes_atual(); slug=_slug_loja(loja,lj.get("unidade"))
     itens_orc=[{"descricao":it.get("descricao"),"quant":float(it.get("quant") or 0),"unid":it.get("unid") or "UN","valor_unit":float(it.get("valor_unit") or 0)} for it in itens]
     hoje=_hoje().strftime("%d/%m/%Y")
-    dados={"num":ticket,"revisao":1,"data":hoje,"loja_nome":loja_nome,
+    parte,_soma_tk=_parte_soma(ticket)
+    dados={"num":(f"{ticket} — Parte {parte}" if parte>1 else ticket),"revisao":1,"data":hoje,"loja_nome":loja_nome,
         "prestador":{"nome":"Frota Macedo Engenharia LTDA","cnpj":"27.363.223/0001-70","forma":"Transferência Bancária 30 dias"},
         "tomador":{"nome":f"Mercadinhos São Luiz — {loja_nome.title()}","cnpj":(loja.get("cnpj") if loja else None),
                    "endereco":(loja.get("endereco") if loja else None),
                    "cidade":((loja.get("cidade") if loja else None) or "")+(" - CE" if (loja.get("cidade") if loja else None) else "")},
         "itens":itens_orc}
-    base_nome=f"{slug}_{ticket}_NOTA_{nota_num}"
+    base_nome=f"{slug}_{ticket}_NOTA_{nota_num}"+(f"_P{parte}" if parte>1 else "")
     doc_bytes=gera_orcamento_docx(dados); pdf_bytes=gera_orcamento_pdf(dados)
     arq_pdf=arq_doc=None
     if extrap:
@@ -4394,6 +4472,7 @@ def _reproc_gerar(access,row,src_base,src_nm,itens,valor_nota,valor_orc,ticket,n
         except Exception: pass
     _sb_write(f"notas_orcamento?id=eq.{row['id']}",{"ticket":ticket,**_doc_cols(nt,nota_num),
         "loja_numero":(loja.get("numero") if loja else None),"loja_nome":loja_nome,"aba":lj.get("aba"),
+        "parte":parte,
         "valor_nota":valor_nota,"valor_orcamento":valor_orc,"status":"gerado","extrapolado":extrap,
         "itens":itens_orc,"data_nota":_data_iso(nt.get("data_nota")),"mes_ref":mes,
         "arquivo_nota":arq_nota,"arquivo_pdf":arq_pdf,"arquivo_doc":arq_doc},"PATCH")
@@ -6354,7 +6433,7 @@ async def aud_editar_orcamento(request: Request):
     u,p=_exige_auditoria(request); b=await request.json()
     oid=(b.get("id") or "").strip(); itens=b.get("itens") or []
     if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
-    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,nota_numero,loja_nome,loja_numero,rateio,lancado,status,mes_ref,extrapolado,arquivo_pdf,arquivo_doc&limit=1",SB_KEY) or []
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,nota_numero,dav_numero,loja_nome,loja_numero,aba,rateio,lancado,status,mes_ref,extrapolado,arquivo_pdf,arquivo_doc,itens&limit=1",SB_KEY) or []
     if not row: raise HTTPException(404,"orçamento não encontrado")
     o=row[0]
     if o.get("status")!="gerado": raise HTTPException(409,"orçamento não está ativo")
@@ -6402,6 +6481,28 @@ async def aud_editar_orcamento(request: Request):
         try:
             if P9: dropbox_rateio.apagar(access,f"{P9}/{os.path.basename(adoc)}")
         except Exception: pass
+    # ---- PERDAS: itens retirados/reduzidos viram cobrança interna (valor COM acréscimo) ----
+    try:
+        antigos={}
+        for it in (o.get("itens") or []):
+            k=re.sub(r"\s+"," ",str(it.get("descricao") or "")).strip().lower()
+            antigos[k]=antigos.get(k,0.0)+_aud_num(it.get("quant"))
+            antigos[k+"@@vu"]=_aud_num(it.get("valor_unit"))
+        novos={}
+        for it in itens:
+            k=re.sub(r"\s+"," ",str(it.get("descricao") or "")).strip().lower()
+            novos[k]=novos.get(k,0.0)+_aud_num(it.get("quant"))
+        motivo=(b.get("motivo") or "exclusão na auditoria").strip()
+        for k,q in list(antigos.items()):
+            if k.endswith("@@vu"): continue
+            dq=q-novos.get(k,0.0)
+            if dq>0.0001:
+                vu=antigos.get(k+"@@vu",0.0)
+                _sb_write("perdas",[{"tipo":"exclusao_item","ticket":str(o.get("ticket") or ""),
+                    "aba":o.get("aba"),"loja":o.get("loja_nome"),"valor":round(round(vu*1.20,2)*dq,2),
+                    "motivo":motivo,"nota_numero":o.get("nota_numero"),"dav_numero":o.get("dav_numero"),
+                    "item":k,"quantidade":round(dq,3),"criado_por":u["id"]}])
+    except Exception as e: print("perdas exclusao erro:", str(e)[:120], flush=True)
     _sb_write(f"notas_orcamento?id=eq.{oid}",
               {"itens":itens,"valor_orcamento":final,"valor_nota":bruto,"extrapolado":extrap,
                "arquivo_pdf":f"{destino}/{nome}","arquivo_doc":None,
@@ -6544,6 +6645,510 @@ def _basic_auth(app, user, pw):
                 return
         await app(scope, receive, send)
     return wrapped
+
+
+# ==============================================================================
+# FASE 2 (rev 137) — CICLO FINANCEIRO COMPLETO
+# Pedido de Fatura · CSV do financeiro · Perdas · Extrapolados · Lote · Cruzamento
+# ==============================================================================
+def _f2_orcs(sel, filtro=""):
+    q=f"{SB_URL}/rest/v1/notas_orcamento?status=eq.gerado&select={sel}&limit=20000"
+    if filtro: q+="&"+filtro
+    return _sb_json(q,SB_KEY) or []
+
+# ---------- bloqueio de lançamento (por nota — trava a fila do robô) ----------
+@app.post("/orc/bloquear_lancamento")
+async def orc_bloquear_lancamento(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS"); b=await request.json()
+    bloquear=bool(b.get("bloquear",True))
+    alvo=None
+    if b.get("orcamento_id"): alvo=f"id=eq.{b['orcamento_id']}"
+    elif b.get("nota_numero"): alvo=f"nota_numero=eq.{_num_limpo(b['nota_numero'])}"
+    elif b.get("dav_numero"): alvo=f"dav_numero=eq.{_num_limpo(b['dav_numero'])}"
+    if not alvo: raise HTTPException(400,"informe orcamento_id, nota_numero ou dav_numero")
+    _sb_write(f"notas_orcamento?{alvo}&status=eq.gerado",{"lancamento_bloqueado":bloquear},"PATCH")
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS",
+                 "BLOQUEOU_LANCAMENTO" if bloquear else "LIBEROU_LANCAMENTO", str(alvo))
+    return {"ok":True,"bloqueado":bloquear}
+
+# ---------- extrapolados: o robô reporta, a área trata ----------
+@app.post("/robot/lancar_extrapolado")
+async def robot_lancar_extrapolado(request: Request):
+    """Robô chama quando a trava B estoura: marca o orçamento como extrapolado pendente."""
+    _robot_ok(request); b=await request.json()
+    nome=b.get("arquivo") or ""; tk=_num_limpo(b.get("ticket"))
+    orcs=_f2_orcs("id,ticket,arquivo_pdf,extrapolado_status")
+    o=_acha_orc_por_arquivo(orcs,nome) if nome else None
+    if not o and tk:
+        cand=[x for x in orcs if str(x.get("ticket") or "")==tk and not x.get("lancado")]
+        o=cand[-1] if cand else None
+    if not o: return {"ok":False,"motivo":"orçamento não encontrado"}
+    if o.get("extrapolado_status") in ("pendente","aprovado"): return {"ok":True,"ja":True}
+    _sb_write(f"notas_orcamento?id=eq.{o['id']}",{"extrapolado_status":"pendente"},"PATCH")
+    return {"ok":True,"id":o["id"]}
+
+@app.get("/orc/extrapolados")
+def orc_extrapolados(request: Request):
+    """Área de extrapolados: cada ticket com pendência, com TODOS os orçamentos dele."""
+    exige(request,"GERAR_ORCAMENTOS")
+    pend=_f2_orcs("id,ticket,parte,valor_orcamento,valor_nota,criado_em,lancado,lancado_em,loja_nome,aba,arquivo_pdf,extrapolado_status,nota_numero,dav_numero",
+                  "extrapolado_status=in.(pendente,aprovado,ajustado)")
+    ticks=sorted({str(o.get("ticket")) for o in pend if o.get("ticket")})
+    out=[]
+    for tk in ticks:
+        todos=_f2_orcs("id,ticket,parte,valor_orcamento,criado_em,lancado,lancado_em,extrapolado_status,arquivo_pdf",f"ticket=eq.{tk}")
+        todos.sort(key=lambda x:(int(x.get("parte") or 1)))
+        soma=round(sum(_numf(x.get("valor_orcamento")) for x in todos),2)
+        soma_lanc=round(sum(_numf(x.get("valor_orcamento")) for x in todos if x.get("lancado")),2)
+        alvo=next((x for x in todos if x.get("extrapolado_status") in ("pendente","aprovado","ajustado")),None)
+        ref=next((p0 for p0 in pend if str(p0.get("ticket"))==tk),{})
+        out.append({"ticket":tk,"loja":ref.get("loja_nome"),"aba":ref.get("aba"),
+            "soma_total":soma,"soma_lancada":soma_lanc,"excede":round(max(0,soma-600),2),
+            "status":(alvo or {}).get("extrapolado_status"),
+            "novo_id":(alvo or {}).get("id"),
+            "orcamentos":[{"id":x["id"],"parte":int(x.get("parte") or 1),
+                "valor":round(_numf(x.get("valor_orcamento")),2),
+                "inserido_em":x.get("lancado_em") or x.get("criado_em"),
+                "lancado":bool(x.get("lancado")),
+                "situacao":x.get("extrapolado_status") or ("no Trílogo" if x.get("lancado") else "aguardando")} for x in todos]})
+    return {"tickets":out}
+
+@app.post("/orc/extrapolado_aprovar")
+async def orc_extrapolado_aprovar(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS"); b=await request.json()
+    oid=b.get("id")
+    if not oid: raise HTTPException(400,"informe o id")
+    _sb_write(f"notas_orcamento?id=eq.{oid}",{"extrapolado_status":"aprovado"},"PATCH")
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","EXTRAPOLADO_APROVADO",str(oid))
+    return {"ok":True}
+
+@app.post("/orc/extrapolado_ajustar")
+async def orc_extrapolado_ajustar(request: Request):
+    """Refaz o ÚLTIMO orçamento do ticket com desconto % uniforme para a soma fechar em R$600,00.
+       O desconto vai para a planilha de perdas (prejuízo assumido e controlado)."""
+    from fastapi import HTTPException
+    u,p=exige(request,"GERAR_ORCAMENTOS"); b=await request.json()
+    oid=b.get("id")
+    if not oid: raise HTTPException(400,"informe o id")
+    row=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=eq.{oid}&select=id,ticket,parte,itens,valor_orcamento,valor_nota,loja_nome,loja_numero,aba,rateio,nota_numero,dav_numero,arquivo_pdf,mes_ref&limit=1",SB_KEY) or []
+    if not row: raise HTTPException(404,"orçamento não encontrado")
+    o=row[0]; tk=str(o.get("ticket") or "")
+    outros=_f2_orcs("id,valor_orcamento",f"ticket=eq.{tk}&id=neq.{oid}")
+    soma_outros=round(sum(_numf(x.get("valor_orcamento")) for x in outros),2)
+    alvo=round(600.0-soma_outros,2)
+    if alvo<=0: raise HTTPException(409,f"os outros orçamentos já somam R${soma_outros:.2f} — não há espaço; trate manualmente")
+    orig=round(_numf(o.get("valor_orcamento")),2)
+    if orig<=alvo: raise HTTPException(409,"este orçamento não estoura o teto — nada a ajustar")
+    fator=alvo/orig
+    itens=[]
+    for it in (o.get("itens") or []):
+        vu=round(round(_aud_num(it.get("valor_unit"))*1.20,2)*fator,2)   # preço de ORÇAMENTO com desconto
+        itens.append({"descricao":it.get("descricao"),"quant":_aud_num(it.get("quant")),
+                      "unid":it.get("unid") or "UN","valor_unit_final":vu,
+                      "valor_unit":_aud_num(it.get("valor_unit"))})
+    # PDF com os preços finais (a função soma +20% por dentro -> passamos o unit ajustado /1.2)
+    itens_pdf=[{"descricao":i["descricao"],"quant":i["quant"],"unid":i["unid"],
+                "valor_unit":round(i["valor_unit_final"]/1.20,6)} for i in itens]
+    loja=_aud_loja(o); slug=_aud_slug(o,loja); parte=int(o.get("parte") or 1)
+    dados=_aud_dados_pdf(o,loja,itens_pdf)
+    dados["num"]=(f"{tk} — Parte {parte}" if parte>1 else tk)
+    pdf=gera_orcamento_pdf(dados)
+    total=round(sum(round(round(i["valor_unit"]*1.20,2)*i["quant"],2)*fator for i in itens),2)
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    ap=str(o.get("arquivo_pdf") or ""); nome=os.path.basename(ap) if ap else f"{slug}_{tk}_NOTA_{o.get('nota_numero') or o.get('dav_numero') or 'SN'}{'_P'+str(parte) if parte>1 else ''}.pdf"
+    destino=4 if o.get("rateio") else 1
+    Pd=_pasta_manut(access,destino,ob)
+    if Pd: dropbox_rateio.subir_bytes(access,pdf,f"{Pd}/{nome}",overwrite=True)
+    if ap.split("/",1)[0] in ("10","11"):
+        try: dropbox_rateio.subir_bytes(access,pdf,_aud_abs(access,ob,ap),overwrite=True)
+        except Exception: pass
+    desconto=round(orig-alvo,2)
+    _sb_write(f"notas_orcamento?id=eq.{oid}",
+              {"valor_orcamento":alvo,"extrapolado_status":"ajustado",
+               "atualizado_em":_agora().isoformat(),"atualizado_por":u["id"]},"PATCH")
+    _sb_write("perdas",[{"tipo":"desconto_extrapolado","ticket":tk,"aba":o.get("aba"),
+        "loja":o.get("loja_nome"),"valor":desconto,
+        "motivo":f"ajuste do teto: soma do ticket fechada em R$600,00 (desconto de {round((1-fator)*100,2)}%)",
+        "nota_numero":o.get("nota_numero"),"dav_numero":o.get("dav_numero"),"criado_por":u["id"]}])
+    log_frotahub(u["id"],p.get("papel"),"GERAR_ORCAMENTOS","EXTRAPOLADO_AJUSTADO",
+                 f"{tk}: R${orig:.2f} -> R${alvo:.2f} (perda R${desconto:.2f})")
+    return {"ok":True,"valor_final":alvo,"desconto":desconto,"pct":round((1-fator)*100,2)}
+
+@app.post("/orc/extrapolados_planilha")
+async def orc_extrapolados_planilha(request: Request):
+    """Gera/atualiza o 'CONTROLE DE EXTRAPOLADOS.xlsx' na pasta 9 do Dropbox."""
+    exige(request,"GERAR_ORCAMENTOS")
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    data=orc_extrapolados(request)["tickets"] if False else None
+    # monta direto (sem passar pela rota, que exige o mesmo perfil)
+    pend=_f2_orcs("id,ticket,parte,valor_orcamento,criado_em,lancado,lancado_em,loja_nome,aba,extrapolado_status",
+                  "extrapolado_status=in.(pendente,aprovado,ajustado)")
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title="Extrapolados"
+    ws.append(["Ticket","Loja","Conta","Parte","Valor (R$)","Inserido em","Lançado?","Situação","Obs (par que extrapola)"])
+    for c in ws[1]: c.font=Font(name='Arial',bold=True,color='FFFFFF'); c.fill=PatternFill('solid',fgColor='A11F22')
+    ticks=sorted({str(o.get("ticket")) for o in pend if o.get("ticket")})
+    for tk in ticks:
+        todos=_f2_orcs("id,ticket,parte,valor_orcamento,criado_em,lancado,lancado_em,loja_nome,aba,extrapolado_status",f"ticket=eq.{tk}")
+        todos.sort(key=lambda x:int(x.get("parte") or 1))
+        outros=", ".join(f"Parte {int(x.get('parte') or 1)} (R${_numf(x.get('valor_orcamento')):.2f})" for x in todos)
+        for x in todos:
+            ws.append([tk,x.get("loja_nome"),x.get("aba"),int(x.get("parte") or 1),
+                round(_numf(x.get("valor_orcamento")),2),
+                str(x.get("lancado_em") or x.get("criado_em") or "")[:10],
+                "sim" if x.get("lancado") else "não",
+                x.get("extrapolado_status") or ("no Trílogo" if x.get("lancado") else "aguardando"),
+                f"extrapola somado a: {outros}"])
+    buf=io.BytesIO(); wb.save(buf)
+    access=dropbox_rateio.obter_token(); ob=_orc_base(access,_manut_base(access))
+    P9=_pasta_manut(access,9,ob)
+    if P9: dropbox_rateio.subir_bytes(access,buf.getvalue(),f"{P9}/CONTROLE DE EXTRAPOLADOS.xlsx",overwrite=True)
+    return {"ok":True,"linhas":ws.max_row-1}
+
+# ---------- PEDIDO DE FATURA ----------
+@app.get("/fin/pf_davs")
+def fin_pf_davs(request: Request):
+    """DAVs abertas (sem pedido e sem nota) — candidatas ao próximo pedido."""
+    exige(request,"FIN_A_PAGAR")
+    rows=_f2_orcs("id,ticket,dav_numero,valor_nota,loja_nome,aba,criado_em,itens",
+                  "dav_numero=not.is.null&nota_numero=is.null&pedido_fatura_id=is.null&order=criado_em")
+    return {"davs":[{"id":r["id"],"ticket":r.get("ticket"),"dav":r.get("dav_numero"),
+        "valor":round(_numf(r.get("valor_nota")),2),"loja":r.get("loja_nome"),"aba":r.get("aba"),
+        "itens":len(r.get("itens") or []),"data":str(r.get("criado_em") or "")[:10]} for r in rows]}
+
+@app.post("/fin/pf_criar")
+async def fin_pf_criar(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"FIN_A_PAGAR"); b=await request.json()
+    ids=[str(i) for i in (b.get("ids") or []) if i]
+    if not ids: raise HTTPException(400,"selecione as DAVs")
+    rows=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?id=in.({','.join(ids)})&select=id,dav_numero,valor_nota,pedido_fatura_id,nota_numero&limit=500",SB_KEY) or []
+    if len(rows)!=len(ids): raise HTTPException(400,"alguma DAV não foi encontrada")
+    for r in rows:
+        if r.get("pedido_fatura_id") or r.get("nota_numero"):
+            raise HTTPException(409,f"DAV {r.get('dav_numero')} já está em pedido/faturada")
+    seq=_sb_json(f"{SB_URL}/rest/v1/pedidos_fatura?select=id&order=id.desc&limit=1",SB_KEY) or []
+    num=f"PF-{(int(seq[0]['id'])+1) if seq else 1:04d}"
+    total=round(sum(_numf(r.get("valor_nota")) for r in rows),2)
+    _sb_write("pedidos_fatura",[{"numero":num,"criado_por":u["id"],"valor_total":total}])
+    ped=_sb_json(f"{SB_URL}/rest/v1/pedidos_fatura?numero=eq.{num}&select=id&limit=1",SB_KEY)[0]
+    _sb_write(f"notas_orcamento?id=in.({','.join(ids)})",
+              {"pedido_fatura_id":ped["id"],"status_pagamento":"fatura_solicitada"},"PATCH")
+    log_frotahub(u["id"],p.get("papel"),"FIN_A_PAGAR","CRIOU_PEDIDO_FATURA",f"{num} · {len(ids)} DAVs · R${total:.2f}")
+    return {"ok":True,"id":ped["id"],"numero":num,"valor_total":total,"davs":len(ids)}
+
+@app.get("/fin/pf_lista")
+def fin_pf_lista(request: Request):
+    exige(request,"FIN_A_PAGAR")
+    peds=_sb_json(f"{SB_URL}/rest/v1/pedidos_fatura?select=*&order=id.desc&limit=300",SB_KEY) or []
+    return {"pedidos":peds}
+
+def _pf_detalhe(pid):
+    ped=(_sb_json(f"{SB_URL}/rest/v1/pedidos_fatura?id=eq.{pid}&select=*&limit=1",SB_KEY) or [None])[0]
+    davs=_sb_json(f"{SB_URL}/rest/v1/notas_orcamento?pedido_fatura_id=eq.{pid}&select=id,ticket,dav_numero,valor_nota,loja_nome,aba,itens,status_pagamento&order=dav_numero&limit=500",SB_KEY) or []
+    return ped,davs
+
+@app.get("/fin/pf_det")
+def fin_pf_det(request: Request, id: str=""):
+    from fastapi import HTTPException
+    exige(request,"FIN_A_PAGAR")
+    ped,davs=_pf_detalhe(id)
+    if not ped: raise HTTPException(404,"pedido não encontrado")
+    return {"pedido":ped,"davs":[{"id":d["id"],"ticket":d.get("ticket"),"dav":d.get("dav_numero"),
+        "valor":round(_numf(d.get("valor_nota")),2),"loja":d.get("loja_nome"),"aba":d.get("aba"),
+        "itens":d.get("itens") or [],"status_pagamento":d.get("status_pagamento")} for d in davs]}
+
+@app.get("/fin/pf_xlsx")
+def fin_pf_xlsx(request: Request, id: str=""):
+    from fastapi import HTTPException
+    exige(request,"FIN_A_PAGAR")
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    ped,davs=_pf_detalhe(id)
+    if not ped: raise HTTPException(404,"pedido não encontrado")
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title=ped["numero"]
+    ws.append([f"PEDIDO DE FATURA {ped['numero']} — Frota Macedo Engenharia LTDA · CNPJ 27.363.223/0001-70"])
+    ws.append([f"Fornecedor: {ped.get('fornecedor')}"]); ws.append([f"Data: {str(ped.get('criado_em') or '')[:10]}"]); ws.append([])
+    ws.append(["DAV","Ticket","Loja","Item","Quant","Unid","Valor unit (R$)","Total (R$)"])
+    for c in ws[5]: c.font=Font(name='Arial',bold=True,color='FFFFFF'); c.fill=PatternFill('solid',fgColor='A11F22')
+    tot=0.0
+    for d in davs:
+        for it in (d.get("itens") or []):
+            v=round(_numf(it.get("valor_unit"))*_numf(it.get("quant")),2); tot+=v
+            ws.append([d.get("dav_numero"),d.get("ticket"),d.get("loja_nome"),it.get("descricao"),
+                       _numf(it.get("quant")),it.get("unid"),_numf(it.get("valor_unit")),v])
+    ws.append([]); ws.append(["","","","","","","TOTAL",round(tot,2)])
+    for col,w in zip("ABCDEFGH",(10,10,24,50,8,7,14,12)): ws.column_dimensions[col].width=w
+    buf=io.BytesIO(); wb.save(buf)
+    return Response(content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"content-disposition":f'attachment; filename="{ped["numero"]}.xlsx"'})
+
+@app.get("/fin/pf_pdf")
+def fin_pf_pdf(request: Request, id: str=""):
+    from fastapi import HTTPException
+    exige(request,"FIN_A_PAGAR")
+    ped,davs=_pf_detalhe(id)
+    if not ped: raise HTTPException(404,"pedido não encontrado")
+    linhas=[]; tot=0.0
+    for d in davs:
+        for it in (d.get("itens") or []):
+            v=round(_numf(it.get("valor_unit"))*_numf(it.get("quant")),2); tot+=v
+            linhas.append([str(d.get("dav_numero") or ""),str(d.get("ticket") or ""),
+                (it.get("descricao") or "")[:60],f"{_numf(it.get('quant')):g} {it.get('unid') or ''}",
+                _fmt_reais(_numf(it.get("valor_unit"))),_fmt_reais(v)])
+    linhas.append(["","","","","TOTAL",_fmt_reais(round(tot,2))])
+    pdf=_lista_pdf(f"Pedido de Fatura {ped['numero']} — {ped.get('fornecedor')}",
+                   ["DAV","Ticket","Item","Quant","V.unit","Total"],linhas)
+    return Response(content=pdf,media_type="application/pdf",
+        headers={"content-disposition":f'inline; filename="{ped["numero"]}.pdf"'})
+
+@app.post("/fin/pf_casar")
+async def fin_pf_casar(request: Request):
+    """Fallback MANUAL: você informa o nº da NF e o pedido é dado como faturado."""
+    from fastapi import HTTPException
+    u,p=exige(request,"FIN_A_PAGAR"); b=await request.json()
+    pid=b.get("id"); nf=_num_limpo(b.get("nota_numero"))
+    if not pid or not nf: raise HTTPException(400,"informe id e nota_numero")
+    ped,davs=_pf_detalhe(pid)
+    if not ped: raise HTTPException(404,"pedido não encontrado")
+    if ped.get("status")=="faturado": raise HTTPException(409,"pedido já faturado")
+    for d in davs:
+        _sb_write(f"notas_orcamento?id=eq.{d['id']}",{"nota_numero":nf,"status_pagamento":"faturada"},"PATCH")
+    _sb_write(f"pedidos_fatura?id=eq.{pid}",{"status":"faturado","nota_numero":nf,
+              "faturado_em":_hoje().isoformat(),"divergencia":None},"PATCH")
+    log_frotahub(u["id"],p.get("papel"),"FIN_A_PAGAR","PF_CASADO_MANUAL",f"{ped['numero']} -> NF {nf}")
+    return {"ok":True}
+
+# ---------- CSV do financeiro (documentos a pagar) ----------
+def _csv_num_br(s):
+    s=str(s or "").strip().replace(".","").replace(",",".")
+    try: return float(s)
+    except Exception: return None
+
+def _csv_data_br(s):
+    m=re.match(r"(\d{2})/(\d{2})/(\d{4})$",str(s or "").strip())
+    return f"{m.group(3)}-{m.group(2)}-{m.group(1)}" if m else None
+
+@app.post("/fin/docs_upload")
+async def fin_docs_upload(request: Request):
+    """Upload do CSV 'Documentos a pagar': guarda TODOS, casa por nº+fornecedor e marca pagas."""
+    from fastapi import HTTPException
+    u,p=exige(request,"FIN_A_PAGAR")
+    raw=await request.body()
+    if not raw: raise HTTPException(400,"envie o CSV no corpo da requisição")
+    try: txt=raw.decode("latin-1")
+    except Exception: txt=raw.decode("utf-8","ignore")
+    import csv as _csv
+    rd=_csv.reader(io.StringIO(txt), delimiter=";")
+    docs=[]
+    for r in rd:
+        if len(r)<16 or (r[0] or "").strip()!="FROTA MACEDO ENGENHARIA LTDA": continue
+        num=(r[4] or "").strip()
+        if not num: continue
+        desc=(r[15] or "").strip()
+        m=re.search(r"TICKET[:\s]*([0-9]{5,6})",desc,re.I)
+        docs.append({"numero":num,"fornecedor":(r[7] or "").strip(),"doc_interno":(r[2] or "").strip(),
+            "obra":(r[6] or "").strip(),"vencimento":_csv_data_br(r[9]),"valor":_csv_num_br(r[10]),
+            "data_pgto":_csv_data_br(r[12]),"valor_pago":_csv_num_br(r[13]),
+            "situacao":(r[14] or "").strip(),"descricao":desc,"ticket":(m.group(1) if m else None)})
+    if not docs: raise HTTPException(400,"nenhuma linha reconhecida — o arquivo é o relatório 'Documentos a pagar'?")
+    _sb_write("fornecedor_docs",docs,"POST","resolution=merge-duplicates,return=minimal")
+    # casamento + pagas
+    orcs=_f2_orcs("id,nota_numero,dav_numero,fornecedor,status_pagamento")
+    pagas=0; casados=0; nao_encontrados=[]
+    for d in docs:
+        n=_num_limpo(d["numero"])
+        alvo=[o for o in orcs if (o.get("nota_numero")==n or o.get("dav_numero")==n)]
+        if alvo:
+            # confere fornecedor quando ambos os lados o conhecem
+            forn1=(d["fornecedor"] or "").split(" ")[0].lower()
+            alvo=[o for o in alvo if not o.get("fornecedor") or forn1 in str(o.get("fornecedor")).lower()]
+        if not alvo:
+            nao_encontrados.append({"numero":d["numero"],"fornecedor":d["fornecedor"],"valor":d["valor"],"situacao":d["situacao"]})
+            continue
+        casados+=1
+        _sb_write(f"fornecedor_docs?numero=eq.{urllib.parse.quote(d['numero'])}&fornecedor=eq.{urllib.parse.quote(d['fornecedor'])}",{"casado":True},"PATCH")
+        if d["situacao"]=="Liquidado":
+            for o in alvo:
+                if o.get("status_pagamento")!="paga":
+                    _sb_write(f"notas_orcamento?id=eq.{o['id']}",
+                              {"status_pagamento":"paga","pago_em":d["data_pgto"],
+                               "fornecedor":o.get("fornecedor") or d["fornecedor"]},"PATCH")
+                    pagas+=1
+    log_frotahub(u["id"],p.get("papel"),"FIN_A_PAGAR","CSV_PAGAMENTOS",
+                 f"{len(docs)} docs · {pagas} marcadas pagas · {len(nao_encontrados)} sem correspondente")
+    return {"ok":True,"importados":len(docs),"casados":casados,"pagas_marcadas":pagas,
+            "nao_encontrados":nao_encontrados[:200]}
+
+@app.get("/fin/docs_lista")
+def fin_docs_lista(request: Request, situacao: str="", fornecedor: str="", so_sem_par: str=""):
+    exige(request,"FIN_A_PAGAR")
+    q=f"{SB_URL}/rest/v1/fornecedor_docs?select=*&order=vencimento.desc&limit=2000"
+    if situacao: q+=f"&situacao=eq.{urllib.parse.quote(situacao)}"
+    if fornecedor: q+=f"&fornecedor=ilike.*{urllib.parse.quote(fornecedor)}*"
+    if so_sem_par: q+="&casado=eq.false"
+    return {"docs":_sb_json(q,SB_KEY) or []}
+
+# ---------- PERDAS ----------
+@app.get("/fin/perdas")
+def fin_perdas(request: Request, tipo: str="", motivo: str="", de: str="", ate: str=""):
+    exige(request,"FIN_A_PAGAR")
+    q=f"{SB_URL}/rest/v1/perdas?select=*&order=data.desc&limit=3000"
+    if tipo: q+=f"&tipo=eq.{urllib.parse.quote(tipo)}"
+    if motivo: q+=f"&motivo=ilike.*{urllib.parse.quote(motivo)}*"
+    if de: q+=f"&data=gte.{de}"
+    if ate: q+=f"&data=lte.{ate}"
+    rows=_sb_json(q,SB_KEY) or []
+    return {"perdas":rows,"soma":round(sum(_numf(r.get("valor")) for r in rows),2)}
+
+# ---------- LOTE DE COBRANÇA (medição mensal) ----------
+def _lote_pendentes(corte):
+    f=(f"lancado=eq.true&lote_id=is.null&cobrado_historico=eq.false"
+       f"&extrapolado_status=not.in.(pendente)")
+    rows=_f2_orcs("id,ticket,parte,valor_orcamento,lancado_em,criado_em,loja_nome,aba,rateio",f)
+    out=[]
+    for r in rows:
+        dt=str(r.get("lancado_em") or r.get("criado_em") or "")[:10]
+        if corte and dt and dt>corte: continue
+        out.append(r)
+    return out
+
+@app.get("/fin/lote_previa")
+def fin_lote_previa(request: Request, corte: str=""):
+    from fastapi import HTTPException
+    exige(request,"FIN_A_RECEBER")
+    if not corte: raise HTTPException(400,"informe a data de corte (AAAA-MM-DD)")
+    rows=_lote_pendentes(corte)
+    blocos={}
+    for r in rows:
+        k=(r.get("loja_nome") or "—", r.get("aba") or "—")
+        blocos.setdefault(k,{"loja":k[0],"aba":k[1],"orcamentos":0,"valor":0.0})
+        blocos[k]["orcamentos"]+=1; blocos[k]["valor"]=round(blocos[k]["valor"]+_numf(r.get("valor_orcamento")),2)
+    bl=sorted(blocos.values(),key=lambda x:(x["loja"],x["aba"]))
+    return {"corte":corte,"orcamentos":len(rows),"nfs":len(bl),
+            "valor_total":round(sum(b["valor"] for b in bl),2),"blocos":bl}
+
+@app.post("/fin/lote_criar")
+async def fin_lote_criar(request: Request):
+    from fastapi import HTTPException
+    u,p=exige(request,"FIN_A_RECEBER"); b=await request.json()
+    corte=(b.get("corte") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$",corte): raise HTTPException(400,"corte inválido (AAAA-MM-DD)")
+    if not _verifica_pin(u["id"], p.get("nivel"), b.get("pin")): raise HTTPException(403,"PIN incorreto")
+    rows=_lote_pendentes(corte)
+    if not rows: raise HTTPException(409,"nenhum orçamento a cobrar até essa data")
+    blocos={(r.get("loja_nome") or "—", r.get("aba") or "—") for r in rows}
+    total=round(sum(_numf(r.get("valor_orcamento")) for r in rows),2)
+    _sb_write("lotes_cobranca",[{"corte":corte,"criado_por":u["id"],
+        "qtd_orcamentos":len(rows),"qtd_nfs":len(blocos),"valor_total":total}])
+    lote=_sb_json(f"{SB_URL}/rest/v1/lotes_cobranca?select=id&order=id.desc&limit=1",SB_KEY)[0]
+    ids=[str(r["id"]) for r in rows]
+    for i in range(0,len(ids),200):
+        _sb_write(f"notas_orcamento?id=in.({','.join(ids[i:i+200])})",
+                  {"lote_id":lote["id"],"cobrado_em":_hoje().isoformat()},"PATCH")
+    log_frotahub(u["id"],p.get("papel"),"FIN_A_RECEBER","FECHOU_LOTE",
+                 f"lote {lote['id']} corte {corte}: {len(rows)} orç · {len(blocos)} NFs · R${total:.2f}")
+    return {"ok":True,"lote_id":lote["id"],"orcamentos":len(rows),"nfs":len(blocos),"valor_total":total}
+
+@app.get("/fin/lotes")
+def fin_lotes(request: Request):
+    exige(request,"FIN_A_RECEBER")
+    return {"lotes":_sb_json(f"{SB_URL}/rest/v1/lotes_cobranca?select=*&order=id.desc&limit=100",SB_KEY) or []}
+
+def _lote_blocos(lid):
+    rows=_f2_orcs("id,ticket,parte,valor_orcamento,lancado_em,loja_nome,aba,rateio",f"lote_id=eq.{lid}")
+    blocos={}
+    for r in rows:
+        k=(r.get("loja_nome") or "—", r.get("aba") or "—")
+        blocos.setdefault(k,[]).append(r)
+    return blocos
+
+@app.get("/fin/lote_espelho")
+def fin_lote_espelho(request: Request, id: str="", fmt: str="xlsx"):
+    """Espelho para o contador: 1 bloco por NF (loja × conta)."""
+    from fastapi import HTTPException
+    exige(request,"FIN_A_RECEBER")
+    lote=(_sb_json(f"{SB_URL}/rest/v1/lotes_cobranca?id=eq.{id}&select=*&limit=1",SB_KEY) or [None])[0]
+    if not lote: raise HTTPException(404,"lote não encontrado")
+    blocos=_lote_blocos(id)
+    if fmt=="pdf":
+        linhas=[]; geral=0.0
+        for (loja,aba),rs in sorted(blocos.items()):
+            sub=round(sum(_numf(r.get("valor_orcamento")) for r in rs),2); geral+=sub
+            linhas.append([f"■ {loja} — {('Instalações' if str(aba).upper().startswith('INST') else 'Civil')}","","",""])
+            for r in sorted(rs,key=lambda x:(str(x.get('ticket')),int(x.get('parte') or 1))):
+                pt=int(r.get("parte") or 1)
+                linhas.append(["",f"{r.get('ticket')}"+(f" — Parte {pt}" if pt>1 else ""),
+                               str(r.get("lancado_em") or "")[:10],_fmt_reais(_numf(r.get("valor_orcamento")))])
+            linhas.append(["","","Total da NF",_fmt_reais(sub)]); linhas.append(["","","",""])
+        linhas.append(["","","TOTAL DO LOTE",_fmt_reais(round(geral,2))])
+        pdf=_lista_pdf(f"Espelho de faturamento — lote {id} (corte {lote.get('corte')})",
+                       ["Loja / Conta","Orçamento (ticket)","Lançado em","Valor"],linhas)
+        return Response(content=pdf,media_type="application/pdf",
+            headers={"content-disposition":f'inline; filename="espelho_lote_{id}.pdf"'})
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+    wb=openpyxl.Workbook(); ws=wb.active; ws.title=f"Lote {id}"
+    ws.append([f"ESPELHO DE FATURAMENTO — Lote {id} · corte {lote.get('corte')} · Frota Macedo Engenharia"]); ws.append([])
+    hdr=Font(name='Arial',bold=True,color='FFFFFF'); fill=PatternFill('solid',fgColor='A11F22')
+    geral=0.0
+    for (loja,aba),rs in sorted(blocos.items()):
+        conta='Instalações' if str(aba).upper().startswith('INST') else 'Civil'
+        ws.append([f"{loja} — {conta}"]); ws[ws.max_row][0].font=Font(name='Arial',bold=True,size=12)
+        ws.append(["Ticket","Parte","Lançado em","Valor (R$)"])
+        for c in ws[ws.max_row]: c.font=hdr; c.fill=fill
+        sub=0.0
+        for r in sorted(rs,key=lambda x:(str(x.get('ticket')),int(x.get('parte') or 1))):
+            v=round(_numf(r.get("valor_orcamento")),2); sub+=v
+            ws.append([r.get("ticket"),int(r.get("parte") or 1),str(r.get("lancado_em") or "")[:10],v])
+        sub=round(sub,2); geral+=sub
+        ws.append(["","","Total da NF",sub]); ws.append([])
+    ws.append(["","","TOTAL DO LOTE",round(geral,2)])
+    for col,w in zip("ABCD",(14,8,14,14)): ws.column_dimensions[col].width=w
+    buf=io.BytesIO(); wb.save(buf)
+    return Response(content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"content-disposition":f'attachment; filename="espelho_lote_{id}.xlsx"'})
+
+# ---------- CRUZAMENTO fornecedor × cliente ----------
+@app.get("/fin/cruzamento")
+def fin_cruzamento(request: Request, prazo_dias: int=30):
+    exige(request,"FIN_A_RECEBER")
+    docs=_sb_json(f"{SB_URL}/rest/v1/fornecedor_docs?select=numero,fornecedor,valor,situacao,data_pgto,vencimento,casado,ticket&limit=5000",SB_KEY) or []
+    orcs=_f2_orcs("id,ticket,parte,valor_orcamento,valor_nota,lancado,lancado_em,criado_em,lote_id,loja_nome,aba,extrapolado_status,cobrado_historico")
+    # vazamento A: docs sem correspondente
+    vaz_a=[d for d in docs if not d.get("casado")]
+    # vazamento B: gerado nunca lançado (mais antigo que prazo)
+    lim=(_hoje()-datetime.timedelta(days=int(prazo_dias))).isoformat()
+    vaz_b=[{"id":o["id"],"ticket":o.get("ticket"),"parte":o.get("parte"),"loja":o.get("loja_nome"),
+            "valor":round(_numf(o.get("valor_orcamento")),2),"gerado_em":str(o.get("criado_em") or "")[:10],
+            "situacao":o.get("extrapolado_status") or ""}
+           for o in orcs if not o.get("lancado") and str(o.get("criado_em") or "")[:10]<lim]
+    # vazamento C: lançado sem lote (fora do histórico)
+    vaz_c=[{"id":o["id"],"ticket":o.get("ticket"),"parte":o.get("parte"),"loja":o.get("loja_nome"),
+            "valor":round(_numf(o.get("valor_orcamento")),2),"lancado_em":str(o.get("lancado_em") or "")[:10]}
+           for o in orcs if o.get("lancado") and not o.get("lote_id") and not o.get("cobrado_historico")
+           and str(o.get("lancado_em") or "9999")[:10]<lim]
+    # margem por mês: pago ao fornecedor × cobrado do cliente
+    meses={}
+    for d in docs:
+        if d.get("situacao")=="Liquidado" and d.get("data_pgto"):
+            m=str(d["data_pgto"])[:7]; meses.setdefault(m,{"pago":0.0,"cobrado":0.0})
+            meses[m]["pago"]=round(meses[m]["pago"]+_numf(d.get("valor")),2)
+    for o in orcs:
+        if o.get("lote_id") or o.get("cobrado_historico"):
+            m=str(o.get("lancado_em") or o.get("criado_em") or "")[:7]
+            if m: meses.setdefault(m,{"pago":0.0,"cobrado":0.0}); meses[m]["cobrado"]=round(meses[m]["cobrado"]+_numf(o.get("valor_orcamento")),2)
+    serie=[{"mes":m,"pago":v["pago"],"cobrado":v["cobrado"],
+            "margem_pct":(round((v["cobrado"]/v["pago"]-1)*100,1) if v["pago"] else None)}
+           for m,v in sorted(meses.items())]
+    return {"vazamento_a":{"qtd":len(vaz_a),"valor":round(sum(_numf(d.get("valor")) for d in vaz_a),2),"itens":vaz_a[:300]},
+            "vazamento_b":{"qtd":len(vaz_b),"valor":round(sum(x["valor"] for x in vaz_b),2),"itens":vaz_b[:300]},
+            "vazamento_c":{"qtd":len(vaz_c),"valor":round(sum(x["valor"] for x in vaz_c),2),"itens":vaz_c[:300]},
+            "meses":serie,"margem_esperada":20.0,"prazo_dias":prazo_dias}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "7860"))    # Render/Cloud injeta PORT
